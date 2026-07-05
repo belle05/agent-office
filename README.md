@@ -13,10 +13,13 @@ together — each worker wears a small colored plaque so you can tell them apart
 
 ## Why
 
-When you run several agents at once it's easy to lose track of which ones are still
-working and which are waiting on you. This gives you an at-a-glance, glanceable view:
-who's busy (at a desk), who needs you (in the kitchen), what each is working on, and
-the last tool it ran — across every project on your machine.
+Honestly? Because it's fun. Watching your agents shuffle between their desks and the
+kitchen is delightful in a way a list of sessions never will be.
+
+It's also genuinely handy: when you run several agents at once it's easy to lose track
+of which are still working and which are waiting on you. This gives you a glanceable
+view — who's busy (at a desk), who needs you (in the kitchen), what each is working on,
+and the last tool it ran — across every project on your machine.
 
 ## Run it
 
