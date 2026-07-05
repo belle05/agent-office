@@ -1,0 +1,2557 @@
+#!/usr/bin/env python3
+"""
+cursor_office.py - A tiny Game Boy-style "office" that visualizes your AI agents.
+
+Each little person in the office is a chat/agent that was active in the last 24 hours,
+read from the local transcript files on this machine. BOTH tools are shown together:
+
+  * Cursor agents      (~/.cursor/projects/*/agent-transcripts/)
+  * Claude Code agents (~/.claude/projects/*/)
+
+Every worker wears a small colored plaque so you can tell them apart at a glance
+(teal = Cursor, coral = Claude Code); the same shows in the hover card and detail view.
+
+  * WORKING agents sit at a desk and type on their computer.
+  * WAITING agents (finished a turn and waiting for your reply) hang out in the
+    kitchen, make coffee and grab a snack.
+
+Click a person to open an overlay with their task, latest thinking/response and the
+last tool they used. From there you can open that chat's transcript file in Cursor or
+copy the session id (to find it under "Previous Chats" in Cursor).
+
+------------------------------------------------------------------------------------
+HOW TO RUN  (no dependencies, just Python 3.8+)
+
+    python3 cursor_office.py
+
+Then open the URL it prints (default http://127.0.0.1:8787). It auto-opens a browser.
+
+By default it shows agents from ALL your Cursor + Claude Code projects/roots on this
+machine (each worker is tagged with its project). You can scope it to a single root, or
+hide a whole source, if you prefer.
+
+Useful flags:
+    python3 cursor_office.py --hours 48        # widen the activity window
+    python3 cursor_office.py --port 9000       # change port
+    python3 cursor_office.py --project my-app  # only this root/project (substring match)
+    python3 cursor_office.py --list-projects   # list roots with active sessions, then exit
+    python3 cursor_office.py --no-cursor       # hide Cursor agents (Claude Code only)
+    python3 cursor_office.py --no-claude       # hide Claude Code agents (Cursor only)
+    python3 cursor_office.py --demo            # add fake workers so the office is lively
+    python3 cursor_office.py --no-open         # don't auto-open the browser
+
+------------------------------------------------------------------------------------
+SHARING WITH YOUR TEAM
+
+This is a single self-contained file. Drop it in a GitHub gist (or send the file) and
+your teammates just run `python3 cursor_office.py`. It reads *their own* local Cursor
+data from ~/.cursor/projects/*/agent-transcripts/ and Claude Code data from
+~/.claude/projects/* -- nothing is uploaded anywhere and the server only listens on
+localhost.
+"""
+
+import argparse
+import json
+import os
+import re
+import threading
+import time
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, unquote, urlparse
+
+# --------------------------------------------------------------------------------------
+# Transcript discovery + parsing
+# --------------------------------------------------------------------------------------
+
+CURSOR_PROJECTS_DIR = os.path.expanduser("~/.cursor/projects")
+# Claude Code stores one .jsonl per chat under ~/.claude/projects/<encoded-cwd>/,
+# with any Task subagents in a sibling <session-uuid>/subagents/*.jsonl -- the same
+# shape as Cursor, so both sources feed the SAME office (each worker is tagged with
+# its `source` so the UI can tell a Cursor agent from a Claude Code agent).
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+# Office (working/desk) vs kitchen (waiting) is decided by TURN STATE, not raw
+# write-recency: a session is "working" while its latest turn is still IN PROGRESS
+# (a user/assistant message after the last `turn_ended`). This keeps a genuinely
+# busy chat at its desk even through long quiet stretches mid-turn -- a slow tool
+# call, a long generation, or simply while you read -- which a write-recency window
+# got wrong (it kept dropping active chats to "idle" during those gaps). A chat
+# whose latest turn has ENDED is waiting on you, so it walks to the kitchen, picked
+# up on the next poll. Two refinements layer on top:
+#   * Multitask rollup: if the parent's turn has ended but a background SUBAGENT was
+#     written within SUBAGENT_ACTIVE_SECONDS, the chat still counts as working
+#     (the Multitask Mode case, where the parent is idle while a worker runs).
+#   * Staleness cap: a turn that has been completely silent (chat AND subagents)
+#     for longer than WORKING_STALE_CAP_SECONDS is treated as abandoned/crashed and
+#     sent to the kitchen, so a half-finished turn can't sit at a desk forever.
+SUBAGENT_ACTIVE_SECONDS = 120    # multitask subagent freshness window; --active-secs
+# Backstop only: a turn still "in progress" but completely silent this long is
+# treated as abandoned/crashed -> kitchen. Kept FAR out (2h) on purpose: the
+# transcript .jsonl records only user/assistant messages, NOT tool calls, so a
+# busy tool-heavy turn can legitimately write nothing for many minutes. A short
+# cap (e.g. 15m) wrongly evicted those active turns to the kitchen, so turn state
+# -- not mtime -- is the primary signal and this only catches genuinely dead ones.
+WORKING_STALE_CAP_SECONDS = 7200
+
+TAG_RE = re.compile(r"<[^>]+>")
+WS_RE = re.compile(r"[ \t]+")
+# leading "Thursday, Jun 25, 2026, 1:26 PM (UTC+3)" style timestamp lines
+TS_LINE_RE = re.compile(
+    r"^(mon|tue|wed|thu|fri|sat|sun)[a-z]*,.*\(utc.*\)\s*$", re.IGNORECASE
+)
+
+# Deterministic fun names so each agent feels like an office worker.
+FIRST_NAMES = [
+    "Pip", "Willow", "Clover", "Bun", "Maple", "Sprout", "Waffle", "Biscuit",
+    "Poppy", "Mochi", "Pebble", "Fern", "Cricket", "Marshmallow", "Pumpkin",
+    "Honey", "Acorn", "Noodle", "Pickle", "Sunny", "Berry", "Tofu", "Dandelion",
+    "Bramble", "Hazel", "Olive", "Tansy", "Muffin", "Peaches", "Juniper",
+]
+LAST_NAMES = [
+    "Sunbeam", "Marshmallow", "Buttercup", "Honeydew", "Pumpkinpatch",
+    "Snugglebee", "Cloudberry", "Dewdrop", "Meadowlight", "Gigglesworth",
+    "Cottontail", "Brightbloom", "Mossypaws", "Tinkerwhisk", "Sugarplum",
+    "Pebblebrook", "Willowwisp", "Honeycomb", "Berrybramble", "Twinkletoes",
+    "Mapleshade", "Cuddleburrow", "Dapplewood", "Snickerdoodle", "Fernwhistle",
+]
+
+
+def _clean_text(s):
+    if not s:
+        return ""
+    s = TAG_RE.sub(" ", s)
+    s = s.replace("\\n", "\n")
+    # collapse runs of spaces/tabs but keep newlines
+    lines = [WS_RE.sub(" ", ln).strip() for ln in s.split("\n")]
+    out = "\n".join(ln for ln in lines)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out
+
+
+def _strip_leading_timestamp(s):
+    """Drop leading blank/timestamp lines so the real query shows up first."""
+    lines = (s or "").split("\n")
+    while lines and (not lines[0].strip() or TS_LINE_RE.match(lines[0].strip())):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _name_for(uuid):
+    h = 0
+    for ch in uuid:
+        h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+    first = FIRST_NAMES[h % len(FIRST_NAMES)]
+    last = LAST_NAMES[(h // len(FIRST_NAMES)) % len(LAST_NAMES)]
+    return f"{first} {last}"
+
+
+def _variant_for(uuid):
+    h = 0
+    for ch in uuid:
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return h % 6
+
+
+def _pretty_project(folder):
+    name = folder
+    if name.startswith("Users-"):
+        parts = name.split("-")
+        # keep the last 2 meaningful segments, e.g. ...-my-app -> "my-app"
+        if len(parts) >= 2:
+            name = "-".join(parts[-2:])
+    return name
+
+
+def _tool_detail(name, inp):
+    # Tolerant of both Cursor and Claude Code tool schemas (e.g. Cursor's Shell /
+    # StrReplace / `path` vs Claude's Bash / Edit / `file_path`).
+    if not isinstance(inp, dict):
+        return name
+    def first_line(v):
+        return _clean_text(str(v)).split("\n")[0][:80]
+    def basename_of(*keys):
+        for k in keys:
+            v = inp.get(k)
+            if v:
+                return os.path.basename(v) or v
+        return ""
+    if name in ("Shell", "Bash"):
+        return first_line(inp.get("description") or inp.get("command") or "")
+    if name in ("Read", "Write", "Delete", "StrReplace", "Edit", "MultiEdit", "NotebookEdit"):
+        return basename_of("path", "file_path", "notebook_path")
+    if name in ("Grep", "SemanticSearch"):
+        return first_line(inp.get("pattern") or inp.get("query") or "")
+    if name in ("Task",):
+        return first_line(inp.get("description") or inp.get("prompt") or "")
+    if name == "Glob":
+        return first_line(inp.get("glob_pattern") or inp.get("pattern") or "")
+    if name in ("TodoWrite",):
+        return "updating task list"
+    if name in ("WebSearch", "WebFetch"):
+        return first_line(inp.get("search_term") or inp.get("query") or inp.get("url") or "")
+    # fall back to first value
+    for k in ("description", "explanation", "title"):
+        if inp.get(k):
+            return first_line(inp[k])
+    return name
+
+
+def _normalize_events(path):
+    """Return a list of normalized events from a .jsonl transcript."""
+    events = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "turn_ended":
+                    events.append({
+                        "kind": "turn_ended",
+                        "status": obj.get("status"),
+                        "text": "",
+                        "tools": [],
+                    })
+                    continue
+                role = obj.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                content = ((obj.get("message") or {}).get("content")) or []
+                texts = []
+                tools = []
+                if isinstance(content, str):
+                    texts.append(content)
+                else:
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text" and block.get("text"):
+                            texts.append(block["text"])
+                        elif btype == "tool_use":
+                            tools.append({
+                                "name": block.get("name", "tool"),
+                                "detail": _tool_detail(block.get("name", ""), block.get("input")),
+                            })
+                events.append({
+                    "kind": role,
+                    "text": _clean_text("\n\n".join(texts)),
+                    "tools": tools,
+                })
+    except Exception:
+        pass
+    return events
+
+
+def _turn_in_progress(events):
+    """True if the session's latest turn has NOT ended yet.
+
+    A Cursor turn is delimited by an explicit ``turn_ended`` marker. The agent is
+    actively working when there is conversational activity (a user prompt, or the
+    agent mid-response / mid-tool-use) AFTER the last ``turn_ended``. Once the agent
+    finishes and ``turn_ended`` is written, the session is waiting on the user.
+
+    This is far more reliable than guessing from file timestamps, because
+    ``turn_ended`` is a definitive boundary rather than a recency heuristic.
+    """
+    last_end = -1
+    last_msg = -1
+    for i, e in enumerate(events):
+        if e["kind"] == "turn_ended":
+            last_end = i
+        elif e["kind"] in ("user", "assistant"):
+            last_msg = i
+    return last_msg > last_end
+
+
+def _latest_sub_mtime(sub_files):
+    """Most recent write across a session's background subagent transcripts (0 if none)."""
+    if not sub_files:
+        return 0.0
+    return max((m for _, m in sub_files), default=0.0)
+
+
+def _is_working(turn_in_progress, eff_mtime, sub_files):
+    """Office (working) vs kitchen (waiting), decided by TURN STATE + rollups.
+
+    Working when the latest turn is still in progress, OR a background subagent
+    was written very recently (multitask: parent idle, worker running). Either way
+    a turn that has been completely silent past the staleness cap is considered
+    abandoned and sent to the kitchen so it can't occupy a desk indefinitely.
+
+    Computed fresh per request (depends on wall-clock vs the rolled-up mtimes).
+    """
+    now = time.time()
+    if (now - eff_mtime) > WORKING_STALE_CAP_SECONDS:
+        return False
+    if turn_in_progress:
+        return True
+    latest_sub = _latest_sub_mtime(sub_files)
+    return bool(latest_sub) and (now - latest_sub) <= SUBAGENT_ACTIVE_SECONDS
+
+
+def _rel_time(seconds_ago):
+    s = int(seconds_ago)
+    if s < 60:
+        return f"{s}s ago"
+    m = s // 60
+    if m < 60:
+        return f"{m}m ago"
+    h = m // 60
+    if h < 24:
+        return f"{h}h ago"
+    d = h // 24
+    return f"{d}d ago"
+
+
+_KNOWN_SUBAGENT_IDS = set()  # subagent uuids ever seen, remembered across scans
+_KNOWN_SUBAGENT_LOCK = threading.Lock()
+
+
+def discover_transcripts():
+    """Yield (uuid, project_folder, abspath, eff_mtime, sub_files) for top-level
+    agent transcripts, de-duplicated across ALL Cursor project roots.
+
+    Two correctness measures prevent the "appears after refresh then vanishes"
+    flicker:
+
+    * GLOBAL subagent exclusion. A subagent transcript is recorded inside its
+      parent's ``<parent>/subagents/<uuid>.jsonl`` AND (sometimes) as its own
+      top-level ``<uuid>/<uuid>.jsonl`` dir. We gather subagent uuids across EVERY
+      project (not just the current one) and never list them as their own agent.
+      Known subagent ids are also remembered across scans, so a transient gap in
+      the filesystem registration can't momentarily promote a subagent to a
+      top-level agent.
+    * CROSS-PROJECT de-dup. The same chat uuid can have a top-level transcript dir
+      in more than one project root (e.g. ``my-app`` and ``empty-window``). Yielding
+      both hands the frontend two agents with the same id -- one computed "working"
+      and one "waiting" -- which fight over the same slot and flicker. We keep a
+      single representative per uuid. When a uuid is duplicated we PREFER the copy
+      that currently computes to 'working' (e.g. the live ``my-app`` copy with a
+      fresh mid-turn subagent) over a stale copy (e.g. an ``empty-window`` copy with
+      a finished turn and no subagents), so the stale one can never shadow the
+      working one. Ties fall back to freshest eff_mtime, then most subagents.
+
+    ``eff_mtime`` is the most recent of the chat itself or any of its subagents, so
+    a session whose work runs in a background subagent still shows as working.
+    """
+    if not os.path.isdir(CURSOR_PROJECTS_DIR):
+        return
+    try:
+        projects = os.listdir(CURSOR_PROJECTS_DIR)
+    except OSError:
+        return
+
+    # ---- pass 1: gather subagent ids + files across ALL projects ----
+    subagent_ids = set()
+    sub_mtime = {}        # (project, entry) -> latest subagent transcript mtime
+    sub_files = {}        # (project, entry) -> [(subpath, submtime), ...]
+    project_entries = {}  # project -> entries list (cached so we don't relist)
+    for project in projects:
+        at_dir = os.path.join(CURSOR_PROJECTS_DIR, project, "agent-transcripts")
+        if not os.path.isdir(at_dir):
+            continue
+        try:
+            entries = os.listdir(at_dir)
+        except OSError:
+            continue
+        project_entries[project] = entries
+        for entry in entries:
+            sub_dir = os.path.join(at_dir, entry, "subagents")
+            if not os.path.isdir(sub_dir):
+                continue
+            try:
+                subs = os.listdir(sub_dir)
+            except OSError:
+                continue
+            for f in subs:
+                if not f.endswith(".jsonl"):
+                    continue
+                subagent_ids.add(f[: -len(".jsonl")])
+                try:
+                    subpath = os.path.join(sub_dir, f)
+                    m = os.path.getmtime(subpath)
+                    sub_files.setdefault((project, entry), []).append((subpath, m))
+                    if m > sub_mtime.get((project, entry), 0):
+                        sub_mtime[(project, entry)] = m
+                except OSError:
+                    pass
+
+    # remember subagent ids across scans (robust against transient registration gaps)
+    with _KNOWN_SUBAGENT_LOCK:
+        _KNOWN_SUBAGENT_IDS.update(subagent_ids)
+        known = set(_KNOWN_SUBAGENT_IDS)
+
+    # ---- pass 2: collect ALL candidate copies per uuid ----
+    cands = {}  # uuid -> [(eff_mtime, n_sub, project, jsonl, sub_files_list), ...]
+    for project, entries in project_entries.items():
+        at_dir = os.path.join(CURSOR_PROJECTS_DIR, project, "agent-transcripts")
+        for entry in entries:
+            if entry == "subagents" or entry in known:
+                continue
+            sess_dir = os.path.join(at_dir, entry)
+            if not os.path.isdir(sess_dir):
+                continue
+            jsonl = os.path.join(sess_dir, entry + ".jsonl")
+            if not os.path.isfile(jsonl):
+                continue
+            try:
+                mtime = os.path.getmtime(jsonl)
+            except OSError:
+                continue
+            sf = sub_files.get((project, entry), [])
+            eff_mtime = max(mtime, sub_mtime.get((project, entry), 0))
+            cands.setdefault(entry, []).append((eff_mtime, len(sf), project, jsonl, sf))
+
+    # ---- resolve duplicates: keep the live/freshest copy ----
+    # The same chat uuid can have a top-level dir in more than one project root. We
+    # keep a single representative: freshest rolled-up eff_mtime first (the copy
+    # being actively written), then the one with the most subagents -- so a stale
+    # duplicate can never shadow the live copy and steal its desk/kitchen slot.
+    for uuid, lst in cands.items():
+        if len(lst) == 1:
+            eff_mtime, _n, project, jsonl, sf = lst[0]
+        else:
+            def _score(c):
+                eff, n, _proj, _jl, _sfl = c
+                return (eff, n)
+            eff_mtime, _n, project, jsonl, sf = max(lst, key=_score)
+        yield uuid, project, jsonl, eff_mtime, sf
+
+
+_CACHE = {}  # uuid -> (mtime, parsed_dict)
+_CACHE_LOCK = threading.Lock()
+
+
+def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
+    with _CACHE_LOCK:
+        cached = _CACHE.get(uuid)
+        if cached and cached[0] == mtime and (full <= cached[1].get("_full", False)):
+            return cached[1]
+
+    events = _normalize_events(path)
+
+    task_full = ""
+    for ev in events:
+        if ev["kind"] == "user" and ev["text"]:
+            task_full = _strip_leading_timestamp(ev["text"]) or ev["text"]
+            break
+    title = task_full.split("\n")[0].strip()
+    if len(title) > 70:
+        title = title[:67].rstrip() + "..."
+    if not title:
+        title = "(untitled session)"
+
+    latest_response = ""
+    for ev in reversed(events):
+        if ev["kind"] == "assistant" and ev["text"]:
+            latest_response = ev["text"]
+            break
+
+    latest_tool = None
+    for ev in reversed(events):
+        if ev["tools"]:
+            latest_tool = ev["tools"][-1]
+            break
+
+    turn_in_progress = _turn_in_progress(events)
+    status = "working" if _is_working(turn_in_progress, mtime, sub_files) else "waiting"
+    msg_count = sum(1 for e in events if e["kind"] in ("user", "assistant"))
+
+    # what the agent is doing *right now*: most recent assistant text, else the
+    # most recent tool action, else fall back to the opening task.
+    latest_activity = latest_response
+    latest_kind = "assistant"
+    if not latest_activity and latest_tool:
+        latest_activity = f"{latest_tool['name']}: {latest_tool.get('detail', '')}".strip().rstrip(":")
+        latest_kind = "tool"
+    if not latest_activity:
+        latest_activity = task_full
+        latest_kind = "task"
+    latest_short = latest_activity[:360].rstrip() + (" ..." if len(latest_activity) > 360 else "")
+
+    result = {
+        "id": uuid,
+        "source": "cursor",
+        "name": _name_for(uuid),
+        "variant": _variant_for(uuid),
+        "project": _pretty_project(project),
+        "status": status,
+        "turn_in_progress": turn_in_progress,
+        "title": title,
+        "preview": (task_full[:360].rstrip() + (" ..." if len(task_full) > 360 else "")) or title,
+        "latest": latest_short or title,
+        "latest_kind": latest_kind,
+        "message_count": msg_count,
+        "mtime": mtime,
+        "last_activity_rel": _rel_time(time.time() - mtime),
+        "_full": False,
+    }
+
+    if full:
+        timeline = []
+        for ev in events[-14:]:
+            if ev["kind"] == "turn_ended":
+                timeline.append({"role": "system", "text": f"-- turn ended ({ev.get('status')}) --", "tools": []})
+                continue
+            text = ev["text"]
+            if len(text) > 1600:
+                text = text[:1600].rstrip() + " ..."
+            timeline.append({
+                "role": ev["kind"],
+                "text": text,
+                "tools": ev["tools"][:6],
+            })
+        result.update({
+            "task_full": task_full,
+            "latest_response": latest_response[:6000],
+            "latest_tool": latest_tool,
+            "timeline": timeline,
+            "transcript_path": path,
+            "_full": True,
+        })
+
+    with _CACHE_LOCK:
+        _CACHE[uuid] = (mtime, result)
+    return result
+
+
+# --------------------------------------------------------------------------------------
+# Claude Code transcripts (~/.claude/projects) -- same office, tagged source="claude"
+# --------------------------------------------------------------------------------------
+
+def _claude_pretty_project(dirname):
+    """Best-effort label from a Claude project dir.
+
+    Claude encodes the launch cwd as the dir name ('/' -> '-', leading '-'). Real
+    dashes make it impossible to reverse perfectly, so we show the last couple of
+    path-ish segments -- matching the cursor pretty style (e.g. '...-my-app' ->
+    'my-app').
+    """
+    name = (dirname or "").lstrip("-")
+    if name.lower().startswith("users-"):
+        parts = name.split("-")
+        if len(parts) >= 2:
+            name = "-".join(parts[-2:])
+    return name
+
+
+def _normalize_events_claude(path):
+    """Normalize a Claude Code .jsonl into the shared event shape.
+
+    Returns ``(events, ai_title)``. Claude Code has no ``turn_ended`` marker, so we
+    only emit user/assistant events; tool-result user messages are flagged so the
+    first *real* user prompt (not a tool result) can be used as the task. Inline
+    sidechain (subagent) records are skipped so the office worker reflects the main
+    thread -- a running Task subagent still surfaces as the parent's pending tool_use.
+    """
+    events = []
+    ai_title = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+                    ai_title = obj["aiTitle"]
+                    continue
+                if obj.get("isSidechain"):
+                    continue
+                msg = obj.get("message") or {}
+                role = msg.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                content = msg.get("content") or []
+                texts = []
+                tools = []
+                is_tool_result = False
+                if isinstance(content, str):
+                    texts.append(content)
+                else:
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type")
+                        if btype == "text" and block.get("text"):
+                            texts.append(block["text"])
+                        elif btype == "tool_use":
+                            tools.append({
+                                "name": block.get("name", "tool"),
+                                "detail": _tool_detail(block.get("name", ""), block.get("input")),
+                            })
+                        elif btype == "tool_result":
+                            is_tool_result = True
+                events.append({
+                    "kind": role,
+                    "text": _clean_text("\n\n".join(texts)),
+                    "tools": tools,
+                    "is_tool_result": is_tool_result,
+                })
+    except Exception:
+        pass
+    return events, ai_title
+
+
+def _turn_in_progress_claude(events):
+    """Claude has no ``turn_ended`` marker: a turn is done once the latest message is
+    a final assistant answer (text with no pending tool call). Anything else -- a
+    fresh user prompt, a tool result awaiting the model, or an in-flight tool_use --
+    means the agent is still working (at a desk)."""
+    for e in reversed(events):
+        if e["kind"] not in ("user", "assistant"):
+            continue
+        if e["kind"] == "assistant" and e["text"] and not e["tools"]:
+            return False  # delivered a final response -> waiting on the user
+        return True       # anything else -> mid-turn
+    return False          # no conversation yet
+
+
+def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
+    with _CACHE_LOCK:
+        cached = _CACHE.get(uuid)
+        if cached and cached[0] == mtime and (full <= cached[1].get("_full", False)):
+            return cached[1]
+
+    events, ai_title = _normalize_events_claude(path)
+
+    task_full = ""
+    for ev in events:
+        if ev["kind"] == "user" and ev["text"] and not ev.get("is_tool_result"):
+            task_full = _strip_leading_timestamp(ev["text"]) or ev["text"]
+            break
+
+    title = (ai_title or task_full.split("\n")[0]).strip()
+    if len(title) > 70:
+        title = title[:67].rstrip() + "..."
+    if not title:
+        title = "(untitled session)"
+
+    latest_response = ""
+    for ev in reversed(events):
+        if ev["kind"] == "assistant" and ev["text"]:
+            latest_response = ev["text"]
+            break
+
+    latest_tool = None
+    for ev in reversed(events):
+        if ev["tools"]:
+            latest_tool = ev["tools"][-1]
+            break
+
+    turn_in_progress = _turn_in_progress_claude(events)
+    status = "working" if _is_working(turn_in_progress, mtime, sub_files) else "waiting"
+    msg_count = sum(1 for e in events if e["kind"] in ("user", "assistant"))
+
+    latest_activity = latest_response
+    latest_kind = "assistant"
+    if not latest_activity and latest_tool:
+        latest_activity = f"{latest_tool['name']}: {latest_tool.get('detail', '')}".strip().rstrip(":")
+        latest_kind = "tool"
+    if not latest_activity:
+        latest_activity = task_full
+        latest_kind = "task"
+    latest_short = latest_activity[:360].rstrip() + (" ..." if len(latest_activity) > 360 else "")
+
+    result = {
+        "id": uuid,
+        "source": "claude",
+        "name": _name_for(uuid),
+        "variant": _variant_for(uuid),
+        "project": _claude_pretty_project(project),
+        "status": status,
+        "turn_in_progress": turn_in_progress,
+        "title": title,
+        "preview": (task_full[:360].rstrip() + (" ..." if len(task_full) > 360 else "")) or title,
+        "latest": latest_short or title,
+        "latest_kind": latest_kind,
+        "message_count": msg_count,
+        "mtime": mtime,
+        "last_activity_rel": _rel_time(time.time() - mtime),
+        "_full": False,
+    }
+
+    if full:
+        timeline = []
+        for ev in events[-14:]:
+            text = ev["text"]
+            if len(text) > 1600:
+                text = text[:1600].rstrip() + " ..."
+            timeline.append({
+                "role": ev["kind"],
+                "text": text,
+                "tools": ev["tools"][:6],
+            })
+        result.update({
+            "task_full": task_full,
+            "latest_response": latest_response[:6000],
+            "latest_tool": latest_tool,
+            "timeline": timeline,
+            "transcript_path": path,
+            "_full": True,
+        })
+
+    with _CACHE_LOCK:
+        _CACHE[uuid] = (mtime, result)
+    return result
+
+
+def discover_claude_transcripts():
+    """Yield (uuid, project_dir, abspath, eff_mtime, sub_files) for Claude Code chats.
+
+    Each chat is ``~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`` with Task
+    subagents in a sibling ``<uuid>/subagents/*.jsonl``. ``eff_mtime`` rolls up the
+    freshest write across the chat and its subagents (so a session whose work runs in
+    a background subagent still reads as working). Duplicate uuids across roots keep
+    the freshest copy, mirroring the cursor discovery.
+    """
+    if not os.path.isdir(CLAUDE_PROJECTS_DIR):
+        return
+    try:
+        projects = os.listdir(CLAUDE_PROJECTS_DIR)
+    except OSError:
+        return
+
+    cands = {}  # uuid -> [(eff_mtime, n_sub, project_dir, jsonl, sub_files), ...]
+    for project in projects:
+        pdir = os.path.join(CLAUDE_PROJECTS_DIR, project)
+        if not os.path.isdir(pdir):
+            continue
+        try:
+            entries = os.listdir(pdir)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".jsonl"):
+                continue
+            uuid = entry[: -len(".jsonl")]
+            jsonl = os.path.join(pdir, entry)
+            if not os.path.isfile(jsonl):
+                continue
+            try:
+                mtime = os.path.getmtime(jsonl)
+            except OSError:
+                continue
+            sf = []
+            sub_dir = os.path.join(pdir, uuid, "subagents")
+            if os.path.isdir(sub_dir):
+                try:
+                    for sfn in os.listdir(sub_dir):
+                        if not sfn.endswith(".jsonl"):
+                            continue
+                        sp = os.path.join(sub_dir, sfn)
+                        try:
+                            sf.append((sp, os.path.getmtime(sp)))
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            sub_m = max((m for _, m in sf), default=0)
+            eff_mtime = max(mtime, sub_m)
+            cands.setdefault(uuid, []).append((eff_mtime, len(sf), project, jsonl, sf))
+
+    for uuid, lst in cands.items():
+        eff_mtime, _n, project, jsonl, sf = max(lst, key=lambda c: (c[0], c[1]))
+        yield uuid, project, jsonl, eff_mtime, sf
+
+
+# Registry so get_agents / list_projects / get_agent_detail can walk every source
+# uniformly. Each entry: (source_name, discover_fn, parse_fn).
+_SOURCES = [
+    ("cursor", discover_transcripts, parse_agent),
+    ("claude", discover_claude_transcripts, parse_claude_agent),
+]
+
+
+def _project_matches(needle, *labels):
+    """Substring match a --project needle against any of the given labels (raw dir
+    and/or pretty label). Empty needle matches everything."""
+    if not needle:
+        return True
+    needle = needle.lower()
+    return any(needle in (lbl or "").lower() for lbl in labels)
+
+
+def _enabled_sources(sources):
+    """Filter the source registry by name (None -> all)."""
+    if not sources:
+        return _SOURCES
+    want = set(sources)
+    return [s for s in _SOURCES if s[0] in want]
+
+
+def get_agents(hours, full=False, project_filter=None, sources=None):
+    cutoff = time.time() - hours * 3600
+    agents = []
+    for _src, discover, parse in _enabled_sources(sources):
+        for uuid, project, path, mtime, _sub_files in discover():
+            if mtime < cutoff:
+                continue
+            a = parse(uuid, project, path, mtime, sub_files=_sub_files, full=full)
+            if not _project_matches(project_filter, project, a["project"]):
+                continue
+            # recompute status fresh each request: parse is cached, but working/
+            # kitchen depends on wall-clock (the staleness cap + subagent freshness)
+            # vs the turn state, so it can change even when the transcript hasn't.
+            a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files) else "waiting"
+            a["last_activity_rel"] = _rel_time(time.time() - mtime)
+            agents.append(a)
+    agents.sort(key=lambda a: a["mtime"], reverse=True)
+    return agents
+
+
+def list_projects(hours, sources=None):
+    """Return [(pretty_label, raw_folder, active_count, source)] sorted by activity."""
+    cutoff = time.time() - hours * 3600
+    counts = {}
+    for src, discover, parse in _enabled_sources(sources):
+        for uuid, project, path, mtime, _sub_files in discover():
+            if mtime < cutoff:
+                continue
+            a = parse(uuid, project, path, mtime, sub_files=_sub_files, full=False)
+            key = (a["project"], project, src)
+            counts[key] = counts.get(key, 0) + 1
+    rows = [(pretty, raw, n, src) for (pretty, raw, src), n in counts.items()]
+    rows.sort(key=lambda r: (-r[2], r[0]))
+    return rows
+
+
+def get_agent_detail(uuid):
+    for _src, discover, parse in _SOURCES:
+        for u, project, path, mtime, _sub_files in discover():
+            if u == uuid:
+                d = parse(uuid, project, path, mtime, sub_files=_sub_files, full=True)
+                d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files) else "waiting"
+                d["last_activity_rel"] = _rel_time(time.time() - mtime)
+                return d
+    return None
+
+
+def demo_agents():
+    now = time.time()
+    samples = [
+        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor"),
+        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude"),
+        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor"),
+        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude"),
+        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude"),
+        ("demo-ffff-0006", "waiting", "Draft migration plan for the new schema", 9000, "cursor"),
+    ]
+    out = []
+    for uuid, status, title, ago, source in samples:
+        out.append({
+            "id": uuid,
+            "source": source,
+            "name": _name_for(uuid),
+            "variant": _variant_for(uuid),
+            "project": "demo-office",
+            "status": status,
+            "title": title,
+            "preview": title,
+            "latest": ("Reviewing the latest changes and preparing a response about: " + title),
+            "latest_kind": "assistant",
+            "message_count": 12,
+            "mtime": now - ago,
+            "last_activity_rel": _rel_time(ago),
+            "demo": True,
+        })
+    return out
+
+
+def demo_detail(uuid):
+    for a in demo_agents():
+        if a["id"] == uuid:
+            a = dict(a)
+            a.update({
+                "task_full": a["title"],
+                "latest_response": "This is a demo worker. Run without --demo to see your real agents.\n\nI'd start by mapping the relevant modules, then make the change incrementally and verify with a quick test.",
+                "latest_tool": {"name": "Shell", "detail": "python -m pytest -v"},
+                "timeline": [
+                    {"role": "user", "text": a["title"], "tools": []},
+                    {"role": "assistant", "text": "Let me explore the codebase first.", "tools": [{"name": "Grep", "detail": "export"}]},
+                    {"role": "assistant", "text": "Found the relevant module. Making the change now.", "tools": [{"name": "StrReplace", "detail": "service.py"}]},
+                ],
+                "transcript_path": "(demo - no file)",
+            })
+            return a
+    return None
+
+
+# --------------------------------------------------------------------------------------
+# Frontend (single embedded HTML/JS/CSS page)
+# --------------------------------------------------------------------------------------
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cursor Office</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --gb-darkest:#0f380f; --gb-dark:#306230; --gb-light:#8bac0f; --gb-lightest:#9bbc0f;
+    --shell:#c4bfb4; --shell-dark:#9a958b;
+    /* high-contrast greyscale for readable text panels (tooltip + detail) */
+    --panel:#1c1e24; --panel2:#26282f; --panel-line:#3a3d46;
+    --ink-hi:#f4f5f7; --ink-mid:#c4c7cf; --ink-lo:#8b8f99;
+    --card:#f2f2f4; --card-line:#d4d5da; --card-ink:#1c1e24; --card-ink-lo:#5b5e68;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;background:#1b1f17;color:var(--gb-darkest);
+    font-family:'Press Start 2P',ui-monospace,Menlo,Consolas,monospace;}
+  body{display:flex;align-items:center;justify-content:center;padding:18px;}
+  #shell{background:var(--shell);border-radius:14px 14px 42px 14px;padding:18px 18px 26px;
+    box-shadow:0 14px 40px rgba(0,0,0,.55), inset 0 2px 0 #e8e4da, inset 0 -3px 0 var(--shell-dark);
+    width:min(960px,96vw);}
+  #brand{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;
+    font-size:11px;color:#5a564d;letter-spacing:1px;}
+  #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
+    box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
+  #brand #celebrate{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+    background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
+  #brand #celebrate:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active{transform:translateY(1px);}
+  #screenwrap{background:#22281a;border-radius:10px;padding:12px;
+    box-shadow:inset 0 0 0 3px #20240f, inset 0 0 22px rgba(0,0,0,.6);}
+  #matrix{display:flex;align-items:center;gap:8px;justify-content:center;margin-bottom:8px;
+    font-size:7px;letter-spacing:2px;color:#6f6a78;}
+  #matrix .ln{height:3px;flex:1;max-width:120px;border-radius:2px;}
+  #matrix .l1{background:linear-gradient(90deg,#7a1f5a,#1f3f7a);}
+  #matrix .l2{background:linear-gradient(90deg,#1f3f7a,#7a1f5a);}
+  #screen{position:relative;width:100%;aspect-ratio:10/9;background:#65748d;
+    border-radius:6px;overflow:hidden;}
+  canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;
+    image-rendering:crisp-edges;cursor:pointer;}
+  #hud{position:absolute;left:0;right:0;top:0;display:flex;justify-content:space-between;
+    padding:6px 8px;font-size:8px;color:#fff;pointer-events:none;}
+  #hud .pill{background:rgba(0,0,0,.38);padding:4px 7px;border-radius:4px;}
+  #tip{position:absolute;left:8px;bottom:8px;font-size:7px;color:#fff;
+    background:rgba(0,0,0,.32);padding:3px 6px;border-radius:4px;pointer-events:none;}
+  #nametag{position:absolute;background:var(--panel);
+    color:var(--ink-hi);font-size:11px;line-height:1.55;padding:11px 13px;border-radius:7px;
+    width:300px;max-width:78%;white-space:normal;word-break:break-word;
+    border:1px solid var(--panel-line);
+    box-shadow:0 10px 26px rgba(0,0,0,.55);
+    pointer-events:none;display:none;z-index:15;}
+  #nametag .nt-name{font-size:13px;color:var(--ink-hi);font-weight:bold;}
+  #nametag .nt-badge{display:inline-block;font-size:9px;padding:2px 7px;border-radius:4px;margin-left:7px;vertical-align:middle;}
+  #nametag .nt-badge.working{background:#e8eaee;color:#16181d;}
+  #nametag .nt-badge.waiting{background:#4a4d56;color:#f4f5f7;}
+  .nt-badge.src-cursor,.badge.src-cursor{background:#2b6d84;color:#eaf6fb;}
+  .nt-badge.src-claude,.badge.src-claude{background:#d97757;color:#2a1409;}
+  #nametag .nt-meta{font-size:9px;color:var(--ink-lo);margin:6px 0 8px;}
+  #nametag .nt-label{font-size:8px;letter-spacing:1px;color:var(--ink-lo);text-transform:uppercase;margin-top:8px;}
+  #nametag .nt-text{font-size:11px;color:var(--ink-mid);margin-top:3px;}
+  #nametag .nt-hint{font-size:8px;color:var(--ink-lo);margin-top:9px;text-align:right;opacity:.85;}
+  #legend{display:flex;gap:14px;justify-content:center;margin-top:12px;font-size:8px;color:#5a564d;}
+  #legend span{display:inline-flex;align-items:center;gap:6px;}
+  #legend i{width:10px;height:10px;border-radius:2px;display:inline-block;}
+
+  /* overlay dialog */
+  #overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(15,24,8,.55);padding:14px;z-index:20;}
+  #dialog{width:100%;max-width:680px;max-height:100%;background:var(--card);
+    border:3px solid var(--panel);border-radius:8px;display:flex;flex-direction:column;
+    box-shadow:0 0 0 3px var(--panel-line), 0 18px 40px rgba(0,0,0,.5);overflow:hidden;}
+  #dhead{background:var(--panel);color:var(--ink-hi);padding:12px 14px;
+    display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}
+  #dhead .who{font-size:13px;color:var(--ink-hi);}
+  #dhead .sub{font-size:9px;color:var(--ink-mid);margin-top:6px;line-height:1.7;}
+  #dhead button{font-family:inherit;background:var(--panel2);color:var(--ink-hi);
+    border:1px solid var(--panel-line);border-radius:4px;font-size:9px;padding:5px 8px;cursor:pointer;}
+  #dbody{padding:16px;overflow:auto;font-size:11px;line-height:1.85;color:var(--card-ink);}
+  #dbody h4{margin:0 0 8px;font-size:10px;color:var(--card-ink-lo);text-transform:uppercase;letter-spacing:1px;}
+  #dbody section{margin-bottom:18px;}
+  #dbody .box{background:#ffffff;border:1px solid var(--card-line);border-left:3px solid #8b8f99;
+    padding:11px 13px;border-radius:4px;white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.75;color:var(--card-ink);}
+  #dbody .tool{display:inline-block;background:var(--panel);color:var(--ink-hi);
+    padding:3px 7px;border-radius:3px;font-size:8px;margin:2px 4px 2px 0;}
+  #dbody .turn{font-size:8px;color:var(--card-ink-lo);text-align:center;margin:6px 0;}
+  .role-user .box{border-left-color:#3a3d46;background:#ececed;}
+  .badge{display:inline-block;font-size:8px;padding:3px 7px;border-radius:3px;}
+  .badge.working{background:#e8eaee;color:#16181d;}
+  .badge.waiting{background:#4a4d56;color:#f4f5f7;}
+  #dfoot{display:flex;flex-wrap:wrap;gap:8px;padding:10px 12px;border-top:1px solid var(--card-line);
+    background:#e7e7ea;}
+  #dfoot button{flex:1 1 auto;font-family:inherit;font-size:8px;padding:9px 8px;cursor:pointer;
+    border:1px solid var(--panel);border-radius:5px;background:var(--panel);color:var(--ink-hi);}
+  #dfoot button.ghost{background:#fff;color:var(--card-ink);border-color:var(--card-line);}
+  #toast{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);background:var(--panel);
+    color:var(--ink-hi);font-size:8px;padding:7px 12px;border-radius:5px;display:none;z-index:30;}
+  #empty{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;
+    justify-content:center;text-align:center;font-size:9px;color:#1c1e24;padding:24px;line-height:2;}
+</style>
+</head>
+<body>
+  <div id="shell">
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><span id="clock"></span></div>
+    <div id="screenwrap">
+      <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
+      <div id="screen">
+        <canvas id="cv" width="640" height="576"></canvas>
+        <div id="hud">
+          <span class="pill" id="hud-work">working: 0</span>
+          <span class="pill" id="hud-wait">in kitchen: 0</span>
+        </div>
+        <div id="tip">click a worker</div>
+        <div id="nametag"></div>
+        <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
+          Start a chat in Cursor or Claude Code, or run with <b>--demo</b> to populate the office.</div>
+        <div id="overlay">
+          <div id="dialog">
+            <div id="dhead">
+              <div>
+                <div class="who" id="d-name"></div>
+                <div class="sub" id="d-sub"></div>
+              </div>
+              <button id="d-x" title="close">X</button>
+            </div>
+            <div id="dbody"></div>
+            <div id="dfoot">
+              <button id="d-open">OPEN TRANSCRIPT FILE (.jsonl)</button>
+              <button id="d-copy" class="ghost">COPY SESSION ID</button>
+            </div>
+          </div>
+        </div>
+        <div id="toast"></div>
+      </div>
+    </div>
+    <div id="legend">
+      <span><i style="background:#1f5d1f"></i>working (at desk)</span>
+      <span><i style="background:#7a4a00"></i>waiting (in kitchen)</span>
+      <span><i style="background:#2b6d84"></i>Cursor</span>
+      <span><i style="background:#d97757"></i>Claude Code</span>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const W = cv.width, H = cv.height;
+// global art scale: characters + desks are drawn larger (about their anchor) so
+// the rooms feel filled. ALL hitbox / hover-ring / pick() math multiplies by SC.
+const SC = 1.5;
+
+// Game Boy palette
+const C = { d0:'#0f380f', d1:'#306230', d2:'#8bac0f', d3:'#9bbc0f', floor:'#94ad42', floor2:'#8aa53b' };
+// look variants -- bright, cheerful, diverse shirt colours (no gloomy navy crowd)
+const SHIRTS = ['#e0533b','#2f93d8','#37b56c','#e8a72e','#8c5fd6','#22b9b9','#e673a8','#6aa72f',
+                '#d83b5b','#3f74d6','#ee8f2c','#16a0c0','#c84fc0','#5bc05b','#f0b429','#ff7a4d'];
+const HAIR   = ['#3a2a14','#1a1410','#5a3010','#6a6a6a','#2a1840','#403018','#7a3010','#c89020','#d8d8d8','#1a3a5a'];
+const SKIN   = ['#f0d2a8','#e6b98a','#d2a070','#f6dcc0','#c08860','#ecc89c','#b87a52','#fae0c2'];
+const ACCCOL = ['#1b1b1b','#d2452f','#2f74d6','#e8a72e','#22b9b9','#8c5fd6'];
+
+// rich, full-colour scene palette (the screen is no longer monochrome green)
+const PAL = {
+  sky:'#bfe9f5', skyTop:'#9ad8ee', cloud:'#ffffff',
+  bldg1:'#7c87b0', bldg2:'#9aa4c6', bldgWin:'#dfeefa',
+  nightTop:'#171436', nightBot:'#46315f', star:'#ffffff', moon:'#f3eecf',
+  bldgN1:'#211c40', bldgN2:'#2c2752', litWin:'#ffd36b',
+  wall:'#efe6d2', trim:'#cdbf9c', base:'#b09a72',
+  ofloor:'#6f7f98', ofloor2:'#65748d',
+  kfloor:'#ecdcb6', kfloor2:'#e1cfa4',
+  wood:'#b27a43', woodHi:'#c68f55', woodDk:'#7d4f2a',
+  metal:'#aeb9c2', metalDk:'#7a8893', steel:'#cdd6dd',
+  fridge:'#e3eaef', fridgeDk:'#c5cfd6',
+  cabinet:'#3f5266', cabinetTop:'#d9c8a6',
+  leaf:'#46a04f', leafHi:'#69bf68', leafDk:'#2f7a3c', pot:'#c4693a', potDk:'#9a4f28',
+  board:'#2c3b37', chalk:'#ece6d2', chalkY:'#e4c558',
+  monitor:'#2b2b34', monitorLip:'#16161c', screen:'#7fd3e0',
+  paper:'#ffffff', ink:'#26282e', outline:'#241c2b', chairW:'#6a5240',
+  pink:'#dd8aa8', red:'#d2452f', yellow:'#e3b021', orange:'#e07a2f',
+  mugA:'#d9534f', mugB:'#4f86d9', mugC:'#e8b84b',
+};
+
+// derive a fun, deterministic appearance from the agent id.
+// NOTE: hash() is unsigned 32-bit, so we MUST use unsigned shifts (>>>) here -
+// a signed >> would go negative for high hashes and yield undefined colours.
+function featuresFor(id){
+  const h = hash(id);
+  return {
+    skin: SKIN[(h>>>0) % SKIN.length],
+    hair: HAIR[(h>>>3) % HAIR.length],
+    shirt: SHIRTS[(h>>>6) % SHIRTS.length],
+    hairStyle: (h>>>9) % 6,        // 0 flat 1 spiky 2 bald 3 bun 4 mop 5 mohawk
+    acc: (h>>>12) % 6,             // 0 none 1 glasses 2 cap 3 headphones 4 beanie 5 antenna
+    accCol: ACCCOL[(h>>>15) % ACCCOL.length],
+    pants: ['#3a4654','#4a3a2e','#2f4250','#5a4326','#3a3a44','#2f4a38'][(h>>>23) % 6],
+    speed: 0.55 + ((h>>>18) % 5) * 0.14,   // per-person walk speed
+    big: ((h>>>21) & 1) === 1,             // chunkier body
+    female: ((h>>>16) & 1) === 1,          // ~half women, stable by id
+    femStyle: (h>>>17) % 3,                // 0 long  1 ponytail  2 bun+bow
+  };
+}
+
+let agents = [];      // raw from server
+let people = [];      // live sprites with positions
+let deskSlots = [];   // fixed office desks (always drawn; some hold a worker)
+let deskAssign = {};  // agent id -> stable desk slot index (kept across refreshes)
+let seatAssign = {};  // agent id -> stable kitchen seat index
+let hover = null;
+let detailCache = {};
+let WINDOW_HOURS = 24;
+let confetti = [];          // celebration particles (capped, auto-expire)
+let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
+
+// ---- ambient random events (pure scenery; never clickable / never hit-tested) ----
+// One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
+// the same rAF clock so it can't drift like a stray setInterval. These critters live
+// ONLY in the animation layer: pick(), hover, confetti and polling never see them.
+let amb = { dog:null, cat:null };   // at most one of each on screen
+let nextEventAt = 0;                // performance.now() ms of the next event
+let lastEventType = null;           // avoid firing the same type twice in a row
+
+// stable kitchen floor spots (hand-placed, ≥~44px apart, CLEAR of the fridge/counter,
+// the lounge table+poufs, the couch, the REFRESH! machine and the wall signs). Used
+// for waiter scatter AND as relocate targets so agents never stack.
+const KSPOTS = [
+  [95,432],[185,428],[280,433],[375,429],          // band in front of the counter
+  [545,436],                                        // right notch, left of the vending machine
+  [60,460],[125,460],[230,470],[315,466],           // mid floor (between fridge and couch)
+  [255,548],[320,545],[365,540]                     // front-centre gap (between table and couch)
+];
+
+// ---- layout regions (in canvas px) ----
+function layout(){
+  const kitchenH = Math.round(H*0.40);
+  return {
+    office: {x:0, y:0, w:W, h:H-kitchenH},
+    kitchen:{x:0, y:H-kitchenH, w:W, h:kitchenH},
+    kitchenTop: H-kitchenH
+  };
+}
+
+// assign stable positions: desks for workers (grid), wander targets for waiters
+function rebuild(){
+  const L = layout();
+  const workers = agents.filter(a=>a.status==='working');
+  const waiters = agents.filter(a=>a.status!=='working');
+
+  const next = [];
+  const prevById = {}; people.forEach(p=>prevById[p.id]=p);
+
+  // --- STABLE position assignment ---------------------------------------
+  // Each agent keeps the SAME desk slot / kitchen seat across refreshes, keyed
+  // by its id. When an agent changes role (kitchen<->desk) it KEEPS its old x/y
+  // and walks/glides to the new target instead of teleporting.
+  const workerIds = new Set(workers.map(a=>a.id));
+  const waiterIds = new Set(waiters.map(a=>a.id));
+  // release assignments for agents that left or switched role
+  Object.keys(deskAssign).forEach(id=>{ if(!workerIds.has(id)) delete deskAssign[id]; });
+  Object.keys(seatAssign).forEach(id=>{ if(!waiterIds.has(id)) delete seatAssign[id]; });
+  // give brand-new workers the lowest free desk index (stable thereafter)
+  const usedSlots = new Set(Object.values(deskAssign));
+  workers.forEach(a=>{ if(deskAssign[a.id]==null){ let i=0; while(usedSlots.has(i)) i++; deskAssign[a.id]=i; usedSlots.add(i); } });
+  const usedSeats = new Set(Object.values(seatAssign));
+  waiters.forEach(a=>{ if(seatAssign[a.id]==null){ let i=0; while(usedSeats.has(i)) i++; seatAssign[a.id]=i; usedSeats.add(i); } });
+
+  // a fixed office layout of desks that is ALWAYS drawn (so the room looks
+  // furnished even when nobody is working). Sized to fit the highest used slot.
+  const cols = 3;
+  const maxSlot = Object.values(deskAssign).reduce((m,v)=>Math.max(m,v), -1);
+  const need = Math.max(6, Math.ceil((maxSlot+1)/cols)*cols);
+  // tighter grid sized for the bigger (SC) desks so the office reads as full
+  const left = 104, right = W-104, top = WALL_H+48, rowH = 112;
+  deskSlots = [];
+  for(let i=0;i<need;i++){
+    const c=i%cols, r=Math.floor(i/cols);
+    const x = left + c*((right-left)/(cols-1));
+    const y = top + r*rowH;
+    deskSlots.push({x, y, worker:null});
+  }
+  workers.forEach(a=>{
+    const old = prevById[a.id];
+    const slot = deskSlots[deskAssign[a.id]];
+    // already seated at THIS desk? stay seated. Otherwise walk in and then sit.
+    const sameSeat = old && old.kind==='work' && old.seated &&
+                     old.deskX===slot.x && old.deskY===slot.y;
+    const person = Object.assign(old||{}, {
+      id:a.id, agent:a, kind:'work',
+      // keep current position so a kitchen->desk move animates as a walk
+      x: old? old.x : slot.x, y: old? old.y : slot.y,
+      deskX:slot.x, deskY:slot.y, vx:0, vy:0,
+      seated: old ? !!sameSeat : true,   // fresh load: just sit; transitions walk
+      seed:hash(a.id), variant:a.variant, feat:featuresFor(a.id),
+    });
+    slot.worker = person;
+    next.push(person);
+  });
+
+  // kitchen: scatter waiting agents NATURALLY across the open floor (not a grid).
+  // Each agent keeps a stable anchor (by seatAssign index) plus a small deterministic
+  // jitter from hash(id). The anchor list is hand-placed (≥~52px apart, with a few
+  // loose pairs) and stays CLEAR of the fridge/counter (top-left band), the COFFEE
+  // and DO GOOD WORK signs, the REFRESH! machine (right), and the couch + table.
+  const k = L.kitchen;
+  // hand-placed scatter across the OPEN floor (KSPOTS), clear of the lounge table
+  // (left), the couch + side table (right), the counter/fridge (back wall), the
+  // REFRESH! machine and the DO GOOD WORK poster. Spaced ≥~44px for hovering.
+  waiters.forEach(a=>{
+    const old = prevById[a.id];
+    const idx = seatAssign[a.id];
+    const base = KSPOTS[idx % KSPOTS.length];
+    const ring = Math.floor(idx / KSPOTS.length);   // overflow agents nudge outward
+    const hsh = hash(a.id);
+    const jx = ((hsh>>>3) % 9) - 4;                  // -4..+4 deterministic jitter
+    const jy = ((hsh>>>9) % 9) - 4;
+    // a relocated agent (ambient event) keeps its event-chosen spot across refreshes
+    // instead of snapping back to its stable anchor.
+    const home = (old && old.relocHome) ? old.relocHome
+               : { x: base[0] + jx + ring*16, y: base[1] + jy + ring*14 };
+    const cameFromDesk = old && old.kind==='work';
+    next.push(Object.assign(old||{}, {
+      id:a.id, agent:a, kind:'wait',
+      // brand-new agents enter from the room doorway (top-center) and walk to
+      // their spot; agents leaving a desk keep their office position and walk down.
+      x: old? old.x : W*0.5, y: old? old.y : k.y+8,
+      home, vx:0, vy:0,
+      // walk to the spot if new or just left a desk; otherwise keep prior mode
+      mode: (!old || cameFromDesk) ? 'walk' : old.mode,
+      seed:hash(a.id), variant:a.variant, feat:featuresFor(a.id),
+    }));
+  });
+
+  people = next;
+  document.getElementById('hud-work').textContent = 'working: '+workers.length;
+  document.getElementById('hud-wait').textContent = 'in kitchen: '+waiters.length;
+  document.getElementById('empty').style.display = agents.length? 'none':'flex';
+}
+
+function hash(s){let h=0;for(let i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))&0xffffffff;return h>>>0;}
+
+// ---- drawing helpers ----
+function px(x,y,w,h,col){ctx.fillStyle=col;ctx.fillRect(x|0,y|0,w|0,h|0);}
+// scale subsequent drawing about an anchor point (used to enlarge sprites/desks)
+function scaleAbout(ax,ay,s){ ctx.translate(ax,ay); ctx.scale(s,s); ctx.translate(-ax,-ay); }
+
+// shade a #rrggbb colour: f>0 lightens toward white, f<0 darkens toward black.
+// used for soft, cohesive shading on shirts/hair/furniture (no flat fills).
+const _shadeCache={};
+function shade(hex, f){
+  const key=hex+'|'+f; if(_shadeCache[key]) return _shadeCache[key];
+  let n=parseInt(hex.slice(1),16); let r=(n>>16)&255,g=(n>>8)&255,b=n&255;
+  if(f>=0){ r+=(255-r)*f; g+=(255-g)*f; b+=(255-b)*f; } else { r*=(1+f); g*=(1+f); b*=(1+f); }
+  return _shadeCache[key]='rgb('+(r|0)+','+(g|0)+','+(b|0)+')';
+}
+// a small white speech bubble with a pink heart (cozy kitchen vibe)
+function heartBubble(x,y){
+  px(x-8,y-7,18,12,PAL.paper); px(x-8,y-7,18,1,'#ececf2'); px(x-8,y+4,18,1,'#d6d6de');
+  px(x-9,y-5,1,8,PAL.paper); px(x+10,y-5,1,8,PAL.paper);
+  px(x-3,y+5,3,3,PAL.paper); px(x-2,y+8,2,2,PAL.paper);     // little tail
+  px(x-3,y-4,3,3,PAL.pink); px(x+1,y-4,3,3,PAL.pink);        // heart lobes
+  px(x-4,y-2,9,2,PAL.pink); px(x-2,y,5,2,PAL.pink); px(x,y+2,1,1,PAL.pink);
+}
+
+const WALL_H = 78;
+
+function drawFloor(){
+  const L=layout(), oh=L.office.h;
+  // office floor: cohesive tiles with grout lines + gentle per-tile shading
+  for(let ty=WALL_H; ty<oh; ty+=24){
+    for(let tx=0; tx<W; tx+=24){
+      const alt=((tx/24+Math.floor((ty-WALL_H)/24))&1);
+      px(tx,ty,24,24, alt?PAL.ofloor:PAL.ofloor2);
+      px(tx,ty,24,1,'rgba(255,255,255,.05)');      // tile top highlight
+      px(tx,ty+23,24,1,'rgba(0,0,0,.10)');          // grout (bottom)
+      px(tx+23,ty,1,24,'rgba(0,0,0,.08)');          // grout (right)
+    }
+  }
+  px(0,WALL_H,W,26,'rgba(255,255,255,.04)');         // soft daylight band near the windows
+  // back wall + picture-rail + skirting
+  px(0,0,W,WALL_H,PAL.wall); px(0,0,W,10,shade(PAL.wall,.05));
+  px(0,WALL_H-8,W,2,shade(PAL.wall,-.06)); px(0,WALL_H-5,W,3,PAL.trim); px(0,WALL_H-2,W,2,PAL.base);
+  drawWindow(20, 8, Math.round(W*0.48), WALL_H-20);
+  drawWallDecor(Math.round(W*0.48)+34, 6);
+
+  // kitchen floor (warm tiles)
+  for(let y=L.kitchenTop;y<H;y+=20){
+    for(let x=0;x<W;x+=20){ px(x,y,20,20, ((x/20+y/20)&1)?PAL.kfloor:PAL.kfloor2); }
+  }
+  // divider skirting between rooms
+  px(0,L.kitchenTop-4,W,4,PAL.base); px(0,L.kitchenTop,W,2,'rgba(0,0,0,.16)');
+
+  drawOfficeProps();
+  drawKitchenProps();
+}
+
+// ---- furniture / decor helpers ----
+function chair(x,y,col){ px(x,y,12,5,col); px(x,y-9,2,9,col); px(x+10,y-9,2,9,col); px(x,y-11,12,3,col); }
+function woodTable(x,y,w,h){ px(x,y,w,h,PAL.wood); px(x,y,w,5,PAL.woodHi); px(x+3,y+9,w-6,2,PAL.woodDk);
+  px(x-2,y+h-2,5,9,PAL.woodDk); px(x+w-3,y+h-2,5,9,PAL.woodDk); }
+function laptop(x,y){ px(x,y,18,12,PAL.monitorLip); px(x+1,y+1,16,8,PAL.screen); px(x-1,y+11,20,3,PAL.metal); }
+function mug(x,y,col){ px(x,y,7,7,PAL.paper); px(x+1,y+1,5,5,col); px(x+7,y+2,2,3,PAL.paper); }
+// a single tapered leaf/frond: rises `h` px from (bx,baseY), drifting `dx` sideways,
+// with a dark edge outline and a lighter inner stripe so it reads hand-drawn.
+function blade(bx, baseY, h, dx, col){
+  const hi=shade(col,.30), lo=shade(col,-.34);
+  for(let i=0;i<h;i++){
+    const t=i/h, cx=Math.round(bx+dx*t);
+    const w=(i<h-4)?3:(i<h-2)?2:1;            // taper to a point
+    px(cx-1, baseY-i, 1,1, lo);                // dark left edge
+    px(cx,   baseY-i, w,1, col);               // leaf body
+    px(cx+w-1, baseY-i, 1,1, lo);              // dark right edge
+    if(i%2===0) px(cx, baseY-i, 1,1, hi);      // inner highlight speckle
+  }
+}
+function smallPlant(x,y){
+  const cx=x+6;
+  ctx.fillStyle='rgba(0,0,0,.14)'; ctx.beginPath(); ctx.ellipse(cx,y+9,10,3,0,0,Math.PI*2); ctx.fill();
+  // tapered little pot
+  px(x,y,12,3,shade(PAL.pot,.16)); px(x+1,y+3,10,3,PAL.pot); px(x+2,y+6,8,3,shade(PAL.pot,-.10));
+  px(x+1,y+3,2,5,shade(PAL.pot,.18)); px(x+1,y+2,10,1,PAL.potDk);
+  // a few short blades
+  [[-4,12,-5],[-1,17,-1],[2,15,2],[5,11,5]].forEach((d,i)=> blade(cx+d[0], y+3, d[1], d[2], i%2?PAL.leaf:PAL.leafDk));
+}
+function bigPlant(x,y){
+  const cx=x+9;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(cx,y+20,16,4,0,0,Math.PI*2); ctx.fill();
+  // tapered terracotta pot with a rim + soil line
+  px(x-1,y,20,5,shade(PAL.pot,.18));                                   // rim (widest)
+  px(x+1,y+5,16,5,PAL.pot); px(x+2,y+10,14,5,PAL.pot); px(x+3,y+15,12,4,shade(PAL.pot,-.10)); // tapered body
+  px(x+2,y+5,3,13,shade(PAL.pot,.16)); px(x+12,y+6,3,12,shade(PAL.pot,-.14)); // hi / shade
+  px(x+1,y+4,16,2,PAL.potDk);                                          // soil line
+  // a fan of fern/snake-plant blades of varied height
+  [[-9,22,-12],[-6,32,-8],[-3,42,-4],[0,48,0],[3,42,4],[6,32,8],[9,24,12]]
+    .forEach((d,i)=> blade(cx+d[0], y+5, d[1], d[2], (i===3)?PAL.leaf:(i%2?PAL.leaf:PAL.leafDk)));
+}
+function couch(x,y){ px(x,y,70,22,PAL.cabinet); px(x,y-10,70,12,'#4f6377');
+  px(x-6,y-10,8,30,PAL.cabinet); px(x+68,y-10,8,30,PAL.cabinet);
+  px(x+4,y+2,28,9,'#5a6e82'); px(x+38,y+2,28,9,'#5a6e82'); }
+// a tall blue dining chair with a curved padded back (seen from the side of a table)
+function blueChair(x,y){
+  const c='#3f64c0', cd='#2f4a96', ch='#5a7ed8';
+  px(x+2,y+2,2,12,'#1f1f24'); px(x+12,y+2,2,12,'#1f1f24');     // legs
+  ro(x,y-2,16,6,cd); px(x+1,y-2,14,2,c);                        // seat
+  ro(x+1,y-17,14,16,c); px(x+2,y-16,12,3,ch); px(x+2,y-4,12,2,cd); // curved back
+  px(x+2,y-16,2,15,ch);                                         // left rail sheen
+}
+// a cute sleeping bear-style mascot lounging on the couch (pure scenery, not an agent)
+function bearMascot(x,y){
+  const fur='#4a6b88', furDk='#3a5572', furHi='#5f82a0', belly='#efe2c2', pad='#dcc99e';
+  function el(cx,cy,rx,ry,col){ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fill(); }
+  el(x,y+13,9,6,furDk); el(x+18,y+13,9,6,furDk);               // feet
+  el(x+3,y+14,4,3,pad); el(x+15,y+14,4,3,pad);                 // foot pads
+  el(x+9,y-4,21,20,fur);                                       // body
+  el(x+9,y-1,13,14,belly);                                     // cream belly
+  el(x-8,y-2,7,9,fur); el(x+26,y-2,7,9,fur);                   // arms
+  el(x-4,y-24,5,5,fur); el(x+22,y-24,5,5,fur);                 // ears
+  el(x+9,y-19,15,13,fur);                                      // head
+  el(x-3,y-24,3,3,furHi); el(x+9,y-26,5,3,furHi);              // head sheen
+  // sleeping content face: two closed (downward-arc) eyes + a soft smile
+  px(x+1,y-20,5,1,PAL.outline); px(x+1,y-19,1,1,PAL.outline); px(x+5,y-19,1,1,PAL.outline);
+  px(x+12,y-20,5,1,PAL.outline); px(x+12,y-19,1,1,PAL.outline); px(x+16,y-19,1,1,PAL.outline);
+  px(x+6,y-14,6,1,PAL.outline); px(x+5,y-15,1,1,PAL.outline); px(x+12,y-15,1,1,PAL.outline);
+  // mug held in the left paw
+  px(x-12,y-8,7,7,PAL.paper); px(x-11,y-7,5,5,PAL.mugC); px(x-5,y-7,2,3,PAL.paper);
+  px(x-11,y-9,4,2,'rgba(255,255,255,.55)');                    // steam
+  // "Z z" sleep symbols
+  ctx.fillStyle=PAL.ink; ctx.font='7px "Press Start 2P", monospace'; ctx.fillText('Z', x+28, y-24);
+  ctx.font='4px "Press Start 2P", monospace'; ctx.fillText('z', x+35, y-30);
+}
+
+// blend two #rrggbb colours (t: 0->a, 1->b)
+function lerpCol(a,b,t){ const pa=parseInt(a.slice(1),16),pb=parseInt(b.slice(1),16);
+  const ar=(pa>>16)&255,ag=(pa>>8)&255,ab=pa&255, br=(pb>>16)&255,bg=(pb>>8)&255,bb=pb&255;
+  return 'rgb('+Math.round(ar+(br-ar)*t)+','+Math.round(ag+(bg-ag)*t)+','+Math.round(ab+(bb-ab)*t)+')'; }
+function cloud(cx,cy){ cx|=0; cy|=0; px(cx,cy,15,4,PAL.cloud); px(cx+3,cy-3,9,4,PAL.cloud); px(cx+1,cy+3,17,2,'rgba(255,255,255,.75)'); }
+// a row of city buildings sitting on the window sill (clipped to x..x+w).
+// `lit` => night mode: warm yellow lit windows speckled across dark silhouettes.
+function drawSkyline(x,y,w,h,col,hf,step,lit){
+  const hs=[16,26,12,32,20,28,15,24,18,30,22,14]; let bx=x+1,i=0; const baseY=y+h;
+  while(bx<x+w-1){ const bw=Math.min(10+(i%4)*5, x+w-1-bx);
+    const bh=Math.round(h*hf*(0.45+0.55*(hs[(i*step)%hs.length]/32)));
+    px(bx,baseY-bh,bw,bh,col);
+    for(let wy=baseY-bh+3;wy<baseY-2;wy+=5) for(let wx=bx+2;wx<bx+bw-2;wx+=4){
+      if(lit){ const on=((wx*31+wy*17+i*13)%5===0); px(wx,wy,1,2, on?PAL.litWin:'rgba(255,255,255,.05)'); }
+      else px(wx,wy,1,2,PAL.bldgWin);
+    }
+    bx+=bw+3; i++;
+  }
+}
+// returns 'night' | 'dusk' | 'day' from the LOCAL computer clock (override hook for tests)
+function skyMode(){
+  if(window.__forceSky) return window.__forceSky;
+  const hr=new Date().getHours();
+  if(hr>=19 || hr<6) return 'night';
+  if(hr===18 || hr===6) return 'dusk';
+  return 'day';
+}
+function drawWindow(x,y,w,h){
+  // chunky frame
+  px(x-5,y-5,w+10,h+10,PAL.woodDk); px(x-3,y-3,w+6,h+6,PAL.wood); px(x-3,y-3,w+6,2,PAL.woodHi);
+  const mode=skyMode(), night=(mode==='night'), bands=10, bh=Math.ceil(h/bands);
+  if(night){
+    for(let i=0;i<bands;i++) px(x, y+Math.round(i*h/bands), w, bh, lerpCol(PAL.nightTop, PAL.nightBot, i/(bands-1)));
+    // scattered stars (deterministic) in the upper sky
+    for(let s=0;s<48;s++){ const sx=x+((s*73)%(w-4))+2, sy=y+((s*37)%Math.max(1,Math.round(h*0.5)))+2;
+      px(sx,sy,1,1, s%6? 'rgba(255,255,255,.85)':'rgba(255,255,255,.45)'); }
+    // crescent moon (top-right)
+    const mnx=x+w-Math.round(w*0.20), mny=y+Math.round(h*0.16);
+    px(mnx,mny,8,8,PAL.moon); px(mnx+4,mny-1,6,8, lerpCol(PAL.moon,PAL.nightTop,.4));
+    cloud(x+w*0.30, y+h*0.16);
+    drawSkyline(x,y,w,h, PAL.bldgN2, 0.42, 7, true);
+    drawSkyline(x,y,w,h, PAL.bldgN1, 0.64, 11, true);
+  } else {
+    let top=PAL.skyTop, bot=PAL.sky;
+    if(mode==='dusk'){ top=lerpCol(PAL.skyTop,'#eaa86e',.30); bot=lerpCol(PAL.sky,'#f6c79a',.45); } // soft dawn/dusk tint
+    for(let i=0;i<bands;i++) px(x, y+Math.round(i*h/bands), w, bh, lerpCol(top, bot, i/(bands-1)));
+    drawSkyline(x,y,w,h, PAL.bldg2, 0.40, 7, false);
+    cloud(x+w*0.16, y+h*0.20); cloud(x+w*0.44, y+h*0.12); cloud(x+w*0.70, y+h*0.26);
+    drawSkyline(x,y,w,h, PAL.bldg1, 0.62, 11, false);
+  }
+  // chunky mullions: vertical panes + one horizontal transom (dark core + light edge)
+  const panes=4, pw=w/panes;
+  for(let i=1;i<panes;i++){ px(x+Math.round(i*pw)-1,y,3,h,PAL.woodDk); px(x+Math.round(i*pw)-1,y,1,h,PAL.wood); }
+  px(x,y+Math.round(h*0.5)-1,w,3,PAL.woodDk); px(x,y+Math.round(h*0.5)-1,w,1,PAL.wood);
+  px(x,y,w,1,'rgba(0,0,0,.22)'); px(x,y+h-1,w,1,'rgba(0,0,0,.22)');
+  // glass sheen on the top-left pane
+  px(x+2,y+2,Math.round(pw)-5,2, night?'rgba(255,255,255,.07)':'rgba(255,255,255,.20)');
+}
+
+function drawWallDecor(x,y){
+  // ---- PROJECT whiteboard with a tidy checklist (boxes + check marks) ----
+  const bw=98, bh=58; px(x-3,y-3,bw+6,bh+6,PAL.metalDk); px(x,y,bw,bh,PAL.paper);
+  px(x,y,bw,2,'#eef0f3'); px(x,y+bh-2,bw,2,'#cfcfd6'); px(x+bw-2,y,2,bh,'#dadbe0');
+  ctx.fillStyle=PAL.ink; ctx.font='7px "Press Start 2P", monospace'; ctx.fillText('PROJECT', x+7, y+13);
+  px(x+7,y+17,bw-14,1,'#c0c0c8');
+  ctx.font='5px "Press Start 2P", monospace';
+  const items=['RESEARCH','DESIGN','TEST','LAUNCH'];
+  items.forEach((it,i)=>{ const iy=y+27+i*8;
+    px(x+8,iy-5,5,5,PAL.paper); px(x+8,iy-5,5,1,PAL.ink); px(x+8,iy-1,5,1,PAL.ink); px(x+8,iy-5,1,5,PAL.ink); px(x+12,iy-5,1,5,PAL.ink); // box
+    px(x+9,iy-3,1,2,PAL.leafDk); px(x+10,iy-2,1,1,PAL.leafDk); px(x+11,iy-4,1,3,PAL.leafDk);                                          // check
+    ctx.fillStyle=PAL.ink; ctx.fillText(it, x+17, iy);
+  });
+  // ---- clean wall clock ----
+  const clx=x+bw+14, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
+  for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
+  ctx.strokeStyle=PAL.ink; ctx.lineWidth=1.4; ctx.beginPath();
+  ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+9,cly+4); ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+13,cly+11); ctx.stroke();
+  px(clx+8,cly+8,2,2,PAL.red);                                  // center hub
+  // ---- bookshelf with books + a little plant on top ----
+  const shx=x+bw+40, shy=y-2; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
+  const cols=[PAL.mugA,PAL.mugB,PAL.mugC,PAL.leafDk,PAL.red,PAL.yellow,PAL.orange,'#8c5fd6'];
+  for(let r=0;r<3;r++){ const ry=shy+5+r*16;
+    for(let b=0;b<5;b++){ const bbh=11-((b+r)%2)*2; px(shx+4+b*8,ry+(11-bbh),6,bbh,cols[(b+r*3)%cols.length]); }
+    px(shx+2,ry+13,42,2,PAL.woodDk);
+  }
+  smallPlant(shx+30, shy-2);
+  // ---- framed pie-chart poster (far right) ----
+  const ppx=shx+58, ppy=y+2; px(ppx-2,ppy-2,34,34,PAL.woodDk); px(ppx,ppy,30,30,PAL.paper);
+  const cxp=ppx+15, cyp=ppy+13, rp=9;
+  ctx.fillStyle=PAL.mugB; ctx.beginPath(); ctx.moveTo(cxp,cyp); ctx.arc(cxp,cyp,rp,-Math.PI/2,Math.PI*0.6); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=PAL.yellow; ctx.beginPath(); ctx.moveTo(cxp,cyp); ctx.arc(cxp,cyp,rp,Math.PI*0.6,Math.PI*1.2); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=PAL.red; ctx.beginPath(); ctx.moveTo(cxp,cyp); ctx.arc(cxp,cyp,rp,Math.PI*1.2,Math.PI*1.5); ctx.closePath(); ctx.fill();
+  px(ppx+4,ppy+25,4,3,PAL.mugB); px(ppx+13,ppy+25,4,3,PAL.yellow); px(ppx+22,ppy+25,4,3,PAL.red);
+}
+
+function drawOfficeProps(){
+  const L=layout(), top=WALL_H;
+  // plants flanking the window
+  bigPlant(14, top+10); bigPlant(W-30, top+10);
+
+  const lastDeskY = deskSlots.length ? Math.max.apply(null, deskSlots.map(s=>s.y)) : top+120;
+  // soft rug spanning the desk area
+  ctx.fillStyle='rgba(214,140,92,.13)'; ctx.fillRect(70, top+30, W-140, (lastDeskY+34)-(top+30));
+  ctx.strokeStyle='rgba(160,96,52,.18)'; ctx.lineWidth=2; ctx.strokeRect(72, top+32, W-144, (lastDeskY+30)-(top+32));
+
+  // ---- water cooler (far right) + floor plant (left) ----
+  const wcx=W-56, wcy=lastDeskY+48; ro(wcx,wcy,18,30,PAL.steel); px(wcx+2,wcy-15,14,15,'#9fd9f0'); px(wcx+5,wcy+14,8,5,PAL.cabinet);
+  bigPlant(34, lastDeskY+44);
+}
+
+function drawKitchenProps(){
+  const L=layout(), k=L.kitchen, T=L.kitchenTop;
+  // back wall band for mounting decor + counters
+  px(0,T,W,30,PAL.wall); px(0,T+28,W,2,PAL.base);
+
+  // ---- tall fridge (far left): freezer/fridge split, handles, magnets, photo ----
+  const fx=8, fy=T+14, fw=30, fh=74; ro(fx,fy,fw,fh,PAL.fridge);
+  px(fx,fy,fw,3,PAL.fridgeDk); px(fx+1,fy+1,fw-2,1,shade(PAL.fridge,.30));   // top + sheen
+  px(fx,fy+30,fw,3,PAL.fridgeDk);                                            // freezer/fridge door split
+  px(fx+fw-6,fy+7,3,17,PAL.metalDk); px(fx+fw-6,fy+38,3,28,PAL.metalDk);     // two vertical handles
+  // magnets + a photo + a sticky note
+  px(fx+5,fy+40,5,4,PAL.red); px(fx+12,fy+41,4,4,PAL.yellow); px(fx+18,fy+39,4,4,PAL.mugB);
+  px(fx+5,fy+48,7,7,PAL.paper); px(fx+5,fy+48,7,1,'#e6e6ec'); px(fx+6,fy+50,5,3,'#9fd9f0'); // photo
+  px(fx+15,fy+49,9,6,'#fff3b0'); px(fx+15,fy+49,9,1,shade('#fff3b0',-.2));                  // sticky note
+  smallPlant(fx+9, fy-9);                                                    // little plant on top
+
+  // ---- kitchen counter (center-back): solid countertop, cabinetry, inset sink,
+  // espresso bar + a wall shelf with jars/mugs ----
+  const cbx=150, cbw=268, cby=T+30, cbh=26, ctTop=cby-9;
+  // solid countertop slab: bright tan surface, highlighted back edge + rounded
+  // shaded front lip so it reads as a real worktop with depth.
+  px(cbx-4,ctTop,cbw+8,9,PAL.cabinetTop);
+  px(cbx-4,ctTop,cbw+8,1,shade(PAL.cabinetTop,.34));                        // back-edge highlight
+  px(cbx-4,ctTop+1,cbw+8,1,shade(PAL.cabinetTop,.14));
+  px(cbx-4,cby-3,cbw+8,3,shade(PAL.cabinetTop,-.16));                       // front lip
+  px(cbx-4,cby-1,cbw+8,1,shade(PAL.cabinetTop,-.34));                       // lip undershadow
+  // cabinetry: dark carcass + bevelled door/drawer fronts with steel pulls + toe-kick
+  ro(cbx,cby,cbw,cbh,PAL.cabinet);
+  const doors=6, dww=cbw/doors;
+  for(let i=0;i<doors;i++){ const dx=cbx+3+i*dww;
+    px(dx,cby+3,dww-6,cbh-8, shade(PAL.cabinet,.10));                       // raised front panel
+    px(dx,cby+3,dww-6,1, shade(PAL.cabinet,.26));                          // top bevel (light)
+    px(dx,cby+3,1,cbh-8, shade(PAL.cabinet,.18));                          // left bevel
+    px(dx+dww-7,cby+3,1,cbh-8, shade(PAL.cabinet,-.26));                   // right bevel (dark)
+    px(dx,cby+cbh-6,dww-6,1, shade(PAL.cabinet,-.30));                     // bottom bevel
+    if(i%2===0){ px(dx+(dww-6)/2-1,cby+7,2,9,PAL.steel); px(dx+(dww-6)/2-1,cby+7,1,9,shade(PAL.steel,.3)); } // door pull (vertical)
+    else { px(dx+4,cby+6,dww-14,2,PAL.steel); px(dx+4,cby+6,dww-14,1,shade(PAL.steel,.3)); }                 // drawer pull (horizontal)
+  }
+  px(cbx,cby+cbh-2,cbw,2, shade(PAL.cabinet,-.42)); px(cbx,cby+cbh,cbw,1,'rgba(0,0,0,.22)'); // toe-kick shadow
+  // ---- espresso machine on the counter (left): body, bean hopper, display,
+  // buttons, steam wand, a group head + portafilter and a cup catching the shot ----
+  const cmw=34, cmh=23, cmx=cbx+8, cmy=ctTop-cmh;
+  ro(cmx,cmy,cmw,cmh,'#3b3b46');                                            // body
+  px(cmx+1,cmy+1,cmw-2,2,'#585863');                                        // top sheen
+  px(cmx,cmy+cmh-4,cmw,4,'#2a2a32');                                        // darker base
+  px(cmx+cmw-10,cmy-4,7,5,'#2a2a32'); px(cmx+cmw-9,cmy-3,5,2,'#4a4a55');    // bean hopper on top
+  px(cmx+3,cmy+3,13,6,PAL.screen); px(cmx+3,cmy+3,13,1,'#c3f0f7');          // display
+  px(cmx+4,cmy+12,3,3,PAL.red); px(cmx+9,cmy+12,3,3,PAL.yellow); px(cmx+14,cmy+12,3,3,PAL.leaf); // buttons
+  px(cmx+cmw-4,cmy+6,2,9,PAL.metalDk); px(cmx+cmw-5,cmy+14,3,2,PAL.metalDk); // steam wand
+  px(cmx+9,cmy+cmh-5,10,3,'#23232a');                                       // group head
+  px(cmx+12,cmy+cmh-2,4,2,PAL.metalDk);                                     // portafilter neck
+  mug(cmx+10,ctTop-7,'#ececf2');                                           // cup catching the shot
+  // ---- wall shelf (center): plank holding two glass jars, a canister + two mugs ----
+  const shx=cbx+54, shw=92, shy=T+1;
+  px(shx-3,shy+16,shw+6,3,PAL.woodDk); px(shx-3,shy+15,shw+6,1,PAL.woodHi); // plank + edge
+  px(shx-3,shy+19,shw+6,1,'rgba(0,0,0,.20)');                              // under-shelf shadow
+  px(shx+4,shy+5,9,11,'rgba(212,226,233,.85)'); px(shx+4,shy+12,9,4,'#6b4a2e'); // clear jar w/ beans
+  px(shx+4,shy+5,9,2,'#e3edf1'); px(shx+3,shy+3,11,2,PAL.metalDk);          // jar sheen + lid
+  px(shx+18,shy+6,9,10,'rgba(183,217,192,.92)'); px(shx+18,shy+6,9,2,shade('#b7d9c0',.3)); px(shx+17,shy+4,11,2,PAL.leafDk); // green jar + lid
+  px(shx+33,shy+4,9,12,PAL.mugC); px(shx+33,shy+4,9,2,shade(PAL.mugC,.34)); px(shx+33,shy+9,9,1,shade(PAL.mugC,-.18)); // canister
+  mug(shx+48,shy+7,PAL.mugA); mug(shx+62,shy+7,PAL.mugB);
+  // ---- SINK (center-right): a stainless drop-in basin recessed into the counter
+  // (steel rim, two-tone recessed interior, centre drain) with a proper goose-neck
+  // faucet rising behind it (riser + arched spout + downspout + lever) -- clearly a sink ----
+  const skx=cbx+170, skw=66, skBot=ctTop, skTop=skBot-14;
+  ro(skx,skTop,skw,14,PAL.steel);                                           // stainless basin shell
+  px(skx,skTop,skw,2,shade(PAL.steel,.34));                                 // rim top highlight
+  px(skx,skTop+12,skw,2,shade(PAL.steel,-.26));                             // front rim shadow
+  px(skx+4,skTop+3,skw-8,9,'#5a6e7d');                                      // recessed basin (upper)
+  px(skx+6,skTop+5,skw-12,6,'#46586a');                                     // recessed basin (deeper)
+  px(skx+6,skTop+10,skw-12,1,'#374755');                                    // basin floor
+  px(skx+skw/2-2,skTop+8,4,2,'#2b3640');                                    // drain
+  px(skx+6,skTop+4,skw-13,1,'rgba(255,255,255,.22)');                       // water sheen
+  const fcx=skx+skw-18, fTop=T;                                             // faucet column (right-back)
+  px(fcx-3,skTop-2,10,3,PAL.metalDk);                                       // escutcheon base plate
+  px(fcx,fTop+2,4,skTop-fTop,PAL.steel); px(fcx,fTop+2,1,skTop-fTop,shade(PAL.steel,.34)); // vertical riser
+  px(fcx-2,fTop,6,3,PAL.steel); px(fcx-7,fTop,6,3,PAL.steel); px(fcx-11,fTop+1,5,3,PAL.steel); // gooseneck arch (curving left)
+  px(fcx-2,fTop,8,1,shade(PAL.steel,.3));                                   // arch highlight
+  px(fcx-11,fTop+3,3,5,PAL.steel); px(fcx-11,fTop+7,3,2,PAL.metalDk);       // downspout + tip over the basin
+  px(fcx+4,skTop-4,5,2,PAL.metalDk); px(fcx+4,skTop-4,5,1,shade(PAL.metalDk,.3)); // lever handle
+
+  // ---- "COFFEE > CODE > CONQUER" wall sign (left) ----
+  const sgx=58, sgy=T+3; px(sgx-2,sgy-2,90,24,PAL.woodDk); px(sgx,sgy,86,20,PAL.paper);
+  ctx.fillStyle=PAL.ink; ctx.font='5px "Press Start 2P", monospace';
+  ctx.fillText('COFFEE >', sgx+6, sgy+9); ctx.fillText('CODE > CONQUER', sgx+6, sgy+17);
+
+  // ---- framed "DO GOOD WORK" poster: high on the RIGHT wall, between the counter
+  // and the REFRESH! machine, above the couch (clear of every agent stand spot) ----
+  const pw=48, ph=46, pcx=W-168, pcy=T-2;
+  px(pcx-3,pcy-3,pw+6,ph+6,'#15151a');                       // outer dark frame
+  px(pcx-1,pcy-1,pw+2,ph+2,'#3c3c46');                       // frame bevel
+  px(pcx+2,pcy+2,pw-4,ph-4,PAL.paper);                       // white mat / background
+  px(pcx+2,pcy+2,pw-4,1,'#ffffff'); px(pcx+2,pcy+ph-3,pw-4,1,'#e2e2e8'); // mat sheen
+  // crisp pink heart, centered up top
+  const hx=pcx+pw/2, hy=pcy+9;
+  px(hx-6,hy,4,3,PAL.pink); px(hx+2,hy,4,3,PAL.pink);        // two lobes
+  px(hx-6,hy+3,12,2,PAL.pink); px(hx-5,hy+5,10,2,PAL.pink);  // body
+  px(hx-3,hy+7,6,2,PAL.pink);  px(hx-1,hy+9,2,1,PAL.pink);   // taper to a point
+  px(hx-5,hy+1,2,1,shade(PAL.pink,.45));                     // little highlight
+  // tidy, evenly-spaced lettering on three centered lines
+  ctx.fillStyle=PAL.ink; ctx.textAlign='center';
+  ctx.font='6px "Press Start 2P", monospace';
+  ctx.fillText('DO',   hx, pcy+26);
+  ctx.fillText('GOOD', hx, pcy+35);
+  ctx.fillText('WORK', hx, pcy+44);
+  ctx.textAlign='left';
+
+  // ---- "REFRESH!" drinks machine (far right): blue cabinet, lit sign, glass grid, side panel ----
+  const vx=W-74, vy=T+10, vw=64, vh=88;
+  ro(vx,vy,vw,vh,'#2f57a8'); px(vx,vy,vw,3,shade('#2f57a8',.28)); px(vx,vy,3,vh,shade('#2f57a8',.18)); // cabinet + sheen
+  px(vx+vw-3,vy,3,vh,shade('#2f57a8',-.22));                                                          // right shade
+  // lit header sign
+  px(vx+4,vy+4,vw-8,13,'#0e1c44'); px(vx+4,vy+4,vw-8,1,'#3a5aa0');
+  ctx.fillStyle='#ffd34d'; ctx.font='6px "Press Start 2P", monospace'; ctx.fillText('REFRESH!', vx+5, vy+14);
+  // glass display: 3 rows x 4 colorful bottles on lit shelves
+  const gx=vx+4, gy=vy+19, gw=42, gh=54; ro(gx,gy,gw,gh,'#0e1530');
+  const drinks=[PAL.red,PAL.mugB,PAL.yellow,PAL.leaf,PAL.orange,PAL.pink,PAL.mugC,'#8c5fd6','#22b9b9','#e673a8','#5bc05b','#3f74d6'];
+  for(let r=0;r<3;r++){ const ry=gy+4+r*17;
+    px(gx+1,ry+14,gw-2,2,'#243a6a');                                                                  // shelf
+    for(let c=0;c<4;c++){ const bxv=gx+3+c*10, col=drinks[r*4+c];
+      px(bxv,ry+2,6,12,col); px(bxv,ry+2,6,2,shade(col,.32)); px(bxv+1,ry,3,3,col); } }              // bottle + cap
+  px(gx+3,gy+2,2,gh-6,'rgba(255,255,255,.12)'); px(gx+8,gy+2,1,gh-6,'rgba(255,255,255,.06)');         // glass reflection
+  // side panel: keypad + card reader + coin slot
+  const spx=vx+48, spw=vw-(spx-vx)-4; px(spx,vy+19,spw,54,'#24407e'); px(spx,vy+19,spw,1,shade('#24407e',.3));
+  for(let r=0;r<3;r++) for(let c=0;c<2;c++) px(spx+2+c*5,vy+23+r*5,3,3,'#cdd6dd');                     // keypad
+  px(spx+1,vy+42,spw-2,11,'#0e1a36'); px(spx+2,vy+44,spw-4,2,'#cdd6dd');                               // card reader
+  px(spx+2,vy+55,spw-4,3,'#0a1024');                                                                  // coin slot
+  // dispense slot / tray at the bottom
+  px(vx+5,vy+vh-13,vw-10,9,'#0e1c44'); px(vx+7,vy+vh-11,vw-14,5,'#0a1024');
+
+  // ---- lounge: BIG wood table w/ fruit bowl + two white mugs, flanked by round
+  // pink poufs (bottom-left). Sized to fill the corner; agents kept clear. ----
+  const tx=66, ty=T+150, tw=116, tth=20;
+  // round cushioned poufs -- a clear 3D cylinder: floor shadow, a darker rounded
+  // side (lower ellipse + side band), a lighter domed cushion top, stitched seams
+  // radiating from a centre button + a soft sheen.
+  function pouf(cx0,cy0){
+    const top='#d98fbe', side='#b06a96', sideDk='#8c4d79', sheen='#ecb6d6';
+    const rx=18;
+    ctx.fillStyle='rgba(0,0,0,.20)'; ctx.beginPath(); ctx.ellipse(cx0,cy0+14,rx+2,5,0,0,Math.PI*2); ctx.fill(); // floor shadow
+    ctx.fillStyle=sideDk; ctx.beginPath(); ctx.ellipse(cx0,cy0+9,rx,7,0,0,Math.PI*2); ctx.fill();    // rounded base
+    ctx.fillStyle=side;   ctx.fillRect(cx0-rx,cy0-2,rx*2,11);                                          // cylindrical side
+    ctx.fillStyle=sideDk; ctx.fillRect(cx0-rx,cy0+6,rx*2,3);                                           // lower side shade
+    ctx.fillStyle=top;    ctx.beginPath(); ctx.ellipse(cx0,cy0-2,rx,9,0,0,Math.PI*2); ctx.fill();      // domed cushion top
+    ctx.fillStyle=sheen;  ctx.beginPath(); ctx.ellipse(cx0-6,cy0-4,8,4,0,0,Math.PI*2); ctx.fill();     // sheen
+    ctx.strokeStyle=side; ctx.lineWidth=1;                                                             // seam dimples
+    [[-12,3],[-5,5],[5,5],[12,3]].forEach(d=>{ ctx.beginPath(); ctx.moveTo(cx0,cy0-3); ctx.lineTo(cx0+d[0],cy0+d[1]); ctx.stroke(); });
+    ctx.fillStyle=sideDk; ctx.beginPath(); ctx.ellipse(cx0,cy0-3,2,1.5,0,0,Math.PI*2); ctx.fill();     // centre button
+  }
+  pouf(tx-28, ty+10); pouf(tx+tw+28, ty+10);
+  // table: floor shadow + front/back legs (with foot shadows) + grained top w/ shaded edges
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(tx+tw/2,ty+38,tw/2,8,0,0,Math.PI*2); ctx.fill();
+  px(tx+22,ty+tth,4,18,PAL.woodDk); px(tx+tw-26,ty+tth,4,18,PAL.woodDk);            // back legs (inset)
+  px(tx+10,ty+tth,5,22,PAL.wood); px(tx+10,ty+tth,2,22,PAL.woodHi);                 // front-left leg
+  px(tx+tw-15,ty+tth,5,22,PAL.wood); px(tx+tw-15,ty+tth,2,22,PAL.woodHi);           // front-right leg
+  px(tx+9,ty+tth+21,7,2,'rgba(0,0,0,.22)'); px(tx+tw-16,ty+tth+21,7,2,'rgba(0,0,0,.22)'); // foot shadows
+  ro(tx,ty,tw,tth,PAL.wood); px(tx,ty,tw,4,PAL.woodHi); px(tx,ty+tth-3,tw,3,PAL.woodDk); // top + edges
+  px(tx,ty+4,tw,1,shade(PAL.wood,.14));                                            // surface highlight band
+  for(let g=0;g<tw-12;g+=13) px(tx+7+g,ty+9,9,1,shade(PAL.wood,-.09));              // grain hints
+  // two white coffee mugs (left + right of the bowl)
+  mug(tx+14,ty-5,PAL.paper); mug(tx+tw-21,ty-5,PAL.paper);
+  // ---- central fruit bowl: ceramic bowl holding apples, a banana + leaves ----
+  const bwx=tx+tw/2, bwy=ty-1, brw=22;
+  // bowl body (exterior lower half) + shaded underside
+  ctx.fillStyle='#ddd4bd'; ctx.beginPath(); ctx.ellipse(bwx,bwy,brw,10,0,0,Math.PI); ctx.fill();
+  ctx.fillStyle=shade('#ddd4bd',-.22); ctx.beginPath(); ctx.ellipse(bwx,bwy+3,brw-3,6,0,0,Math.PI); ctx.fill();
+  // rim ring at the opening with a shadowed interior
+  ctx.fillStyle='#efe8d6'; ctx.beginPath(); ctx.ellipse(bwx,bwy-1,brw,5,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#3a342e'; ctx.beginPath(); ctx.ellipse(bwx,bwy-1,brw-4,3,0,0,Math.PI*2); ctx.fill();
+  // fruit piled in the bowl (sitting above the rim line)
+  blade(bwx-3,bwy-4,11,-3,PAL.leafDk); blade(bwx+2,bwy-5,12,2,PAL.leaf); blade(bwx+6,bwy-3,9,4,PAL.leafDk); // leaves
+  px(bwx-2,bwy-12,14,4,PAL.yellow); px(bwx-3,bwy-11,2,3,PAL.yellow); px(bwx+12,bwy-11,2,3,shade(PAL.yellow,-.2)); px(bwx-3,bwy-12,3,1,shade(PAL.yellow,.3)); // banana
+  function apple(ax,ay){ px(ax+1,ay,6,2,PAL.red); px(ax,ay+2,8,4,PAL.red); px(ax+1,ay+6,6,1,shade(PAL.red,-.25)); px(ax+1,ay+1,2,2,shade(PAL.red,.45)); px(ax+3,ay-1,1,2,PAL.leafDk); }
+  apple(bwx-15,bwy-7); apple(bwx-3,bwy-6); apple(bwx+7,bwy-7);
+  // thin front lip over the fruit bottoms so they nest inside the bowl
+  ctx.fillStyle='#e7dfc9'; ctx.beginPath(); ctx.ellipse(bwx,bwy+1,brw,3,0,0,Math.PI); ctx.fill();
+  px(bwx-brw,bwy-2,brw*2,1,'#f3eede');                                              // rim top highlight
+
+  // ---- BIG plush purple sofa + sleeping bear mascot + round side table (bottom-right) ----
+  const vcx=432, vcy=T+146, cw=150, ch=34;
+  const pur='#8552c0', purDk='#683da0', purHi='#a274d8', seat='#9a68cc';
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(vcx+cw/2,vcy+34,cw/2+5,7,0,0,Math.PI*2); ctx.fill(); // shadow
+  // two rounded back cushions (split down the middle)
+  const bcw=(cw-26)/2;
+  ro(vcx+8,vcy-26,bcw,30,pur);       px(vcx+10,vcy-26,bcw-4,3,purHi); px(vcx+10,vcy+1,bcw-4,2,purDk);
+  ro(vcx+14+bcw,vcy-26,bcw,30,pur);  px(vcx+16+bcw,vcy-26,bcw-4,3,purHi); px(vcx+16+bcw,vcy+1,bcw-4,2,purDk);
+  px(vcx+10+bcw,vcy-24,4,28,purDk);                                                                // cushion seam
+  // rounded arms
+  ro(vcx-3,vcy-18,18,50,pur); px(vcx-3,vcy-18,18,3,purHi); px(vcx-3,vcy-18,3,50,purHi);            // left arm
+  ro(vcx+cw-15,vcy-18,18,50,pur); px(vcx+cw-15,vcy-18,18,3,purHi); px(vcx+cw-3,vcy-18,3,50,purDk); // right arm
+  ro(vcx+8,vcy+6,cw-16,26,purDk);                                                                  // seat base
+  const sw=(cw-34)/2; ro(vcx+14,vcy+4,sw,18,seat); ro(vcx+20+sw,vcy+4,sw,18,seat);                 // two seat cushions
+  px(vcx+14,vcy+4,sw,2,purHi); px(vcx+20+sw,vcy+4,sw,2,purHi);
+  // two cozy throw pillows (left side of the sofa)
+  ro(vcx+18,vcy-13,17,16,PAL.yellow); px(vcx+18,vcy-13,17,2,shade(PAL.yellow,.3)); px(vcx+21,vcy-8,11,1,shade(PAL.yellow,-.2));
+  ro(vcx+35,vcy-11,16,15,PAL.mugB);   px(vcx+35,vcy-11,16,2,shade(PAL.mugB,.3));   px(vcx+38,vcy-6,10,1,shade(PAL.mugB,-.2));
+  // sleeping bear mascot on the right (scaled up a touch to fill the bigger sofa)
+  ctx.save(); scaleAbout(vcx+cw-46, vcy+4, 1.22); bearMascot(vcx+cw-62, vcy-2); ctx.restore();
+  // round WOOD side table with a small potted plant (left of the sofa)
+  const stx=vcx-36, sty=vcy+16; px(stx+6,sty,5,18,PAL.woodDk);                                     // pedestal
+  ctx.fillStyle='rgba(0,0,0,.15)'; ctx.beginPath(); ctx.ellipse(stx+8,sty+20,15,4,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=PAL.wood;  ctx.beginPath(); ctx.ellipse(stx+8,sty,17,6,0,0,Math.PI*2); ctx.fill();  // round top
+  ctx.fillStyle=PAL.woodHi;ctx.beginPath(); ctx.ellipse(stx+8,sty-1,13,3,0,0,Math.PI*2); ctx.fill();
+  smallPlant(stx+2,sty-10);
+}
+
+// outlined rectangle (dark 1px border) - the key to the chunky pixel look
+function ro(x,y,w,h,c){ px((x|0)-1,(y|0)-1,(w|0)+2,(h|0)+2,PAL.outline); px(x|0,y|0,w|0,h|0,c); }
+
+// hair + headwear, drawn on a 14px-wide head whose top-left is (x-7, hy)
+function drawHairAcc(x, hy, f){
+  const hr=f.hair, hl=shade(hr,.34), hd=shade(hr,-.30);
+  if(f.female){
+    // rounded crown framing the face (clearly feminine), with shading
+    px(x-8,hy-4,16,7,hr); px(x-8,hy-4,16,1,hd);          // crown + top outline
+    px(x-9,hy+1,3,13,hr); px(x+6,hy+1,3,13,hr);          // long sides past the cheeks
+    px(x-7,hy-3,9,1,hl); px(x-9,hy+1,2,5,hl);            // soft crown + side highlight
+    px(x-9,hy+12,3,3,hd); px(x+6,hy+12,3,3,hd);          // tip shade
+    if(f.femStyle===0){                                  // long flowing
+      px(x-10,hy+12,3,7,hr); px(x+7,hy+12,3,7,hr); px(x+7,hy+5,1,11,hl); px(x-10,hy+17,3,2,hd);
+    } else if(f.femStyle===1){                           // side ponytail
+      px(x+8,hy,4,14,hr); px(x+9,hy+12,3,7,hr); px(x+7,hy-1,4,4,hr); px(x+9,hy+2,1,10,hl);
+      px(x-5,hy-4,3,2,PAL.pink);                         // little clip
+    } else {                                             // bun + bow
+      px(x-3,hy-8,6,5,hr); px(x-2,hy-7,3,1,hl);
+      px(x-5,hy-9,3,3,PAL.pink); px(x+2,hy-9,3,3,PAL.pink); px(x-1,hy-8,2,2,PAL.pink);
+    }
+    if(f.acc===3){ px(x-9,hy+3,3,7,'#222'); px(x+6,hy+3,3,7,'#222'); px(x-8,hy-4,16,3,'#222'); } // headphones
+    return;
+  }
+  // ---- men / neutral ----
+  if(f.hairStyle!==2){ px(x-7,hy-3,14,6,hr); px(x-8,hy+1,2,7,hr); px(x+6,hy+1,2,7,hr);
+    px(x-7,hy-3,14,1,hd); px(x-5,hy-2,7,1,hl); }                                              // base + outline + sheen
+  if(f.hairStyle===1){ px(x-5,hy-7,3,5,hr); px(x-1,hy-8,3,6,hr); px(x+3,hy-7,3,5,hr); px(x-1,hy-8,2,1,hl); } // spiky
+  else if(f.hairStyle===3){ px(x-2,hy-7,5,5,hr); px(x-1,hy-7,3,1,hl); }                                      // bun
+  else if(f.hairStyle===4){ px(x-8,hy-4,16,8,hr); px(x-9,hy+4,2,6,hr); px(x+7,hy+4,2,6,hr);
+    px(x-6,hy-3,5,1,hl); px(x-1,hy-4,4,1,hl); px(x+3,hy-3,3,1,hl); }                                         // curly mop
+  else if(f.hairStyle===5){ px(x-1,hy-8,4,9,hr); px(x-1,hy-8,2,1,hl); }                                      // mohawk
+  else if(f.hairStyle===0){ px(x-7,hy-4,14,4,hr); px(x-6,hy-3,7,1,hl); }                                     // flat
+  if(f.acc===2){ px(x-8,hy-2,16,4,f.accCol); px(x-13,hy+1,6,3,f.accCol); }                    // cap
+  else if(f.acc===3){ px(x-8,hy-2,16,3,'#222'); px(x-10,hy+3,3,8,'#222'); px(x+7,hy+3,3,8,'#222'); } // headphones
+  else if(f.acc===4){ px(x-8,hy-4,16,8,f.accCol); px(x-8,hy+3,16,2,'rgba(0,0,0,.25)'); }      // beanie
+  else if(f.acc===5){ px(x-1,hy-8,2,7,'#9aa'); px(x-2,hy-11,4,4,PAL.red); }                   // antenna
+}
+function drawFace(x, hy, f){
+  const sk=f.skin;
+  // ears
+  px(x-9,hy+5,2,4,sk); px(x-9,hy+5,1,4,PAL.outline);
+  px(x+7,hy+5,2,4,sk); px(x+8,hy+5,1,4,PAL.outline);
+  // relaxed, slightly raised eyebrows (friendly, never angled-down)
+  px(x-5,hy+2,3,1,'rgba(70,50,40,.55)'); px(x+2,hy+2,3,1,'rgba(70,50,40,.55)');
+  if(f.acc===1){ // glasses (over the eyes)
+    px(x-6,hy+5,5,4,'#1b1b1b'); px(x+1,hy+5,5,4,'#1b1b1b'); px(x-1,hy+6,2,1,'#1b1b1b');
+    px(x-5,hy+5,3,3,'#eaf6ff'); px(x+2,hy+5,3,3,'#eaf6ff');
+    px(x-4,hy+6,1,1,'#101010'); px(x+3,hy+6,1,1,'#101010');
+  } else { // big bright open eyes (white + pupil + sparkle)
+    px(x-5,hy+5,3,3,'#ffffff'); px(x+2,hy+5,3,3,'#ffffff');
+    px(x-4,hy+6,2,2,PAL.outline); px(x+3,hy+6,2,2,PAL.outline);
+    px(x-4,hy+5,1,1,'#ffffff'); px(x+3,hy+5,1,1,'#ffffff'); // catch-light sparkle
+  }
+  // eyelashes for women (outer corners)
+  if(f.female){ px(x-6,hy+4,1,1,PAL.outline); px(x+6,hy+4,1,1,PAL.outline); }
+  // small nose
+  px(x,hy+8,1,2,'rgba(0,0,0,.20)');
+  // HAPPY upturned smile: base line low in the middle, corners curving UP
+  const mc='#6e352f';
+  px(x-1,hy+11,3,1,mc);                 // bottom of the curve (middle, lowest)
+  px(x-2,hy+10,1,1,mc); px(x+2,hy+10,1,1,mc);   // sides rising
+  px(x-3,hy+9,1,1,mc);  px(x+3,hy+9,1,1,mc);    // corners turned UP
+  px(x-1,hy+12,3,1,'rgba(214,90,110,.55)');     // warm lower-lip hint
+  // rosy cheeks
+  px(x-6,hy+8,2,2,'rgba(232,120,120,.55)'); px(x+5,hy+8,2,2,'rgba(232,120,120,.55)');
+}
+
+// a full workstation: office chair + desk + monitor + filing cabinet + plant,
+// with (optionally) a worker seated behind it, facing us. Even empty it looks furnished.
+function drawDeskPod(x, y, p, t){
+  const f = p ? (p.feat||featuresFor(p.id)) : null;
+  // --- soft contact shadow on the floor under the whole workstation ---
+  ctx.fillStyle='rgba(0,0,0,.14)'; ctx.beginPath(); ctx.ellipse(x, y+26, 35, 6, 0, 0, Math.PI*2); ctx.fill();
+  // --- rolling office chair: gas post + 5-star wheel base (peeks below the desk) ---
+  px(x-2,y+10,4,14,PAL.metalDk);                                       // gas post
+  px(x-18,y+23,36,2,shade(PAL.metalDk,.14));                           // hub bar
+  px(x-18,y+24,4,4,'#2b2b30'); px(x-10,y+25,4,4,'#2b2b30');
+  px(x-2,y+25,4,4,'#2b2b30'); px(x+6,y+25,4,4,'#2b2b30'); px(x+14,y+24,4,4,'#2b2b30'); // 5 wheels
+  // --- curved padded backrest + armrests (behind the worker) ---
+  ro(x-13, y-23, 26, 21, PAL.chairW);
+  px(x-10,y-26,20,4,PAL.chairW); px(x-10,y-27,20,1,PAL.outline);        // rounded headrest cap
+  px(x-13,y-23,26,3, shade(PAL.chairW,.20)); px(x-13,y-6,26,3, shade(PAL.chairW,-.22));
+  px(x-14,y-20,2,15, shade(PAL.chairW,-.12)); px(x+12,y-20,2,15, shade(PAL.chairW,-.12)); // side bolsters
+  px(x-18,y-4,5,8, shade(PAL.chairW,-.10)); px(x+13,y-4,5,8, shade(PAL.chairW,-.10));     // armrests
+  if(p){
+    const sh=f.shirt, sk=f.skin;
+    // celebration: a little seated bounce while the flag is live (visual only;
+    // hitbox uses deskX/deskY, so a transient offset is safe)
+    const hop=(p.celebrateUntil && performance.now()<p.celebrateUntil)
+      ? -Math.abs(Math.sin(performance.now()*0.018))*4 : 0;
+    const y=Math.round(arguments[1]+hop);   // shadow the desk y for the worker body only
+    // torso (soft shaded shirt + collar)  -- anchors UNCHANGED (hitbox-critical)
+    ro(x-11, y-12, 22, 16, sh);
+    px(x-11,y-12,22,2, shade(sh,.30)); px(x+7,y-11,3,14, shade(sh,-.20)); px(x-11,y+2,22,2, shade(sh,-.16));
+    px(x-2,y-12,4,2, shade(sh,-.28));
+    // typing arms
+    const tap=(Math.floor(t*0.4)&1);
+    ro(x-15, y-2+tap, 6, 8, sh); ro(x+9, y-2+(1-tap), 6, 8, sh);
+    px(x-14, y+5+tap, 5,3, sk); px(x+10, y+5+(1-tap), 5,3, sk);
+    // neck + head  -- anchors UNCHANGED (hitbox-critical)
+    px(x-3, y-15, 6, 4, sk); px(x-3, y-15, 6, 1, 'rgba(0,0,0,.16)');
+    ro(x-7, y-28, 14, 15, sk);
+    px(x-7,y-14,14,1,'rgba(0,0,0,.10)');                                // soft jaw shade
+    drawHairAcc(x, y-26, f); drawFace(x, y-26, f);
+    // source plaque (Cursor vs Claude Code) floating just above the head
+    if(p.agent) drawSourceTag(x, y-35, p.agent.source);
+  }
+  // --- wood desk top: bright surface + grain hint + shaded front edge ---
+  px(x-26,y+1,52,4,PAL.woodHi);                                         // bright top surface
+  ro(x-26, y+5, 52, 6, PAL.wood); px(x-26,y+5,52,2, shade(PAL.wood,.22));
+  for(let g=0; g<46; g+=11) px(x-22+g,y+7,7,1, shade(PAL.wood,-.10));    // grain
+  px(x-26,y+10,52,2,PAL.woodDk);                                        // shaded front edge
+  // --- grey TWO-DRAWER pedestal under the left side + a right leg ---
+  const pbx=x-24; ro(pbx, y+11, 20, 15, PAL.metal); px(pbx,y+11,20,2,PAL.steel);
+  px(pbx+1,y+13,18,5, shade(PAL.metal,.05)); px(pbx+1,y+19,18,5, shade(PAL.metal,-.07)); // drawer faces
+  px(pbx+6,y+15,8,1,PAL.metalDk); px(pbx+6,y+21,8,1,PAL.metalDk);       // drawer handles
+  px(x+19,y+11,3,14,PAL.woodDk);                                        // right desk leg
+  // --- chunkier monitor on a stand with a soft screen glow ---
+  const mx=x-23, my=y-16, mw=26;
+  ctx.fillStyle='rgba(150,222,236,.16)'; ctx.fillRect(mx-2,my-1,mw+4,18);  // glow halo
+  px(x-11,y-1,4,3,PAL.monitorLip); px(x-15,y+2,12,2,PAL.monitorLip);       // stand + base
+  ro(mx, my, mw, 16, PAL.monitor); px(mx,my,mw,2, shade(PAL.monitor,.5));
+  if(p){ const tints=['#7fd3e0','#9fe0c0','#7fb0e0','#cfe9a0']; const fr=Math.floor((t*0.12+p.seed)%4);
+    px(mx+2,my+2,mw-4,12,tints[fr]);                                      // animated "code" lines
+    px(mx+3,my+4,16,2,PAL.ink); px(mx+3,my+7,10,2,PAL.ink); px(mx+3,my+10,19,2,PAL.ink);
+    px(mx+2,my+2,mw-4,1,'rgba(255,255,255,.22)');                         // screen gloss
+  } else { px(mx+2,my+2,mw-4,12,'#39404a'); px(mx+4,my+7,12,2,'#4a525d'); } // dim when empty
+  // keyboard + mouse on the desk top
+  px(x-15,y+1,20,4,'#d3dae0'); px(x-15,y+1,20,1,'#fff'); for(let k=0;k<5;k++) px(x-13+k*4,y+3,2,1,'#aeb6bd');
+  px(x+8,y+2,4,3,'#d3dae0');
+  // little terracotta desk plant (right) + paper stack
+  px(x+13,y-4,9,6,PAL.pot); px(x+13,y-4,9,2,shade(PAL.pot,.18)); px(x+12,y,11,1,PAL.potDk);
+  blade(x+15,y-4,9,-2,PAL.leafDk); blade(x+17,y-4,12,0,PAL.leaf); blade(x+19,y-4,8,2,PAL.leafDk);
+  px(x-22,y+6,9,5,PAL.paper); px(x-22,y+6,9,1,'#e6e6ec'); px(x-21,y+8,7,1,'#cfcfd6');
+  // mug with steam if the desk is occupied
+  if(p){ mug(x+3, y-1, PAL.mugC);
+    for(let i=0;i<3;i++){ const yy=y-3-((t*1.0+i*5)%8); px(x+5,yy,1,2,'rgba(255,255,255,.5)'); } }
+}
+
+// a standing person (kitchen / lounge), facing us
+function drawStanding(p, t){
+  // celebration dance: little hops + side-to-side wiggle while the flag is live
+  let dx0=0, dy0=0;
+  if(p.celebrateUntil && performance.now()<p.celebrateUntil){
+    const tt=performance.now();
+    dy0 = -Math.abs(Math.sin(tt*0.018))*5;     // quick hops
+    dx0 = Math.sin(tt*0.013)*3;                // wiggle
+  }
+  const x=Math.round(p.x+dx0), y=Math.round(p.y+dy0);
+  const f=p.feat||featuresFor(p.id||'x');
+  const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
+  const walking=(Math.abs(p.vx)+Math.abs(p.vy))>0.05;
+  const step=walking?(Math.floor(t*0.16)&1):0;
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,.20)'; ctx.beginPath(); ctx.ellipse(x,y+16,11,3,0,0,Math.PI*2); ctx.fill();
+  // legs + rounded shoes (feet stay at ~y+16 to match the hitbox)
+  const l1=9+(walking?step:0), l2=9+(walking?(1-step):0);
+  ro(x-6, y+4, 5, l1, pants); ro(x+1, y+4, 5, l2, pants);
+  px(x-6,y+4,5,1, shade(pants,.18)); px(x+1,y+4,5,1, shade(pants,.18));     // pant sheen
+  px(x-8, y+4+l1, 7,3, shoe); px(x-8, y+4+l1, 7,1, shade(shoe,.32));        // left shoe
+  px(x,   y+4+l2, 7,3, shoe); px(x,   y+4+l2, 7,1, shade(shoe,.32));        // right shoe
+  // torso (soft shaded shirt: top highlight, side + hem shadow, collar, belt)
+  ro(x-9, y-11, 18, 16, sh);
+  px(x-9,y-11,18,2, shade(sh,.30)); px(x+6,y-10,3,13, shade(sh,-.20)); px(x-9,y+3,18,2, shade(sh,-.16));
+  px(x-2,y-11,4,2, shade(sh,-.28));                         // collar notch
+  px(x-9,y+4,18,1, shade(pants,-.10));                      // belt/hem line
+  // arms by mode: upper sleeve (shirt) + forearm/hand (skin)
+  if(p.mode==='drink' || p.mode==='idle'){
+    ro(x-14, y-7, 5, 7, sh); px(x-14, y-1, 5,4, sk);                       // left arm relaxed
+    ro(x+9, y-9, 5, 7, sh); px(x+9, y-3, 5,3, sk);                         // right toward mug
+    ro(x+10, y-13, 7, 7, PAL.paper); px(x+11,y-12,5,5,PAL.mugA); px(x+17,y-12,2,4,PAL.paper);
+    for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } // steam
+  } else if(p.mode==='eat'){
+    ro(x-14, y-6, 5, 7, sh); px(x-14, y+1, 5,3, sk);
+    ro(x+9, y-7, 5, 6, sh); px(x+10,y-9,5,5,PAL.orange);
+  } else {
+    ro(x-14, y-7, 5, 8, sh); px(x-14, y+1, 4,4, sk);                       // hands at sides
+    ro(x+10, y-7, 5, 8, sh); px(x+10, y+1, 4,4, sk);
+  }
+  // neck + head
+  px(x-3, y-14, 6, 4, sk); px(x-3, y-14, 6, 1, 'rgba(0,0,0,.16)');
+  ro(x-7, y-27, 14, 15, sk);
+  px(x-7,y-13,14,1,'rgba(0,0,0,.10)');                      // soft jaw shade
+  drawHairAcc(x, y-25, f); drawFace(x, y-25, f);
+  // source plaque (Cursor vs Claude Code) floating just above the head
+  if(p.agent) drawSourceTag(x, y-34, p.agent.source);
+  // cozy heart speech bubble for settled kitchen agents (scales with the sprite)
+  if(p.kind!=='work' && p.mode==='idle'){ heartBubble(x+15, y-34); }
+}
+
+// ---- update loop ----
+let last=performance.now(), tCount=0;
+const WALK_PXPS = 80;   // constant walk speed -> a room crossing takes ~2-4s
+function tick(now){
+  const dt=Math.min(40, now-last); last=now; tCount+= dt*0.06;
+  const L=layout();
+  const step = WALK_PXPS * dt/1000;   // distance to advance this frame
+  // advance + expire confetti particles
+  if(confetti.length){
+    const ds=dt/1000;
+    for(let i=confetti.length-1;i>=0;i--){ const c=confetti[i]; c.age+=ds;
+      if(c.age>=c.life){ confetti.splice(i,1); continue; }
+      c.vy+=c.g*ds; c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.99; c.rot+=c.vr*ds;
+    }
+  }
+  for(const p of people){
+    if(p.kind==='work'){
+      if(p.seated){ p.x=p.deskX; p.y=p.deskY; p.vx=p.vy=0; }
+      else {
+        // walk in from wherever it was (e.g. the kitchen) up to the desk, then sit
+        const dx=p.deskX-p.x, dy=p.deskY-p.y, dist=Math.hypot(dx,dy);
+        if(dist<=step+0.5){ p.x=p.deskX; p.y=p.deskY; p.seated=true; p.vx=p.vy=0; }
+        else { p.vx=dx/dist; p.vy=dy/dist; p.x+=p.vx*step; p.y+=p.vy*step; }
+      }
+    } else {
+      // walk once to the assigned spot, then stand still so it's easy to hover
+      if(p.mode!=='idle'){
+        const dx=p.home.x-p.x, dy=p.home.y-p.y, dist=Math.hypot(dx,dy);
+        if(dist<=step+0.5){ p.x=p.home.x; p.y=p.home.y; p.mode='idle'; p.vx=p.vy=0; }
+        else { p.vx=dx/dist; p.vy=dy/dist; p.x+=p.vx*step; p.y+=p.vy*step; }
+      } else { p.vx=p.vy=0; }
+      // clamp into the kitchen only once settled (lets cross-room walks pass through)
+      if(p.mode==='idle'){
+        p.x=Math.max(L.kitchen.x+18,Math.min(L.kitchen.x+L.kitchen.w-18,p.x));
+        p.y=Math.max(L.kitchenTop+44,Math.min(H-20,p.y));
+      }
+    }
+  }
+  updateAmbient(now, dt);
+  render(tCount);
+  requestAnimationFrame(tick);
+}
+
+function render(t){
+  ctx.clearRect(0,0,W,H);
+  drawFloor();
+  // office desks (always shown); seated worker drawn only once docked, otherwise
+  // the desk is shown empty and the worker is drawn separately as a walker.
+  const slots=[...deskSlots].sort((a,b)=>a.y-b.y);
+  for(const s of slots){ const w=s.worker;
+    ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore(); }
+  // everyone currently standing/walking (kitchen agents + workers still walking in),
+  // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
+  const drawList=[];
+  people.filter(p=> p.kind!=='work' || !p.seated).forEach(p=> drawList.push({y:p.y, p}));
+  if(amb.dog) drawList.push({y:amb.dog.y, dog:amb.dog});
+  if(amb.cat) drawList.push({y:amb.cat.y, cat:amb.cat});
+  drawList.sort((a,b)=>a.y-b.y);
+  for(const e of drawList){
+    if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC); drawStanding(e.p,t); ctx.restore(); }
+    else if(e.dog) drawDog(e.dog, t);
+    else if(e.cat) drawCat(e.cat, t);
+  }
+  // hover ring (around the drawn sprite, scaled to match SC)
+  if(hover){
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=2;
+    if(hover.kind==='work' && hover.seated) ctx.strokeRect(hover.deskX-24*SC, hover.deskY-33*SC, 48*SC, 56*SC);
+    else ctx.strokeRect(Math.round(hover.x)-14*SC, Math.round(hover.y)-31*SC, 28*SC, 51*SC);
+  }
+  // subtle dot-matrix vignette (kept faint + crisp so text/sprites stay readable)
+  if(!render._vig){
+    const g=ctx.createRadialGradient(W/2,H*0.46,H*0.34,W/2,H*0.5,H*0.78);
+    g.addColorStop(0,'rgba(20,16,28,0)'); g.addColorStop(1,'rgba(20,16,28,0.15)');
+    render._vig=g;
+  }
+  ctx.fillStyle=render._vig; ctx.fillRect(0,0,W,H);
+  // celebration confetti, rendered above everything
+  for(const c of confetti){
+    const a=Math.max(0, 1 - c.age/c.life);
+    ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
+    ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
+  }
+  ctx.globalAlpha=1;
+}
+
+// burst ~110 confetti pieces: half from the agent's head, half across the whole screen
+function spawnConfetti(ox, oy){
+  const cols=['#e23b3b','#f0a23b','#ffd84d','#4fd06a','#3fa0e0','#8c5fd6','#e673a8','#ffffff'];
+  const N=110;
+  for(let i=0;i<N;i++){
+    const fromOrigin = (ox!=null) && (i<55);
+    confetti.push({
+      x: fromOrigin? ox : Math.random()*W,
+      y: fromOrigin? oy : -10 - Math.random()*H*0.3,
+      vx: fromOrigin? (Math.random()-0.5)*170 : (Math.random()-0.5)*45,
+      vy: fromOrigin? (-130 - Math.random()*120) : (20 + Math.random()*60),
+      g: 190 + Math.random()*120,
+      w: 3+Math.random()*4, h: 4+Math.random()*5,
+      col: cols[(Math.random()*cols.length)|0],
+      rot: Math.random()*Math.PI, vr:(Math.random()-0.5)*10,
+      life: 2.6 + Math.random()*1.0, age:0,
+    });
+  }
+  if(confetti.length>200) confetti.splice(0, confetti.length-200);   // hard cap
+}
+
+// ======================================================================
+// AMBIENT RANDOM EVENTS  (dog crossing / cat nap / agent relocate)
+// Scheduled + animated entirely off the rAF clock (see tick()).
+// ======================================================================
+
+// next-event delay. Override for testing with:  window.__eventInterval=[2000,4000]
+// (and restore with:  delete window.__eventInterval)
+function scheduleNextEvent(now){
+  let mn=30000, mx=60000;
+  if(window.__eventInterval){ mn=window.__eventInterval[0]; mx=window.__eventInterval[1]; }
+  nextEventAt = now + mn + Math.random()*(mx-mn);
+}
+
+// pick ONE event at random, avoiding an immediate repeat; if the chosen type can't
+// run (dog/cat already on screen, or no waiting agent for a relocate) try another.
+function fireRandomEvent(now){
+  const types=[1,2,3];
+  for(let i=types.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; const tmp=types[i]; types[i]=types[j]; types[j]=tmp; }
+  if(types[0]===lastEventType){ types.push(types.shift()); }   // soft anti-repeat
+  for(const t of types){
+    if(t===1 && !amb.dog){ startDog(now); lastEventType=1; return; }
+    if(t===2 && !amb.cat){ startCat(now); lastEventType=2; return; }
+    if(t===3 && startRelocate(now)){ lastEventType=3; return; }
+  }
+}
+
+// ---- 1) DOG walks across the OFFICE floor and exits ----
+const DOG_BREEDS=['dachshund','husky','retriever'];
+function startDog(now){
+  const L=layout();
+  const dir = Math.random()<0.5 ? 1 : -1;            // 1: L->R, -1: R->L
+  const breed = DOG_BREEDS[(Math.random()*DOG_BREEDS.length)|0];
+  amb.dog = {
+    breed, dir,
+    x: dir>0 ? -36 : W+36,
+    y: L.kitchenTop - 24,                            // near-front office lane (in front of desks)
+    spd: 118 + Math.random()*26,                     // px/s -> ~4-5s to cross
+  };
+}
+
+// ---- 2) CAT walks into the KITCHEN, curls up and naps, then leaves ----
+const CAT_FURS=['#e09a4a','#9aa0a6','#caa97a','#cfcfcf'];  // ginger / grey / fawn / silver
+const CAT_SPOTS=[[490,556],[300,478],[200,556],[410,556]]; // open floor, clear of furniture
+function startCat(now){
+  // choose the floor spot furthest from every agent (so the cat doesn't overlap)
+  let best=CAT_SPOTS[0], bestD=-1;
+  for(const s of CAT_SPOTS){
+    let mind=1e9;
+    for(const p of people){ if(p.kind==='work') continue; const d=Math.hypot(p.x-s[0],p.y-s[1]); if(d<mind) mind=d; }
+    if(mind>bestD){ bestD=mind; best=s; }
+  }
+  const dir = best[0] < W/2 ? 1 : -1;                // enter from the nearer side
+  let nap = 120000 + Math.random()*120000;          // 2-4 min
+  if(window.__catNapMs) nap = window.__catNapMs;     // testing override
+  amb.cat = {
+    fur: CAT_FURS[(Math.random()*CAT_FURS.length)|0],
+    dir, x: dir>0 ? -20 : W+20, y: best[1],
+    tx: best[0], state:'in', spd:74, napMs:nap, sleepUntil:0,
+  };
+}
+
+// ---- 3) RELOCATE: a waiting agent strolls to a different open kitchen spot ----
+function startRelocate(now){
+  const cands = people.filter(p=> p.kind==='wait' && p.mode==='idle');
+  if(!cands.length) return false;
+  const p = cands[(Math.random()*cands.length)|0];
+  // collect spots that are free (no other agent within ~40px) and not where we already are
+  const others = people.filter(q=> q!==p);
+  const open = [];
+  for(const s of KSPOTS){
+    if(Math.hypot(s[0]-p.x, s[1]-p.y) < 30) continue;          // too close to current spot
+    let free=true;
+    for(const q of others){ if(Math.hypot(q.x-s[0],q.y-s[1])<40){ free=false; break; } }
+    if(free) open.push(s);
+  }
+  if(!open.length) return false;
+  const s = open[(Math.random()*open.length)|0];
+  p.relocHome = { x:s[0], y:s[1] };       // sticky across refreshes (see rebuild)
+  p.home = p.relocHome;
+  p.mode = 'walk';                         // reuse existing walk->idle mechanics
+  return true;
+}
+
+// advance ambient critters; called from tick()
+function updateAmbient(now, dt){
+  if(!nextEventAt) scheduleNextEvent(now);          // first event ~30-60s after load
+  if(now>=nextEventAt){ fireRandomEvent(now); scheduleNextEvent(now); }
+  const sec=dt/1000;
+  if(amb.dog){ const d=amb.dog; d.x += d.dir*d.spd*sec;
+    if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null; }
+  if(amb.cat){ const c=amb.cat;
+    if(c.state==='in'){
+      if(Math.abs(c.tx-c.x) <= c.spd*sec+0.5){ c.x=c.tx; c.state='sleep'; c.sleepUntil=now+c.napMs; }
+      else c.x += Math.sign(c.tx-c.x)*c.spd*sec;
+    } else if(c.state==='sleep'){
+      if(now>=c.sleepUntil){ c.state='out'; c.dir = (c.x < W/2) ? -1 : 1; }   // leave the nearer side
+    } else { // out
+      c.x += c.dir*c.spd*sec;
+      if((c.dir>0 && c.x>W+24) || (c.dir<0 && c.x<-24)) amb.cat=null;
+    }
+  }
+}
+
+// ---------- pixel-art critters (drawn scaled by SC about their anchor) ----------
+
+// a single shaded leg segment
+function _leg(lx, topY, len, w, col){ px(lx,topY,w,len,col); px(lx,topY+len-1,w,1,shade(col,-.34)); }
+
+// DOG: three visually distinct breeds, side-on, facing its walk direction.
+function drawDog(d, t){
+  ctx.save();
+  scaleAbout(d.x, d.y, SC);
+  if(d.dir<0){ ctx.translate(d.x,0); ctx.scale(-1,1); ctx.translate(-d.x,0); }  // face left
+  const x=d.x, y=d.y;
+  const ph = (Math.floor(t*0.34)&1) ? 1 : -1;        // leg swing phase
+  const bob = Math.round(Math.sin(t*0.30))|0;        // head bob (0/1)
+  const wag = Math.round(Math.sin(t*0.55)*2);        // tail wag
+  // ground contact shadow
+  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.beginPath(); ctx.ellipse(x, y+1, 22, 4, 0, 0, Math.PI*2); ctx.fill();
+
+  if(d.breed==='dachshund'){
+    const c='#8a5a2b', cd='#6b431d', ch='#a3743f', ear='#5a3717', nose='#241c2b';
+    const bw=42, bh=9, by=y-12;                       // long, low body
+    // short legs (front pair near +x/head, back pair near -x/tail)
+    _leg(x-15, by+bh, 6+ph, 4, cd); _leg(x-8, by+bh, 6-ph, 4, cd);
+    _leg(x+8,  by+bh, 6-ph, 4, c);  _leg(x+15, by+bh, 6+ph, 4, c);
+    ro(x-bw/2, by, bw, bh, c);                        // body
+    px(x-bw/2, by, bw, 2, ch); px(x-bw/2, by+bh-2, bw, 2, cd);
+    // tail (thin, low, wagging) at the back-left
+    px(x-bw/2-4, by+1+wag, 6, 2, c); px(x-bw/2-6, by-1+wag, 3, 2, c);
+    // neck + head at the front-right, slightly raised by bob
+    const hx=x+bw/2-1, hy=by-6+bob;
+    px(hx-2, by-2, 7, 6, c);                          // neck wedge
+    ro(hx, hy, 13, 11, c); px(hx,hy,13,2,ch);         // head
+    px(hx+11, hy+4, 6, 5, c); px(hx+11,hy+4,6,1,ch);  // snout
+    px(hx+16, hy+5, 2, 3, nose);                      // nose
+    px(hx-2, hy+1, 5, 12, ear);                       // long floppy ear hanging down
+    px(hx-2, hy+1, 5, 2, shade(ear,.2));
+    px(hx+6, hy+4, 2, 2, nose);                       // eye
+  }
+  else if(d.breed==='husky'){
+    const c='#9aa3ab', cd='#6f7780', ch='#cfd5da', wht='#f3f5f7', ear='#5b636b', nose='#241c2b';
+    const bw=30, bh=12, by=y-16;                      // medium body, taller legs
+    _leg(x-11, by+bh, 9+ph, 4, wht); _leg(x-5, by+bh, 9-ph, 4, wht);
+    _leg(x+5,  by+bh, 9-ph, 4, wht); _leg(x+11, by+bh, 9+ph, 4, wht);
+    ro(x-bw/2, by, bw, bh, c);                        // grey back
+    px(x-bw/2, by, bw, 2, ch);
+    px(x-bw/2, by+bh-4, bw, 4, wht);                  // white belly band
+    // curled tail (plumed, sweeping up over the back)
+    px(x-bw/2-4, by-2+wag, 4, 8, c); px(x-bw/2-6, by-6+wag, 5, 5, ch);
+    px(x-bw/2-3, by-8+wag, 6, 4, wht);
+    // neck + head with mask markings
+    const hx=x+bw/2-2, hy=by-9+bob;
+    px(hx-2, by-3, 8, 8, c);                          // neck
+    ro(hx, hy, 14, 13, c); px(hx,hy,14,2,ch);         // head (grey)
+    px(hx+5, hy+4, 9, 9, wht);                        // white muzzle/mask
+    px(hx+12, hy+6, 6, 5, wht);                       // snout
+    px(hx+17, hy+7, 2, 3, nose);                      // nose
+    px(hx+1, hy-5, 4, 6, c); px(hx+1,hy-5,4,1,ch);    // pointy ear (back)
+    px(hx+8, hy-5, 4, 6, c); px(hx+8,hy-5,4,1,ch);    // pointy ear (front)
+    px(hx+2, hy-3, 2, 3, shade(c,-.3)); px(hx+9, hy-3, 2, 3, shade(c,-.3)); // ear insides
+    px(hx+9, hy+4, 2, 2, '#5aa0d8');                  // pale husky eye
+  }
+  else { // golden retriever
+    const c='#e0a84a', cd='#bd8730', ch='#f0c878', nose='#2a2018';
+    const bw=32, bh=13, by=y-16;
+    _leg(x-12, by+bh, 9+ph, 5, cd); _leg(x-5, by+bh, 9-ph, 5, cd);
+    _leg(x+5,  by+bh, 9-ph, 5, c);  _leg(x+12, by+bh, 9+ph, 5, c);
+    ro(x-bw/2, by, bw, bh, c);                        // tan body
+    px(x-bw/2, by, bw, 2, ch); px(x-bw/2, by+bh-2, bw, 2, cd);
+    // plumed bushy tail held out/up, wagging
+    px(x-bw/2-6, by-1+wag, 8, 4, c); px(x-bw/2-10, by-4+wag, 7, 5, ch);
+    px(x-bw/2-12, by-7+wag, 6, 4, c); px(x-bw/2-8, by+2+wag, 6, 3, cd);
+    // neck + head with long floppy ears
+    const hx=x+bw/2-2, hy=by-8+bob;
+    px(hx-2, by-3, 9, 8, c);                          // neck
+    ro(hx, hy, 14, 12, c); px(hx,hy,14,2,ch);         // head
+    px(hx+11, hy+4, 7, 6, c); px(hx+11,hy+4,7,1,ch);  // muzzle
+    px(hx+17, hy+5, 2, 3, nose);                      // nose
+    px(hx-3, hy+1, 5, 11, cd); px(hx-3,hy+1,5,2,c);   // floppy ear
+    px(hx+8, hy+4, 2, 2, nose);                       // eye
+  }
+  ctx.restore();
+}
+
+// CAT: rounded curled body when sleeping (tail wrapped, Zzz rising), or a small
+// side-on walker when entering/leaving.
+function drawCat(c, t){
+  ctx.save();
+  scaleAbout(c.x, c.y, SC);
+  const fur=c.fur, furDk=shade(fur,-.30), furHi=shade(fur,.30), pink='#e79ab0', nose='#cf7a8e';
+  const el=(cx,cy,rx,ry,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fill(); };
+  const x=c.x, y=c.y;
+  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, y+2, 16, 4, 0, 0, Math.PI*2); ctx.fill();
+
+  if(c.state==='sleep'){
+    el(x, y-6, 15, 9, fur);                           // curled body
+    el(x, y-9, 11, 5, furHi);                         // back highlight
+    el(x-9, y-3, 7, 6, fur);                          // tucked head (front-left)
+    px(x-15, y-12, 4, 6, fur); px(x-15,y-12,4,2,furHi); // ear
+    px(x-9, y-12, 4, 6, fur);  px(x-9,y-12,4,2,furHi);  // ear
+    px(x-12, y-3, 4, 1, PAL.outline);                 // closed eye (sleepy arc)
+    px(x-13, y-2, 1, 1, PAL.outline); px(x-8, y-2, 1, 1, PAL.outline);
+    // tail wrapped around the front of the body
+    ctx.strokeStyle=furDk; ctx.lineWidth=3; ctx.beginPath();
+    ctx.arc(x+2, y-4, 12, -0.2, 1.5); ctx.stroke();
+    px(x+13, y+2, 3, 3, furDk);                       // tail tip
+    // rising sleep "z"s (animated)
+    ctx.fillStyle=PAL.ink;
+    const f=(t*0.6);
+    ctx.font='6px "Press Start 2P", monospace'; ctx.fillText('z', x+5-((f)%10), y-16-((f)%10));
+    ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('z', x+10-((f+5)%12), y-12-((f+5)%12));
+  } else {
+    if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }  // face walk dir
+    const ph=(Math.floor(t*0.4)&1)?1:-1;
+    _leg(x-7, y-7, 7+ph, 3, furDk); _leg(x-2, y-7, 7-ph, 3, furDk);
+    _leg(x+4, y-7, 7-ph, 3, fur);  _leg(x+8, y-7, 7+ph, 3, fur);
+    ro(x-9, y-13, 18, 7, fur); px(x-9,y-13,18,2,furHi);   // body
+    // upright tail with a slight wag
+    const wag=Math.round(Math.sin(t*0.5)*2);
+    px(x-11, y-18+wag, 3, 8, fur); px(x-12, y-22+wag, 3, 5, furDk);
+    // head (front-right) with ears + face
+    const hx=x+7, hy=y-19;
+    ro(hx, hy, 11, 10, fur); px(hx,hy,11,2,furHi);
+    px(hx, hy-4, 4, 5, fur); px(hx+7, hy-4, 4, 5, fur);   // pointy ears
+    px(hx+1, hy-3, 2, 3, pink); px(hx+8, hy-3, 2, 3, pink);
+    px(hx+8, hy+4, 2, 2, PAL.outline);                   // eye
+    px(hx+10, hy+6, 2, 2, nose);                         // nose
+  }
+  ctx.restore();
+}
+
+// ---- interaction ----
+function toCanvas(ev){
+  const r=cv.getBoundingClientRect();
+  return { x:(ev.clientX-r.left)/r.width*W, y:(ev.clientY-r.top)/r.height*H, cx:ev.clientX-r.left, cy:ev.clientY-r.top, r };
+}
+function pick(mx,my){
+  let best=null,bd=1e9;
+  for(const p of people){
+    const seatedWorker = p.kind==='work' && p.seated;
+    // hit-test against where the sprite is actually drawn
+    const sx = seatedWorker ? p.deskX : p.x;
+    const sy = seatedWorker ? p.deskY : p.y;
+    const dx=mx-sx;
+    let hit;
+    // hitboxes scale with SC (sprites are drawn scaled about their anchor)
+    if(seatedWorker) hit = (Math.abs(dx)<24*SC && my>sy-32*SC && my<sy+22*SC);
+    else             hit = (Math.abs(dx)<15*SC && my>sy-32*SC && my<sy+18*SC); // standing
+    if(hit){ const cy=sy-12*SC, d=dx*dx+(my-cy)*(my-cy); if(d<bd){bd=d;best=p;} }
+  }
+  return best;
+}
+const nametag=document.getElementById('nametag');
+cv.addEventListener('mousemove', e=>{
+  const m=toCanvas(e); hover=pick(m.x,m.y);
+  if(hover){
+    cv.style.cursor='pointer';
+    const a=hover.agent;
+    const where = a.status==='working' ? 'at a desk' : 'in the kitchen';
+    const meta = [a.project, a.last_activity_rel? ('active '+a.last_activity_rel):null,
+                  (a.message_count!=null? a.message_count+' msgs':null)].filter(Boolean).join('  ·  ');
+    const k = a.latest_kind;
+    const label = a.status==='working'
+      ? (k==='tool' ? 'Currently running' : 'Latest activity')
+      : (k==='tool' ? 'Last action' : 'Latest message');
+    nametag.innerHTML =
+      '<div class="nt-name">'+esc(a.name)+
+        '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
+        srcBadgeHTML(a.source)+'</div>'+
+      '<div class="nt-meta">'+esc(meta)+'  ·  '+where+'</div>'+
+      '<div class="nt-label">Task</div>'+
+      '<div class="nt-text">'+esc(a.title||'(untitled session)')+'</div>'+
+      '<div class="nt-label">'+label+'</div>'+
+      '<div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'+
+      '<div class="nt-hint">click to open full session</div>';
+    nametag.style.display='block';
+    // clamp inside the screen: place near cursor, flip/shift to stay on-screen
+    const sw=m.r.width, sh=m.r.height, pad=8;
+    const bw=nametag.offsetWidth, bh=nametag.offsetHeight;
+    let left=m.cx+16, top=m.cy-bh-12;
+    if(left+bw+pad>sw) left=m.cx-bw-16;        // flip to the left of cursor
+    if(left<pad) left=pad;
+    if(top<pad) top=m.cy+18;                    // flip below cursor
+    if(top+bh+pad>sh) top=sh-bh-pad;
+    nametag.style.left=Math.round(left)+'px';
+    nametag.style.top=Math.round(top)+'px';
+  } else { nametag.style.display='none'; cv.style.cursor='default'; }
+});
+cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';});
+cv.addEventListener('click', e=>{
+  const m=toCanvas(e); const p=pick(m.x,m.y);
+  if(p) openDetail(p.agent.id);
+});
+
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+// which tool made this worker -- Cursor vs Claude Code
+function srcLabel(source){ return source==='claude' ? 'Claude Code' : 'Cursor'; }
+function srcBadgeHTML(source){
+  const cls = source==='claude' ? 'src-claude' : 'src-cursor';
+  return '<span class="nt-badge '+cls+'">'+esc(srcLabel(source))+'</span>';
+}
+// small on-canvas source marker (a little colored sign floating above the head)
+const SRC_COLORS = { cursor:'#2b6d84', claude:'#d97757' };
+function drawSourceTag(x, topY, source){
+  const col = SRC_COLORS[source] || SRC_COLORS.cursor;
+  // a 6x4 rounded plaque with a soft outline + top gloss, centered on x
+  px(x-4, topY,   8, 1, 'rgba(0,0,0,.35)');
+  px(x-4, topY,   8, 4, col);
+  px(x-4, topY,   8, 1, 'rgba(255,255,255,.4)');
+  px(x-4, topY+3, 8, 1, 'rgba(0,0,0,.28)');
+}
+
+// ---- overlay ----
+const overlay=document.getElementById('overlay');
+let currentDetail=null;
+async function openDetail(id){
+  let d=detailCache[id];
+  if(!d){
+    try{ const res=await fetch('/api/agent/'+encodeURIComponent(id)); d=await res.json(); detailCache[id]=d; }
+    catch(err){ toast('failed to load'); return; }
+  }
+  if(!d||d.error){ toast('not found'); return; }
+  currentDetail=d;
+  document.getElementById('d-name').textContent=d.name;
+  document.getElementById('d-sub').innerHTML=
+    '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
+    '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> &nbsp; '+
+    esc(d.project)+' &nbsp;·&nbsp; '+esc(d.last_activity_rel)+' &nbsp;·&nbsp; '+d.message_count+' msgs';
+  const body=document.getElementById('dbody');
+  let html='';
+  html+='<section><h4>Task</h4><div class="box role-user">'+esc(d.task_full||d.title||'(none)')+'</div></section>';
+  if(d.latest_tool){
+    html+='<section><h4>Last action</h4><span class="tool">'+esc(d.latest_tool.name)+'</span> '+esc(d.latest_tool.detail||'')+'</section>';
+  }
+  html+='<section><h4>Latest thinking / response</h4><div class="box">'+esc(d.latest_response||'(no assistant message yet)')+'</div></section>';
+  if(d.timeline && d.timeline.length){
+    html+='<section><h4>Recent activity</h4>';
+    for(const ev of d.timeline){
+      if(ev.role==='system'){ html+='<div class="turn">'+esc(ev.text)+'</div>'; continue; }
+      let tools=''; (ev.tools||[]).forEach(tl=>{ tools+='<span class="tool">'+esc(tl.name)+(tl.detail?': '+esc(tl.detail):'')+'</span>'; });
+      const cls = ev.role==='user'?'role-user':'';
+      if(ev.text || tools){
+        html+='<div class="'+cls+'" style="margin-bottom:8px"><div style="font-size:8px;letter-spacing:1px;color:'+(ev.role==='user'?'#6b6e78':'#3a3d46')+';margin-bottom:3px">'+ev.role.toUpperCase()+'</div>';
+        if(ev.text) html+='<div class="box">'+esc(ev.text)+'</div>';
+        if(tools) html+='<div style="margin-top:4px">'+tools+'</div>';
+        html+='</div>';
+      }
+    }
+    html+='</section>';
+  }
+  const jumpHelp = d.source==='claude'
+    ? 'Claude Code has no public deep link to a past session yet. Use <b>Open Transcript File</b> to view the raw <code>.jsonl</code>, or <b>Copy Session ID</b> and resume with <code>claude --resume '+esc(d.id)+'</code>.'
+    : 'Cursor has no public deep link to a specific past chat session yet, so this id can\u2019t auto-open the chat. Use <b>Open Transcript File</b> to view the raw <code>.jsonl</code> in Cursor, or <b>Copy Session ID</b> and find it under the sidebar\u2019s Previous Chats.';
+  html+='<section><h4>Jump back to this chat</h4><div class="box">'+jumpHelp+'<br><br>session id: '+esc(d.id)+'</div></section>';
+  body.innerHTML=html; body.scrollTop=0;
+  overlay.style.display='flex';
+}
+function closeDetail(){overlay.style.display='none';currentDetail=null;}
+document.getElementById('d-x').addEventListener('click',closeDetail);
+overlay.addEventListener('click',e=>{ if(e.target===overlay) closeDetail(); });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeDetail(); });
+
+document.getElementById('d-open').addEventListener('click',()=>{
+  if(!currentDetail) return;
+  const path=currentDetail.transcript_path||'';
+  if(!path || path.indexOf('demo')>=0){ toast('demo worker - no file'); return; }
+  // Cursor has no deep link to a past chat session, so we open the raw
+  // transcript file (.jsonl) in Cursor as the closest available action.
+  window.location.href='cursor://file'+ (path.startsWith('/')?'':'/') + path.split('/').map(encodeURIComponent).join('/');
+  toast('opening transcript file in Cursor...');
+});
+document.getElementById('d-copy').addEventListener('click',async ()=>{
+  if(!currentDetail) return;
+  try{ await navigator.clipboard.writeText(currentDetail.id); toast('session id copied'); }
+  catch(e){ toast(currentDetail.id); }
+});
+// CELEBRATE button: everyone dances ~3s + a screen-wide confetti burst (reuses finish-fx)
+document.getElementById('celebrate').addEventListener('click',()=>{
+  const now=performance.now();
+  people.forEach(p=>{ p.celebrateUntil=now+3000; });
+  spawnConfetti(W/2, H*0.22);
+  toast('party time!');
+});
+
+let toastT=null;
+function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.style.display='block';
+  clearTimeout(toastT); toastT=setTimeout(()=>el.style.display='none',1800); }
+
+// ---- data polling ----
+async function refresh(){
+  try{
+    const res=await fetch('/api/agents'); const data=await res.json();
+    WINDOW_HOURS=data.hours||24; document.getElementById('emh').textContent=WINDOW_HOURS;
+    document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
+    agents=data.agents||[]; rebuild();
+    detectFinishes(agents);
+  }catch(e){/* keep last */}
+}
+// fire a celebration when an agent transitions working -> waiting between polls
+function detectFinishes(list){
+  const cur={}; list.forEach(a=>cur[a.id]=a.status);
+  if(prevStatus===null){ prevStatus=cur; return; }   // first poll: seed map, no fires
+  for(const a of list){
+    if(prevStatus[a.id]==='working' && a.status==='waiting'){
+      const p=people.find(q=>q.id===a.id);
+      if(p){ p.celebrateUntil=performance.now()+2200;
+             spawnConfetti(Math.round(p.x), Math.round(p.y)-Math.round(46*SC)); }
+      else { spawnConfetti(W/2, H*0.2); }
+    }
+  }
+  prevStatus=cur;
+}
+function clock(){ document.getElementById('clock').textContent=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
+setInterval(clock,1000); clock();
+refresh(); setInterval(refresh, 4000);
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------------------
+# HTTP server
+# --------------------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    hours = 24
+    demo = False
+    project_filter = None
+    sources = None  # None -> all sources (cursor + claude)
+
+    def log_message(self, *args):
+        pass  # quiet
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode("utf-8")
+        elif isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + ("; charset=utf-8" if "json" in ctype or "html" in ctype else ""))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path in ("/", "/index.html"):
+                self._send(200, PAGE, "text/html")
+                return
+            if path == "/api/agents":
+                if self.demo:
+                    agents = demo_agents()
+                else:
+                    agents = get_agents(self.hours, full=False,
+                                        project_filter=self.project_filter,
+                                        sources=self.sources)
+                self._send(200, {
+                    "hours": self.hours,
+                    "scope": self.project_filter or "all projects",
+                    "agents": agents,
+                })
+                return
+            if path.startswith("/api/agent/"):
+                uuid = unquote(path[len("/api/agent/"):])
+                detail = demo_detail(uuid) if self.demo else get_agent_detail(uuid)
+                if not detail and not self.demo:
+                    detail = demo_detail(uuid)
+                if not detail:
+                    self._send(404, {"error": "not found"})
+                    return
+                self._send(200, detail)
+                return
+            self._send(404, {"error": "not found"})
+        except BrokenPipeError:
+            pass
+        except Exception as exc:  # never crash the office
+            try:
+                self._send(500, {"error": str(exc)})
+            except Exception:
+                pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Game Boy office of your Cursor + Claude Code agents.")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--hours", type=float, default=24, help="activity window in hours (default 24)")
+    ap.add_argument("--project", "-p", default=None,
+                    help="only show one root/project (substring match, e.g. 'my-app'). "
+                         "Omit to show ALL projects across every root.")
+    ap.add_argument("--list-projects", action="store_true",
+                    help="list the projects/roots with active sessions, then exit")
+    ap.add_argument("--no-cursor", action="store_true", help="hide Cursor agents")
+    ap.add_argument("--no-claude", action="store_true", help="hide Claude Code agents")
+    ap.add_argument("--active-secs", type=float, default=120.0,
+                    help="multitask subagent freshness window (seconds). A chat whose own "
+                         "turn has ended still shows working (at a desk) if a background "
+                         "subagent was written within this many seconds; otherwise it waits "
+                         "in the kitchen. Working chats are primarily decided by turn state, "
+                         "not recency. Default 120.")
+    ap.add_argument("--demo", action="store_true", help="show fake workers (no real data)")
+    ap.add_argument("--no-open", action="store_true", help="do not auto-open the browser")
+    args = ap.parse_args()
+
+    sources = [name for name, _d, _p in _SOURCES
+               if not (name == "cursor" and args.no_cursor)
+               and not (name == "claude" and args.no_claude)]
+    if not sources:
+        ap.error("--no-cursor and --no-claude can't both be set (nothing to show).")
+
+    if args.list_projects:
+        rows = list_projects(args.hours, sources=sources)
+        print(f"Projects/roots with sessions active in the last {args.hours:g}h:")
+        if not rows:
+            print("  (none - try a larger --hours window)")
+        for pretty, raw, n, src in rows:
+            print(f"  {n:>3}  [{src:<6}] {pretty:<24}  ({raw})")
+        print("\nUse:  python3 cursor_office.py --project <name>   to scope to one root.")
+        return
+
+    global SUBAGENT_ACTIVE_SECONDS
+    SUBAGENT_ACTIVE_SECONDS = max(15, args.active_secs)
+
+    Handler.hours = args.hours
+    Handler.demo = args.demo
+    Handler.project_filter = args.project
+    Handler.sources = sources
+
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    url = f"http://{args.host}:{args.port}"
+
+    if not args.demo:
+        dirs = []
+        if "cursor" in sources:
+            dirs.append(("Cursor", CURSOR_PROJECTS_DIR))
+        if "claude" in sources:
+            dirs.append(("Claude Code", CLAUDE_PROJECTS_DIR))
+        missing = [(label, d) for label, d in dirs if not os.path.isdir(d)]
+        if len(missing) == len(dirs):
+            for label, d in missing:
+                print(f"[!] {d} not found - is {label} installed for this user?")
+            print("    You can still preview the office with:  python3 cursor_office.py --demo")
+
+    src_labels = " + ".join(s.capitalize() for s in sources)
+    data_dirs = []
+    if "cursor" in sources:
+        data_dirs.append(CURSOR_PROJECTS_DIR)
+    if "claude" in sources:
+        data_dirs.append(CLAUDE_PROJECTS_DIR)
+    print("=" * 60)
+    print("  AGENT OFFICE  (Game Boy edition)")
+    print("=" * 60)
+    print(f"  Serving at:   {url}")
+    print(f"  Window:       last {args.hours:g}h" + ("   [DEMO MODE]" if args.demo else ""))
+    print(f"  Sources:      {src_labels}")
+    print(f"  Scope:        {args.project or 'ALL projects / roots'}")
+    print(f"  Status:       turn-state (office=turn in progress; multitask subagent window {args.active_secs:g}s; stale cap {WORKING_STALE_CAP_SECONDS:g}s)")
+    print(f"  Data source:  {', '.join(data_dirs)}")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60)
+
+    if not args.no_open:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nbye!")
+        httpd.shutdown()
+
+
+if __name__ == "__main__":
+    main()

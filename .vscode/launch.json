@@ -1,0 +1,42 @@
+{
+  // Run "Cursor Office" from this standalone folder.
+  // Open the cursor-office folder in Cursor, then pick a config below.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Cursor Office",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/cursor_office.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Cursor Office (demo)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/cursor_office.py",
+      "args": ["--demo"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Cursor Office (48h window)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/cursor_office.py",
+      "args": ["--hours", "48"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Cursor Office (list projects)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/cursor_office.py",
+      "args": ["--list-projects"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
