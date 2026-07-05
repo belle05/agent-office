@@ -8,8 +8,7 @@ It reads **both** Cursor and Claude Code sessions from your machine and shows th
 together — each worker wears a small colored plaque so you can tell them apart
 (teal = Cursor, coral = Claude Code).
 
-<!-- Add a screenshot at docs/screenshot.png and uncomment:
-![screenshot](docs/screenshot.png) -->
+![screenshot](docs/screenshot.png)
 
 
 ## Why
