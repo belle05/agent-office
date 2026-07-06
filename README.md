@@ -75,6 +75,8 @@ python3 cursor_office.py --no-open         # don't auto-open the browser
 - Scheduled / automated agents (cron jobs, daily monitors — anything launched by a
   scheduled task) are drawn as **couriers**: a solid uniform with a matching cap, so a
   squad of recurring jobs doesn't get mistaken for chats you started yourself.
+- A soft chime plays when an agent finishes (working → waiting). Toggle it with the
+  **♪** button in the header; the preference is remembered across reloads.
 - It's a single self-contained file — drop `cursor_office.py` anywhere and run it.
 
 ## License

@@ -937,10 +937,12 @@ PAGE = r"""<!DOCTYPE html>
     font-size:11px;color:#5a564d;letter-spacing:1px;}
   #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
     box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
-  #brand #celebrate{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+  #brand #celebrate,#brand #sound{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
     background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
-  #brand #celebrate:hover{background:#4a4a52;color:#fff;}
-  #brand #celebrate:active{transform:translateY(1px);}
+  #brand #celebrate:hover,#brand #sound:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active,#brand #sound:active{transform:translateY(1px);}
+  #brand #sound{margin-left:8px;}
+  #brand #sound.off{color:#8a8a90;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
     box-shadow:inset 0 0 0 3px #20240f, inset 0 0 22px rgba(0,0,0,.6);}
   #matrix{display:flex;align-items:center;gap:8px;justify-content:center;margin-bottom:8px;
@@ -1015,7 +1017,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><span id="clock"></span></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><span id="clock"></span></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
@@ -2435,18 +2437,54 @@ async function refresh(){
     detectFinishes(agents);
   }catch(e){/* keep last */}
 }
-// fire a celebration when an agent transitions working -> waiting between polls
+// ---- gentle "an agent finished" chime (Web Audio, no files) ----
+let audioCtx = null;
+let soundOn = (localStorage.getItem('office_sound') !== 'off');
+function initAudio(){
+  if(!audioCtx){ try{ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ audioCtx=null; } }
+  if(audioCtx && audioCtx.state==='suspended') audioCtx.resume();
+}
+// browsers block audio until a user gesture -- unlock on the first interaction
+['pointerdown','keydown'].forEach(ev=>window.addEventListener(ev, initAudio));
+function playFinishChime(){
+  if(!soundOn || !audioCtx) return;
+  const t0=audioCtx.currentTime;
+  // a soft two-note bell (C6 -> E6): quiet sine tones with a gentle attack/decay
+  [[1046.5,0.0],[1318.5,0.085]].forEach(([freq,dt])=>{
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.type='sine'; o.frequency.value=freq;
+    const s=t0+dt;
+    g.gain.setValueAtTime(0.0001, s);
+    g.gain.exponentialRampToValueAtTime(0.07, s+0.015);   // soft attack (kept low = not annoying)
+    g.gain.exponentialRampToValueAtTime(0.0001, s+0.33);  // gentle decay
+    o.connect(g).connect(audioCtx.destination);
+    o.start(s); o.stop(s+0.35);
+  });
+}
+const soundBtn=document.getElementById('sound');
+function updateSoundBtn(){ soundBtn.innerHTML=(soundOn?'&#9834; ON':'&#9834; OFF'); soundBtn.classList.toggle('off', !soundOn); }
+soundBtn.addEventListener('click',()=>{
+  soundOn=!soundOn; localStorage.setItem('office_sound', soundOn?'on':'off');
+  initAudio(); if(soundOn) playFinishChime();   // the toggle also previews the sound
+  updateSoundBtn();
+});
+updateSoundBtn();
+
+// fire a celebration (+ chime) when an agent transitions working -> waiting between polls
 function detectFinishes(list){
   const cur={}; list.forEach(a=>cur[a.id]=a.status);
   if(prevStatus===null){ prevStatus=cur; return; }   // first poll: seed map, no fires
+  let anyFinished=false;
   for(const a of list){
     if(prevStatus[a.id]==='working' && a.status==='waiting'){
+      anyFinished=true;
       const p=people.find(q=>q.id===a.id);
       if(p){ p.celebrateUntil=performance.now()+2200;
              spawnConfetti(Math.round(p.x), Math.round(p.y)-Math.round(46*SC)); }
       else { spawnConfetti(W/2, H*0.2); }
     }
   }
+  if(anyFinished) playFinishChime();   // once per poll, even if several finished at once
   prevStatus=cur;
 }
 function clock(){ document.getElementById('clock').textContent=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
