@@ -81,8 +81,9 @@ python3 cursor_office.py --no-open         # don't auto-open the browser
   **♪** button in the header; the preference is remembered across reloads.
 - The bottom of the room is split into a **kitchen** (agents waiting on you) and a
   **beach** (agents you're done with). Open any worker and hit **🏖 Send to beach** to
-  mark that loop finished — they'll go relax on the sand until you **Bring back to
-  work**. It's your call, sticky across reloads, independent of the agent's status.
+  mark that loop finished — they'll go sit on the sand in sunglasses with a cocktail
+  until you **Bring back to work**. It's your call, sticky across reloads, independent
+  of the agent's status.
 - It's a single self-contained file — drop `cursor_office.py` anywhere and run it.
 
 ## License

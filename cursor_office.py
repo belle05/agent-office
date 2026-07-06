@@ -1867,14 +1867,17 @@ function drawHairAcc(x, hy, f){
   else if(f.acc===4){ px(x-8,hy-4,16,8,f.accCol); px(x-8,hy+3,16,2,'rgba(0,0,0,.25)'); }      // beanie
   else if(f.acc===5){ px(x-1,hy-8,2,7,'#9aa'); px(x-2,hy-11,4,4,PAL.red); }                   // antenna
 }
-function drawFace(x, hy, f){
+function drawFace(x, hy, f, beach){
   const sk=f.skin;
   // ears
   px(x-9,hy+5,2,4,sk); px(x-9,hy+5,1,4,PAL.outline);
   px(x+7,hy+5,2,4,sk); px(x+8,hy+5,1,4,PAL.outline);
   // relaxed, slightly raised eyebrows (friendly, never angled-down)
   px(x-5,hy+2,3,1,'rgba(70,50,40,.55)'); px(x+2,hy+2,3,1,'rgba(70,50,40,.55)');
-  if(f.acc===1){ // glasses (over the eyes)
+  if(beach){ // dark sunglasses (beach only) -- two tinted lenses + a bridge
+    px(x-6,hy+4,5,4,'#15151a'); px(x+1,hy+4,5,4,'#15151a'); px(x-1,hy+5,2,1,'#15151a');
+    px(x-5,hy+4,2,1,'rgba(120,200,230,.55)'); px(x+2,hy+4,2,1,'rgba(120,200,230,.55)'); // lens glint
+  } else if(f.acc===1){ // glasses (over the eyes)
     px(x-6,hy+5,5,4,'#1b1b1b'); px(x+1,hy+5,5,4,'#1b1b1b'); px(x-1,hy+6,2,1,'#1b1b1b');
     px(x-5,hy+5,3,3,'#eaf6ff'); px(x+2,hy+5,3,3,'#eaf6ff');
     px(x-4,hy+6,1,1,'#101010'); px(x+3,hy+6,1,1,'#101010');
@@ -1895,6 +1898,47 @@ function drawFace(x, hy, f){
   px(x-1,hy+12,3,1,'rgba(214,90,110,.55)');     // warm lower-lip hint
   // rosy cheeks
   px(x-6,hy+8,2,2,'rgba(232,120,120,.55)'); px(x+5,hy+8,2,2,'rgba(232,120,120,.55)');
+}
+
+// a little tropical cocktail (glass + drink + straw + paper umbrella); cy = glass base
+function drawCocktail(cx, cy){
+  const glass='#d5edf5', drink='#f39a3a';
+  px(cx-2,cy-6,5,6,glass);            // glass body
+  px(cx-2,cy-6,5,1,'#eef8fb');        // rim highlight
+  px(cx-1,cy-5,3,4,drink);            // drink
+  px(cx+2,cy-5,1,4,'#b7d5df');        // glass shade
+  px(cx-2,cy,5,1,'#b7d5df');          // base
+  px(cx+2,cy-11,1,6,'#37b56c');       // straw
+  px(cx-1,cy-12,6,1,'#e0533b'); px(cx,cy-11,4,1,'#f6f6f8'); px(cx+1,cy-10,2,1,'#2f93d8'); // paper umbrella
+}
+
+// a finished agent relaxing on the sand: seated, shades on, cocktail in hand.
+// Only used for beach agents once they've settled, so the vacation look never
+// leaks into the kitchen or the desks.
+function drawBeachSitter(p, t){
+  const x=Math.round(p.x), y=Math.round(p.y);   // y = where they sit on the sand
+  const f=p.feat||featuresFor(p.id||'x');
+  const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
+  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.beginPath(); ctx.ellipse(x,y+8,15,4,0,0,Math.PI*2); ctx.fill(); // shadow
+  // legs stretched out on the sand + feet at the ends
+  ro(x-11, y+2, 22, 6, pants); px(x-11,y+2,22,1,shade(pants,.18)); px(x-11,y+7,22,1,shade(pants,-.14));
+  px(x-14, y+3, 5, 4, shoe); px(x+9, y+3, 5, 4, shoe);
+  px(x-14,y+3,5,1,shade(shoe,.3)); px(x+9,y+3,5,1,shade(shoe,.3));
+  // seated torso
+  ro(x-8, y-9, 16, 13, sh);
+  px(x-8,y-9,16,2,shade(sh,.30)); px(x+5,y-8,3,11,shade(sh,-.20)); px(x-8,y+2,16,2,shade(sh,-.16));
+  px(x-2,y-9,4,2,shade(sh,-.28));                              // collar
+  // left arm propped back on the sand
+  ro(x-12, y-6, 5, 8, sh); px(x-12, y+1, 5, 3, sk);
+  // right arm raised, holding the cocktail
+  ro(x+7, y-8, 5, 7, sh); px(x+8, y-3, 4, 3, sk);
+  drawCocktail(x+12, y-1);
+  // neck + head
+  px(x-3, y-13, 6, 4, sk); px(x-3,y-13,6,1,'rgba(0,0,0,.16)');
+  ro(x-7, y-26, 14, 15, sk);
+  px(x-7,y-12,14,1,'rgba(0,0,0,.10)');
+  drawHairAcc(x, y-24, f); drawFace(x, y-24, f, true);        // sunglasses ON (beach only)
+  if(p.agent) drawSourceTag(x, y-33, p.agent.source);
 }
 
 // a full workstation: office chair + desk + monitor + filing cabinet + plant,
@@ -2094,7 +2138,10 @@ function render(t){
   if(amb.cat) drawList.push({y:amb.cat.y, cat:amb.cat});
   drawList.sort((a,b)=>a.y-b.y);
   for(const e of drawList){
-    if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC); drawStanding(e.p,t); ctx.restore(); }
+    if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
+      // beach agents sit (with shades + cocktail) once settled; still walk in standing
+      if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t); else drawStanding(e.p,t);
+      ctx.restore(); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
   }
