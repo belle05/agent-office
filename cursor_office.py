@@ -1728,6 +1728,16 @@ function drawCap(x, hy, col){
   px(x-14,hy+1,8,2,shade(col,-.15));  // front visor / brim
   px(x-8,hy+1,16,1,shade(col,-.22));  // band shadow
 }
+// a small envelope emblem (like ✉️) stamped on a courier's chest, centered on (cx,cy)
+function drawEnvelope(cx, cy){
+  const paper='#f4f4f6', edge='#3a3a44';
+  px(cx-4, cy-3, 8, 6, paper);                              // body
+  px(cx-4, cy-3, 8, 1, edge); px(cx-4, cy+2, 8, 1, edge);  // top + bottom border
+  px(cx-4, cy-3, 1, 6, edge); px(cx+3, cy-3, 1, 6, edge);  // left + right border
+  // flap: a shallow V from the top corners meeting in the middle
+  px(cx-3,cy-2,1,1,edge); px(cx-2,cy-1,1,1,edge); px(cx-1,cy,1,1,edge);
+  px(cx+2,cy-2,1,1,edge); px(cx+1,cy-1,1,1,edge); px(cx,cy,1,1,edge);
+}
 function drawHairAcc(x, hy, f){
   const hr=f.hair, hl=shade(hr,.34), hd=shade(hr,-.30);
   if(f.female){
@@ -1821,6 +1831,7 @@ function drawDeskPod(x, y, p, t){
     ro(x-11, y-12, 22, 16, sh);
     px(x-11,y-12,22,2, shade(sh,.30)); px(x+7,y-11,3,14, shade(sh,-.20)); px(x-11,y+2,22,2, shade(sh,-.16));
     px(x-2,y-12,4,2, shade(sh,-.28));
+    if(f.messenger){ drawEnvelope(x, y-5); }                            // courier envelope badge
     // typing arms
     const tap=(Math.floor(t*0.4)&1);
     ro(x-15, y-2+tap, 6, 8, sh); ro(x+9, y-2+(1-tap), 6, 8, sh);
@@ -1892,6 +1903,7 @@ function drawStanding(p, t){
   px(x-9,y-11,18,2, shade(sh,.30)); px(x+6,y-10,3,13, shade(sh,-.20)); px(x-9,y+3,18,2, shade(sh,-.16));
   px(x-2,y-11,4,2, shade(sh,-.28));                         // collar notch
   px(x-9,y+4,18,1, shade(pants,-.10));                      // belt/hem line
+  if(f.messenger){ drawEnvelope(x, y-3); }                  // courier envelope badge
   // arms by mode: upper sleeve (shirt) + forearm/hand (skin)
   if(p.mode==='drink' || p.mode==='idle'){
     ro(x-14, y-7, 5, 7, sh); px(x-14, y-1, 5,4, sk);                       // left arm relaxed
