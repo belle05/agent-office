@@ -479,6 +479,7 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
     result = {
         "id": uuid,
         "source": "cursor",
+        "scheduled": False,
         "name": _name_for(uuid),
         "variant": _variant_for(uuid),
         "project": _pretty_project(project),
@@ -545,14 +546,21 @@ def _claude_pretty_project(dirname):
 def _normalize_events_claude(path):
     """Normalize a Claude Code .jsonl into the shared event shape.
 
-    Returns ``(events, ai_title)``. Claude Code has no ``turn_ended`` marker, so we
-    only emit user/assistant events; tool-result user messages are flagged so the
-    first *real* user prompt (not a tool result) can be used as the task. Inline
-    sidechain (subagent) records are skipped so the office worker reflects the main
-    thread -- a running Task subagent still surfaces as the parent's pending tool_use.
+    Returns ``(events, ai_title, scheduled, scheduled_name)``. Claude Code has no
+    ``turn_ended`` marker, so we only emit user/assistant events; tool-result user
+    messages are flagged so the first *real* user prompt (not a tool result) can be
+    used as the task. Inline sidechain (subagent) records are skipped so the office
+    worker reflects the main thread -- a running Task subagent still surfaces as the
+    parent's pending tool_use.
+
+    A session started by a scheduled task / cron opens with a
+    ``<scheduled-task name="..." file="...">`` marker in its first user message; we
+    detect that (before the tag is stripped) so those agents can be shown as couriers.
     """
     events = []
     ai_title = ""
+    scheduled = False
+    scheduled_name = ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -592,6 +600,13 @@ def _normalize_events_claude(path):
                             })
                         elif btype == "tool_result":
                             is_tool_result = True
+                if role == "user" and not scheduled:
+                    joined = "\n".join(texts)  # raw, before tags are stripped
+                    if "<scheduled-task" in joined:
+                        scheduled = True
+                        m = re.search(r'name="([^"]+)"', joined)
+                        if m:
+                            scheduled_name = m.group(1)
                 events.append({
                     "kind": role,
                     "text": _clean_text("\n\n".join(texts)),
@@ -600,7 +615,7 @@ def _normalize_events_claude(path):
                 })
     except Exception:
         pass
-    return events, ai_title
+    return events, ai_title, scheduled, scheduled_name
 
 
 def _turn_in_progress_claude(events):
@@ -623,7 +638,7 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
         if cached and cached[0] == mtime and (full <= cached[1].get("_full", False)):
             return cached[1]
 
-    events, ai_title = _normalize_events_claude(path)
+    events, ai_title, scheduled, scheduled_name = _normalize_events_claude(path)
 
     task_full = ""
     for ev in events:
@@ -631,7 +646,7 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
             task_full = _strip_leading_timestamp(ev["text"]) or ev["text"]
             break
 
-    title = (ai_title or task_full.split("\n")[0]).strip()
+    title = (ai_title or scheduled_name or task_full.split("\n")[0]).strip()
     if len(title) > 70:
         title = title[:67].rstrip() + "..."
     if not title:
@@ -666,6 +681,7 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
     result = {
         "id": uuid,
         "source": "claude",
+        "scheduled": scheduled,
         "name": _name_for(uuid),
         "variant": _variant_for(uuid),
         "project": _claude_pretty_project(project),
@@ -840,18 +856,20 @@ def get_agent_detail(uuid):
 def demo_agents():
     now = time.time()
     samples = [
-        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor"),
-        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude"),
-        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor"),
-        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude"),
-        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude"),
-        ("demo-ffff-0006", "waiting", "Draft migration plan for the new schema", 9000, "cursor"),
+        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False),
+        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude", False),
+        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor", False),
+        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude", False),
+        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude", False),
+        ("demo-ffff-0006", "waiting", "Daily production error monitor", 9000, "claude", True),
+        ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True),
     ]
     out = []
-    for uuid, status, title, ago, source in samples:
+    for uuid, status, title, ago, source, scheduled in samples:
         out.append({
             "id": uuid,
             "source": source,
+            "scheduled": scheduled,
             "name": _name_for(uuid),
             "variant": _variant_for(uuid),
             "project": "demo-office",
@@ -951,6 +969,7 @@ PAGE = r"""<!DOCTYPE html>
   #nametag .nt-badge.waiting{background:#4a4d56;color:#f4f5f7;}
   .nt-badge.src-cursor,.badge.src-cursor{background:#2b6d84;color:#eaf6fb;}
   .nt-badge.src-claude,.badge.src-claude{background:#d97757;color:#2a1409;}
+  .nt-badge.scheduled,.badge.scheduled{background:#2f5fb0;color:#eaf1ff;}
   #nametag .nt-meta{font-size:9px;color:var(--ink-lo);margin:6px 0 8px;}
   #nametag .nt-label{font-size:8px;letter-spacing:1px;color:var(--ink-lo);text-transform:uppercase;margin-top:8px;}
   #nametag .nt-text{font-size:11px;color:var(--ink-mid);margin-top:3px;}
@@ -1033,6 +1052,7 @@ PAGE = r"""<!DOCTYPE html>
       <span><i style="background:#7a4a00"></i>waiting (in kitchen)</span>
       <span><i style="background:#2b6d84"></i>Cursor</span>
       <span><i style="background:#d97757"></i>Claude Code</span>
+      <span><i style="background:#2f5fb0"></i>scheduled (courier)</span>
     </div>
   </div>
 
@@ -1094,6 +1114,22 @@ function featuresFor(id){
     female: ((h>>>16) & 1) === 1,          // ~half women, stable by id
     femStyle: (h>>>17) % 3,                // 0 long  1 ponytail  2 bun+bow
   };
+}
+
+// Scheduled / automated agents (cron, daily monitors, etc.) wear a courier uniform:
+// one solid color from shirt to cap, so a whole squad of them reads instantly as
+// "not a human-driven chat" instead of blending into the office crowd.
+const MESSENGER_COL = '#2f5fb0';
+function featuresForAgent(a){
+  const f = featuresFor((a && a.id) || 'x');
+  if(a && a.scheduled){
+    f.messenger = true;
+    f.shirt = MESSENGER_COL;    // uniform shirt
+    f.acc = 2;                  // cap
+    f.accCol = MESSENGER_COL;   // cap matches the uniform
+    if(f.hairStyle === 2) f.hairStyle = 0;   // a little hair peeks out under a bald courier's cap
+  }
+  return f;
 }
 
 let agents = [];      // raw from server
@@ -1185,7 +1221,7 @@ function rebuild(){
       x: old? old.x : slot.x, y: old? old.y : slot.y,
       deskX:slot.x, deskY:slot.y, vx:0, vy:0,
       seated: old ? !!sameSeat : true,   // fresh load: just sit; transitions walk
-      seed:hash(a.id), variant:a.variant, feat:featuresFor(a.id),
+      seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     });
     slot.worker = person;
     next.push(person);
@@ -1221,7 +1257,7 @@ function rebuild(){
       home, vx:0, vy:0,
       // walk to the spot if new or just left a desk; otherwise keep prior mode
       mode: (!old || cameFromDesk) ? 'walk' : old.mode,
-      seed:hash(a.id), variant:a.variant, feat:featuresFor(a.id),
+      seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     }));
   });
 
@@ -1683,6 +1719,15 @@ function drawKitchenProps(){
 function ro(x,y,w,h,c){ px((x|0)-1,(y|0)-1,(w|0)+2,(h|0)+2,PAL.outline); px(x|0,y|0,w|0,h|0,c); }
 
 // hair + headwear, drawn on a 14px-wide head whose top-left is (x-7, hy)
+// a courier / baseball cap in one solid color -- shared so messengers look identical
+// whether the sprite is drawn as male, female, seated or standing
+function drawCap(x, hy, col){
+  px(x-8,hy-3,16,5,col);              // dome sitting on the crown
+  px(x-8,hy-3,16,1,shade(col,.35));   // top gloss
+  px(x-9,hy,2,3,col); px(x+7,hy,2,3,col);   // side wrap over the ears
+  px(x-14,hy+1,8,2,shade(col,-.15));  // front visor / brim
+  px(x-8,hy+1,16,1,shade(col,-.22));  // band shadow
+}
 function drawHairAcc(x, hy, f){
   const hr=f.hair, hl=shade(hr,.34), hd=shade(hr,-.30);
   if(f.female){
@@ -1701,6 +1746,7 @@ function drawHairAcc(x, hy, f){
       px(x-5,hy-9,3,3,PAL.pink); px(x+2,hy-9,3,3,PAL.pink); px(x-1,hy-8,2,2,PAL.pink);
     }
     if(f.acc===3){ px(x-9,hy+3,3,7,'#222'); px(x+6,hy+3,3,7,'#222'); px(x-8,hy-4,16,3,'#222'); } // headphones
+    if(f.acc===2){ drawCap(x, hy, f.accCol); }           // cap (e.g. courier uniform)
     return;
   }
   // ---- men / neutral ----
@@ -1712,7 +1758,7 @@ function drawHairAcc(x, hy, f){
     px(x-6,hy-3,5,1,hl); px(x-1,hy-4,4,1,hl); px(x+3,hy-3,3,1,hl); }                                         // curly mop
   else if(f.hairStyle===5){ px(x-1,hy-8,4,9,hr); px(x-1,hy-8,2,1,hl); }                                      // mohawk
   else if(f.hairStyle===0){ px(x-7,hy-4,14,4,hr); px(x-6,hy-3,7,1,hl); }                                     // flat
-  if(f.acc===2){ px(x-8,hy-2,16,4,f.accCol); px(x-13,hy+1,6,3,f.accCol); }                    // cap
+  if(f.acc===2){ drawCap(x, hy, f.accCol); }                                                   // cap
   else if(f.acc===3){ px(x-8,hy-2,16,3,'#222'); px(x-10,hy+3,3,8,'#222'); px(x+7,hy+3,3,8,'#222'); } // headphones
   else if(f.acc===4){ px(x-8,hy-4,16,8,f.accCol); px(x-8,hy+3,16,2,'rgba(0,0,0,.25)'); }      // beanie
   else if(f.acc===5){ px(x-1,hy-8,2,7,'#9aa'); px(x-2,hy-11,4,4,PAL.red); }                   // antenna
@@ -2245,7 +2291,8 @@ cv.addEventListener('mousemove', e=>{
     nametag.innerHTML =
       '<div class="nt-name">'+esc(a.name)+
         '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
-        srcBadgeHTML(a.source)+'</div>'+
+        srcBadgeHTML(a.source)+
+        (a.scheduled?'<span class="nt-badge scheduled">scheduled</span>':'')+'</div>'+
       '<div class="nt-meta">'+esc(meta)+'  ·  '+where+'</div>'+
       '<div class="nt-label">Task</div>'+
       '<div class="nt-text">'+esc(a.title||'(untitled session)')+'</div>'+
@@ -2303,7 +2350,8 @@ async function openDetail(id){
   document.getElementById('d-name').textContent=d.name;
   document.getElementById('d-sub').innerHTML=
     '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
-    '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> &nbsp; '+
+    '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> '+
+    (d.scheduled?'<span class="badge scheduled">SCHEDULED</span> ':'')+'&nbsp; '+
     esc(d.project)+' &nbsp;·&nbsp; '+esc(d.last_activity_rel)+' &nbsp;·&nbsp; '+d.message_count+' msgs';
   const body=document.getElementById('dbody');
   let html='';
