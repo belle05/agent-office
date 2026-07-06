@@ -1026,6 +1026,7 @@ PAGE = r"""<!DOCTYPE html>
         <div id="hud">
           <span class="pill" id="hud-work">working: 0</span>
           <span class="pill" id="hud-wait">in kitchen: 0</span>
+          <span class="pill" id="hud-beach" style="display:none">on beach: 0</span>
         </div>
         <div id="tip">click a worker</div>
         <div id="nametag"></div>
@@ -1042,6 +1043,7 @@ PAGE = r"""<!DOCTYPE html>
             </div>
             <div id="dbody"></div>
             <div id="dfoot">
+              <button id="d-finish">&#127958; SEND TO BEACH</button>
               <button id="d-open">OPEN TRANSCRIPT FILE (.jsonl)</button>
               <button id="d-copy" class="ghost">COPY SESSION ID</button>
             </div>
@@ -1056,6 +1058,7 @@ PAGE = r"""<!DOCTYPE html>
       <span><i style="background:#2b6d84"></i>Cursor</span>
       <span><i style="background:#d97757"></i>Claude Code</span>
       <span><i style="background:#2f5fb0"></i>scheduled (courier)</span>
+      <span><i style="background:#57c2d8"></i>finished (beach)</span>
     </div>
   </div>
 
@@ -1068,6 +1071,9 @@ const W = cv.width, H = cv.height;
 // global art scale: characters + desks are drawn larger (about their anchor) so
 // the rooms feel filled. ALL hitbox / hover-ring / pick() math multiplies by SC.
 const SC = 1.5;
+// the bottom band is split: KITCHEN (waiting) on the left, BEACH (finished, resting)
+// on the right. BEACH_X is the divider; everything to its right is sand + water.
+const BEACH_X = Math.round(W*0.60);
 
 // Game Boy palette
 const C = { d0:'#0f380f', d1:'#306230', d2:'#8bac0f', d3:'#9bbc0f', floor:'#94ad42', floor2:'#8aa53b' };
@@ -1140,12 +1146,17 @@ let people = [];      // live sprites with positions
 let deskSlots = [];   // fixed office desks (always drawn; some hold a worker)
 let deskAssign = {};  // agent id -> stable desk slot index (kept across refreshes)
 let seatAssign = {};  // agent id -> stable kitchen seat index
+let beachAssign = {}; // agent id -> stable beach spot index (finished agents)
 let hover = null;
 let detailCache = {};
 let WINDOW_HOURS = 24;
 let confetti = [];          // celebration particles (capped, auto-expire)
 let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
 let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // filter couriers (default off)
+// agents the user has marked "finished" -- they go rest on the beach until unmarked.
+// User-controlled and sticky (persisted), independent of the working/waiting status.
+let finishedIds = new Set(JSON.parse(localStorage.getItem('office_finished')||'[]'));
+function saveFinished(){ localStorage.setItem('office_finished', JSON.stringify([...finishedIds])); }
 
 // ---- ambient random events (pure scenery; never clickable / never hit-tested) ----
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
@@ -1159,10 +1170,16 @@ let lastEventType = null;           // avoid firing the same type twice in a row
 // the lounge table+poufs, the couch, the REFRESH! machine and the wall signs). Used
 // for waiter scatter AND as relocate targets so agents never stack.
 const KSPOTS = [
-  [95,432],[185,428],[280,433],[375,429],          // band in front of the counter
-  [545,436],                                        // right notch, left of the vending machine
-  [60,460],[125,460],[230,470],[315,466],           // mid floor (between fridge and couch)
-  [255,548],[320,545],[365,540]                     // front-centre gap (between table and couch)
+  [95,432],[185,428],[280,433],[360,429],           // band in front of the counter (kept left of BEACH_X)
+  [60,460],[125,460],[230,470],[315,466],           // mid floor (between fridge and beach)
+  [255,548],[320,545],[365,540]                     // front-centre gap (between table and beach)
+];
+
+// stable BEACH rest spots for finished agents (all in the right band, x > BEACH_X,
+// clear of the water strip on the far-right edge, the umbrella and the napping bear).
+const BSPOTS = [
+  [438,520],[510,532],[464,478],
+  [556,502],[590,458],[534,548]
 ];
 
 // ---- layout regions (in canvas px) ----
@@ -1181,8 +1198,12 @@ function rebuild(){
   // when the "hide scheduled" filter is on, courier (scheduled) agents don't get a
   // desk or kitchen spot -- they walk off-screen instead (handled at the end).
   const active = hideScheduled ? agents.filter(a=>!a.scheduled) : agents;
-  const workers = active.filter(a=>a.status==='working');
-  const waiters = active.filter(a=>a.status!=='working');
+  // agents marked "finished" go to the beach regardless of working/waiting status;
+  // everyone else is placed at desks (working) or the kitchen (waiting) as before.
+  const beachers = active.filter(a=>finishedIds.has(a.id));
+  const rest = active.filter(a=>!finishedIds.has(a.id));
+  const workers = rest.filter(a=>a.status==='working');
+  const waiters = rest.filter(a=>a.status!=='working');
 
   const next = [];
   const prevById = {}; people.forEach(p=>prevById[p.id]=p);
@@ -1193,14 +1214,18 @@ function rebuild(){
   // and walks/glides to the new target instead of teleporting.
   const workerIds = new Set(workers.map(a=>a.id));
   const waiterIds = new Set(waiters.map(a=>a.id));
+  const beacherIds = new Set(beachers.map(a=>a.id));
   // release assignments for agents that left or switched role
   Object.keys(deskAssign).forEach(id=>{ if(!workerIds.has(id)) delete deskAssign[id]; });
   Object.keys(seatAssign).forEach(id=>{ if(!waiterIds.has(id)) delete seatAssign[id]; });
+  Object.keys(beachAssign).forEach(id=>{ if(!beacherIds.has(id)) delete beachAssign[id]; });
   // give brand-new workers the lowest free desk index (stable thereafter)
   const usedSlots = new Set(Object.values(deskAssign));
   workers.forEach(a=>{ if(deskAssign[a.id]==null){ let i=0; while(usedSlots.has(i)) i++; deskAssign[a.id]=i; usedSlots.add(i); } });
   const usedSeats = new Set(Object.values(seatAssign));
   waiters.forEach(a=>{ if(seatAssign[a.id]==null){ let i=0; while(usedSeats.has(i)) i++; seatAssign[a.id]=i; usedSeats.add(i); } });
+  const usedBeach = new Set(Object.values(beachAssign));
+  beachers.forEach(a=>{ if(beachAssign[a.id]==null){ let i=0; while(usedBeach.has(i)) i++; beachAssign[a.id]=i; usedBeach.add(i); } });
 
   // a fixed office layout of desks that is ALWAYS drawn (so the room looks
   // furnished even when nobody is working). Sized to fit the highest used slot.
@@ -1255,15 +1280,35 @@ function rebuild(){
     // instead of snapping back to its stable anchor.
     const home = (old && old.relocHome) ? old.relocHome
                : { x: base[0] + jx + ring*16, y: base[1] + jy + ring*14 };
-    const cameFromDesk = old && old.kind==='work';
+    // walk in if new or arriving from another zone (desk/beach); otherwise keep mode
+    const cameFromElsewhere = !old || old.kind!=='wait';
     next.push(Object.assign(old||{}, {
       id:a.id, agent:a, kind:'wait',
       // brand-new agents enter from the room doorway (top-center) and walk to
       // their spot; agents leaving a desk keep their office position and walk down.
       x: old? old.x : W*0.5, y: old? old.y : k.y+8,
       home, vx:0, vy:0,
-      // walk to the spot if new or just left a desk; otherwise keep prior mode
-      mode: (!old || cameFromDesk) ? 'walk' : old.mode,
+      mode: cameFromElsewhere ? 'walk' : old.mode,
+      seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
+    }));
+  });
+
+  // beach: finished agents walk over to the sand and chill until you unmark them.
+  beachers.forEach(a=>{
+    const old = prevById[a.id];
+    const idx = beachAssign[a.id];
+    const base = BSPOTS[idx % BSPOTS.length];
+    const ring = Math.floor(idx / BSPOTS.length);        // overflow nudges outward
+    const hsh = hash(a.id);
+    const jx = ((hsh>>>4) % 7) - 3;
+    const jy = ((hsh>>>10) % 7) - 3;
+    const home = { x: base[0] + jx + ring*14, y: base[1] + jy + ring*12 };
+    const cameFromElsewhere = !old || old.kind!=='beach';
+    next.push(Object.assign(old||{}, {
+      id:a.id, agent:a, kind:'beach',
+      x: old? old.x : W*0.5, y: old? old.y : k.y+8,
+      home, vx:0, vy:0,
+      mode: cameFromElsewhere ? 'walk' : old.mode,
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     }));
   });
@@ -1291,6 +1336,9 @@ function rebuild(){
   people = next;
   document.getElementById('hud-work').textContent = 'working: '+workers.length;
   document.getElementById('hud-wait').textContent = 'in kitchen: '+waiters.length;
+  const hb=document.getElementById('hud-beach');
+  hb.textContent = 'on beach: '+beachers.length;
+  hb.style.display = beachers.length ? '' : 'none';   // only show the pill when in use
   document.getElementById('empty').style.display = agents.length? 'none':'flex';
 }
 
@@ -1540,6 +1588,7 @@ function drawKitchenProps(){
   const L=layout(), k=L.kitchen, T=L.kitchenTop;
   // back wall band for mounting decor + counters
   px(0,T,W,30,PAL.wall); px(0,T+28,W,2,PAL.base);
+  drawBeachFloor();   // sand + water fill the right band (under the back-wall props)
 
   // ---- tall fridge (far left): freezer/fridge split, handles, magnets, photo ----
   const fx=8, fy=T+14, fw=30, fh=74; ro(fx,fy,fw,fh,PAL.fridge);
@@ -1554,7 +1603,7 @@ function drawKitchenProps(){
 
   // ---- kitchen counter (center-back): solid countertop, cabinetry, inset sink,
   // espresso bar + a wall shelf with jars/mugs ----
-  const cbx=150, cbw=268, cby=T+30, cbh=26, ctTop=cby-9;
+  const cbx=150, cbw=224, cby=T+30, cbh=26, ctTop=cby-9;   // counter kept left of BEACH_X
   // solid countertop slab: bright tan surface, highlighted back edge + rounded
   // shaded front lip so it reads as a real worktop with depth.
   px(cbx-4,ctTop,cbw+8,9,PAL.cabinetTop);
@@ -1600,7 +1649,7 @@ function drawKitchenProps(){
   // ---- SINK (center-right): a stainless drop-in basin recessed into the counter
   // (steel rim, two-tone recessed interior, centre drain) with a proper goose-neck
   // faucet rising behind it (riser + arched spout + downspout + lever) -- clearly a sink ----
-  const skx=cbx+170, skw=66, skBot=ctTop, skTop=skBot-14;
+  const skx=cbx+150, skw=60, skBot=ctTop, skTop=skBot-14;
   ro(skx,skTop,skw,14,PAL.steel);                                           // stainless basin shell
   px(skx,skTop,skw,2,shade(PAL.steel,.34));                                 // rim top highlight
   px(skx,skTop+12,skw,2,shade(PAL.steel,-.26));                             // front rim shadow
@@ -1714,32 +1763,50 @@ function drawKitchenProps(){
   ctx.fillStyle='#e7dfc9'; ctx.beginPath(); ctx.ellipse(bwx,bwy+1,brw,3,0,0,Math.PI); ctx.fill();
   px(bwx-brw,bwy-2,brw*2,1,'#f3eede');                                              // rim top highlight
 
-  // ---- BIG plush purple sofa + sleeping bear mascot + round side table (bottom-right) ----
-  const vcx=432, vcy=T+146, cw=150, ch=34;
-  const pur='#8552c0', purDk='#683da0', purHi='#a274d8', seat='#9a68cc';
-  ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(vcx+cw/2,vcy+34,cw/2+5,7,0,0,Math.PI*2); ctx.fill(); // shadow
-  // two rounded back cushions (split down the middle)
-  const bcw=(cw-26)/2;
-  ro(vcx+8,vcy-26,bcw,30,pur);       px(vcx+10,vcy-26,bcw-4,3,purHi); px(vcx+10,vcy+1,bcw-4,2,purDk);
-  ro(vcx+14+bcw,vcy-26,bcw,30,pur);  px(vcx+16+bcw,vcy-26,bcw-4,3,purHi); px(vcx+16+bcw,vcy+1,bcw-4,2,purDk);
-  px(vcx+10+bcw,vcy-24,4,28,purDk);                                                                // cushion seam
-  // rounded arms
-  ro(vcx-3,vcy-18,18,50,pur); px(vcx-3,vcy-18,18,3,purHi); px(vcx-3,vcy-18,3,50,purHi);            // left arm
-  ro(vcx+cw-15,vcy-18,18,50,pur); px(vcx+cw-15,vcy-18,18,3,purHi); px(vcx+cw-3,vcy-18,3,50,purDk); // right arm
-  ro(vcx+8,vcy+6,cw-16,26,purDk);                                                                  // seat base
-  const sw=(cw-34)/2; ro(vcx+14,vcy+4,sw,18,seat); ro(vcx+20+sw,vcy+4,sw,18,seat);                 // two seat cushions
-  px(vcx+14,vcy+4,sw,2,purHi); px(vcx+20+sw,vcy+4,sw,2,purHi);
-  // two cozy throw pillows (left side of the sofa)
-  ro(vcx+18,vcy-13,17,16,PAL.yellow); px(vcx+18,vcy-13,17,2,shade(PAL.yellow,.3)); px(vcx+21,vcy-8,11,1,shade(PAL.yellow,-.2));
-  ro(vcx+35,vcy-11,16,15,PAL.mugB);   px(vcx+35,vcy-11,16,2,shade(PAL.mugB,.3));   px(vcx+38,vcy-6,10,1,shade(PAL.mugB,-.2));
-  // sleeping bear mascot on the right (scaled up a touch to fill the bigger sofa)
-  ctx.save(); scaleAbout(vcx+cw-46, vcy+4, 1.22); bearMascot(vcx+cw-62, vcy-2); ctx.restore();
-  // round WOOD side table with a small potted plant (left of the sofa)
-  const stx=vcx-36, sty=vcy+16; px(stx+6,sty,5,18,PAL.woodDk);                                     // pedestal
-  ctx.fillStyle='rgba(0,0,0,.15)'; ctx.beginPath(); ctx.ellipse(stx+8,sty+20,15,4,0,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle=PAL.wood;  ctx.beginPath(); ctx.ellipse(stx+8,sty,17,6,0,0,Math.PI*2); ctx.fill();  // round top
-  ctx.fillStyle=PAL.woodHi;ctx.beginPath(); ctx.ellipse(stx+8,sty-1,13,3,0,0,Math.PI*2); ctx.fill();
-  smallPlant(stx+2,sty-10);
+  // ---- the beach: towels, umbrella, beach ball + the office mascot napping on sand ----
+  drawBeachProps();
+}
+
+// a striped beach towel laid on the sand (finished agents rest on these)
+function towel(x,y,col){
+  px(x-1,y-1,32,16,PAL.outline);
+  px(x,y,30,14,col);
+  px(x,y,30,3,shade(col,.30));                             // top highlight
+  px(x,y+11,30,3,shade(col,-.16));                         // shadow band
+  for(let i=3;i<30;i+=8) px(x+i,y,3,14,shade(col,-.10));   // stripes
+}
+// a classic red/white beach umbrella; canopy floats above the resting agents
+function beachUmbrella(x,y){
+  const cx=x+24, r1='#e0533b', r2='#f6f6f8';
+  px(cx-1,y+8,3,66,'#7a5a30'); px(cx-1,y+8,1,66,'#9a7440');            // pole
+  const bands=[[54,20],[46,16],[36,12],[24,8],[12,4]];                 // widen toward the bottom
+  for(const b of bands){ const w=b[0], yo=b[1];
+    for(let i=0;i<w;i+=8) px(cx-w/2+i, y+yo, Math.min(8,w-i), 4, ((i>>3)%2)?r2:r1); }
+  px(cx-27,y+22,54,1,PAL.outline);                                     // canopy rim
+  px(cx-2,y+2,4,4,'#ffd34d');                                          // finial
+}
+function drawBeachFloor(){
+  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H;
+  px(x0-1,y0,2,y1-y0,shade(PAL.base,-.10));                            // divider edge
+  for(let y=y0;y<y1;y+=8) for(let x=x0;x<W;x+=8)                       // speckled sand
+    px(x,y,8,8, ((x/8+y/8)&1) ? '#efdca6' : '#e7d199');
+  for(let i=0;i<44;i++){ const sx=x0+((i*57)%(W-x0)), sy=y0+((i*89)%(y1-y0)); px(sx,sy,1,1,'rgba(150,120,60,.22)'); }
+  // water strip + foam shoreline along the far-right edge
+  const wx=W-22;
+  px(wx-3,y0,3,y1-y0,'#dcc891');                                       // damp sand
+  for(let y=y0;y<y1;y+=6) px(wx,y,W-wx,6, ((y/6)&1)?'#49b0c8':'#57c2d8');
+  px(wx,y0,W-wx,2,'rgba(255,255,255,.40)');                            // foam
+  for(let y=y0+5;y<y1;y+=14) px(wx+3,y,6,1,'rgba(255,255,255,.5)');    // ripples
+}
+function drawBeachProps(){
+  const T=layout().kitchenTop, y1=H, x0=BEACH_X;
+  towel(x0+30, y1-58, '#e0533b'); towel(x0+96, y1-72, '#2f93d8'); towel(x0+66, y1-34, '#37b56c');
+  beachUmbrella(x0+40, T+34);
+  // beach ball
+  const bx=x0+126, by=y1-28; px(bx-1,by-1,12,12,PAL.outline);
+  px(bx,by,10,10,'#f6f6f8'); px(bx,by,5,5,PAL.red); px(bx+5,by+5,5,5,'#2f93d8'); px(bx,by+5,5,5,PAL.yellow);
+  // the office mascot bear, now napping on the sand instead of on a couch
+  ctx.save(); scaleAbout(x0+172, y1-40, 1.12); bearMascot(x0+158, y1-52); ctx.restore();
 }
 
 // outlined rectangle (dark 1px border) - the key to the chunky pixel look
@@ -1993,9 +2060,15 @@ function tick(now){
         if(dist<=step+0.5){ p.x=p.home.x; p.y=p.home.y; p.mode='idle'; p.vx=p.vy=0; }
         else { p.vx=dx/dist; p.vy=dy/dist; p.x+=p.vx*step; p.y+=p.vy*step; }
       } else { p.vx=p.vy=0; }
-      // clamp into the kitchen only once settled (lets cross-room walks pass through)
+      // clamp once settled (lets cross-room walks pass through first). Beach agents
+      // stay on the sand (right of BEACH_X, clear of the water); kitchen agents stay
+      // to the left of the divider.
       if(p.mode==='idle'){
-        p.x=Math.max(L.kitchen.x+18,Math.min(L.kitchen.x+L.kitchen.w-18,p.x));
+        if(p.kind==='beach'){
+          p.x=Math.max(BEACH_X+16, Math.min(W-30, p.x));   // W-30 keeps them out of the water
+        } else {
+          p.x=Math.max(L.kitchen.x+18, Math.min(BEACH_X-18, p.x));
+        }
         p.y=Math.max(L.kitchenTop+44,Math.min(H-20,p.y));
       }
     }
@@ -2393,6 +2466,7 @@ async function openDetail(id){
   }
   if(!d||d.error){ toast('not found'); return; }
   currentDetail=d;
+  updateFinishBtn(d.id);
   document.getElementById('d-name').textContent=d.name;
   document.getElementById('d-sub').innerHTML=
     '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
@@ -2433,6 +2507,20 @@ document.getElementById('d-x').addEventListener('click',closeDetail);
 overlay.addEventListener('click',e=>{ if(e.target===overlay) closeDetail(); });
 document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeDetail(); });
 
+// mark / unmark an agent as "finished" -> it walks to the beach (or back to work)
+function updateFinishBtn(id){
+  const b=document.getElementById('d-finish');
+  const on=finishedIds.has(id);
+  b.innerHTML = on ? '&#8617;&#65039; BRING BACK TO WORK' : '&#127958; SEND TO BEACH';
+  b.classList.toggle('ghost', on);
+}
+document.getElementById('d-finish').addEventListener('click',()=>{
+  if(!currentDetail) return;
+  const id=currentDetail.id;
+  if(finishedIds.has(id)){ finishedIds.delete(id); toast('back to work'); }
+  else { finishedIds.add(id); toast('off to the beach 🏖️'); }
+  saveFinished(); updateFinishBtn(id); rebuild();
+});
 document.getElementById('d-open').addEventListener('click',()=>{
   if(!currentDetail) return;
   const path=currentDetail.transcript_path||'';
