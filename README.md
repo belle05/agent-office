@@ -73,8 +73,10 @@ python3 cursor_office.py --no-open         # don't auto-open the browser
 - If you run agents in Multitask mode, a parent whose own turn ended still counts as
   working while a background subagent is active.
 - Scheduled / automated agents (cron jobs, daily monitors — anything launched by a
-  scheduled task) are drawn as **couriers**: a solid uniform with a matching cap, so a
-  squad of recurring jobs doesn't get mistaken for chats you started yourself.
+  scheduled task) are drawn as **couriers**: a solid uniform with a matching cap and an
+  envelope badge, so a squad of recurring jobs doesn't get mistaken for chats you
+  started yourself. The header **✉** button hides them (they walk off-screen) and shows
+  them again (they walk back in); the choice is remembered across reloads.
 - A soft chime plays when an agent finishes (working → waiting). Toggle it with the
   **♪** button in the header; the preference is remembered across reloads.
 - It's a single self-contained file — drop `cursor_office.py` anywhere and run it.

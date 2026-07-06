@@ -937,12 +937,13 @@ PAGE = r"""<!DOCTYPE html>
     font-size:11px;color:#5a564d;letter-spacing:1px;}
   #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
     box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
-  #brand #celebrate,#brand #sound{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+  #brand #celebrate,#brand #sound,#brand #filter{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
     background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
-  #brand #celebrate:hover,#brand #sound:hover{background:#4a4a52;color:#fff;}
-  #brand #celebrate:active,#brand #sound:active{transform:translateY(1px);}
-  #brand #sound{margin-left:8px;}
-  #brand #sound.off{color:#8a8a90;}
+  #brand #celebrate:hover,#brand #sound:hover,#brand #filter:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active,#brand #sound:active,#brand #filter:active{transform:translateY(1px);}
+  #brand #sound,#brand #filter{margin-left:8px;}
+  #brand #sound.off,#brand #filter.off{color:#8a8a90;}
+  #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
     box-shadow:inset 0 0 0 3px #20240f, inset 0 0 22px rgba(0,0,0,.6);}
   #matrix{display:flex;align-items:center;gap:8px;justify-content:center;margin-bottom:8px;
@@ -1017,7 +1018,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><span id="clock"></span></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><span id="clock"></span></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
@@ -1144,6 +1145,7 @@ let detailCache = {};
 let WINDOW_HOURS = 24;
 let confetti = [];          // celebration particles (capped, auto-expire)
 let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
+let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // filter couriers (default off)
 
 // ---- ambient random events (pure scenery; never clickable / never hit-tested) ----
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
@@ -1176,8 +1178,11 @@ function layout(){
 // assign stable positions: desks for workers (grid), wander targets for waiters
 function rebuild(){
   const L = layout();
-  const workers = agents.filter(a=>a.status==='working');
-  const waiters = agents.filter(a=>a.status!=='working');
+  // when the "hide scheduled" filter is on, courier (scheduled) agents don't get a
+  // desk or kitchen spot -- they walk off-screen instead (handled at the end).
+  const active = hideScheduled ? agents.filter(a=>!a.scheduled) : agents;
+  const workers = active.filter(a=>a.status==='working');
+  const waiters = active.filter(a=>a.status!=='working');
 
   const next = [];
   const prevById = {}; people.forEach(p=>prevById[p.id]=p);
@@ -1262,6 +1267,23 @@ function rebuild(){
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     }));
   });
+
+  // filtered-out scheduled agents: if they were on screen, keep them around just long
+  // enough to walk off the bottom edge (a tidy "exit"); ones that were never visible
+  // are simply omitted. Turning the filter back off re-adds them via the normal
+  // worker/kitchen assignment above, so they walk back in from where they left.
+  if(hideScheduled){
+    agents.filter(a=>a.scheduled).forEach(a=>{
+      const old = prevById[a.id];
+      if(!old) return;
+      next.push(Object.assign(old, {
+        id:a.id, agent:a, kind:'exit', mode:'walk', seated:false,
+        exitX: W*0.5, exitY: H + 30,       // head for the door and off the bottom
+        vx:0, vy:0,
+        seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
+      }));
+    });
+  }
 
   people = next;
   document.getElementById('hud-work').textContent = 'working: '+workers.length;
@@ -1946,6 +1968,13 @@ function tick(now){
     }
   }
   for(const p of people){
+    if(p.kind==='exit'){
+      // a filtered-out scheduled agent walking off the bottom of the screen
+      const dx=p.exitX-p.x, dy=p.exitY-p.y, dist=Math.hypot(dx,dy);
+      if(dist>0.5){ p.vx=dx/dist; p.vy=dy/dist; p.x+=p.vx*step; p.y+=p.vy*step; }
+      else { p.vx=p.vy=0; }
+      continue;
+    }
     if(p.kind==='work'){
       if(p.seated){ p.x=p.deskX; p.y=p.deskY; p.vx=p.vy=0; }
       else {
@@ -2469,6 +2498,24 @@ soundBtn.addEventListener('click',()=>{
   updateSoundBtn();
 });
 updateSoundBtn();
+
+// ---- hide-scheduled (courier) filter toggle ----
+const filterBtn=document.getElementById('filter');
+function updateFilterBtn(){
+  filterBtn.innerHTML = hideScheduled ? '&#9993; HIDDEN' : '&#9993; SHOWN';
+  filterBtn.classList.toggle('on', hideScheduled);
+  filterBtn.classList.toggle('off', !hideScheduled);
+  filterBtn.title = hideScheduled
+    ? 'scheduled / courier agents hidden — click to show'
+    : 'click to hide scheduled / courier agents';
+}
+filterBtn.addEventListener('click',()=>{
+  hideScheduled=!hideScheduled;
+  localStorage.setItem('office_hide_scheduled', hideScheduled?'on':'off');
+  rebuild();            // immediate: couriers walk off-screen, or walk back in
+  updateFilterBtn();
+});
+updateFilterBtn();
 
 // fire a celebration (+ chime) when an agent transitions working -> waiting between polls
 function detectFinishes(list){
