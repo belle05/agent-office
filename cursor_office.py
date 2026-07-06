@@ -1278,7 +1278,10 @@ function rebuild(){
       if(!old) return;
       next.push(Object.assign(old, {
         id:a.id, agent:a, kind:'exit', mode:'walk', seated:false,
-        exitX: W*0.5, exitY: H + 30,       // head for the door and off the bottom
+        // sprites are drawn scaled x SC about their anchor, so the body extends
+        // ~50px ABOVE the anchor -- push the target well below H so the WHOLE
+        // sprite (cap included) clears the bottom edge, not just the feet.
+        exitX: W*0.5, exitY: H + 70*SC,
         vx:0, vy:0,
         seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
       }));
