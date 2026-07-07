@@ -1540,21 +1540,169 @@ function drawWindow(x,y,w,h){
   px(x+2,y+2,Math.round(pw)-5,2, night?'rgba(255,255,255,.07)':'rgba(255,255,255,.20)');
 }
 
-// short, real, positive quotes (motivation / happiness / health) with attribution
+// real, positive quotes (motivation / happiness / health) with attribution.
+// 150+ entries, majority by women -- the board shows a new one every hour.
 const QUOTES = [
+  ["Try to be a rainbow in someone's cloud.","Maya Angelou"],
+  ["If you don't like something, change it. If you can't change it, change your attitude.","Maya Angelou"],
+  ["Nothing will work unless you do.","Maya Angelou"],
+  ["We may encounter many defeats but we must not be defeated.","Maya Angelou"],
+  ["People will forget what you said, but never how you made them feel.","Maya Angelou"],
+  ["Success is liking yourself, liking what you do, and liking how you do it.","Maya Angelou"],
+  ["No one can make you feel inferior without your consent.","Eleanor Roosevelt"],
+  ["The future belongs to those who believe in the beauty of their dreams.","Eleanor Roosevelt"],
+  ["Do one thing every day that scares you.","Eleanor Roosevelt"],
+  ["You must do the things you think you cannot do.","Eleanor Roosevelt"],
+  ["With the new day comes new strength and new thoughts.","Eleanor Roosevelt"],
+  ["When they go low, we go high.","Michelle Obama"],
+  ["Success is about the difference you make in people's lives.","Michelle Obama"],
+  ["Failure is an important part of your growth.","Michelle Obama"],
+  ["There is no limit to what we, as women, can accomplish.","Michelle Obama"],
+  ["Turn your wounds into wisdom.","Oprah Winfrey"],
+  ["The more you praise and celebrate your life, the more there is to celebrate.","Oprah Winfrey"],
+  ["Surround yourself with people who are going to lift you higher.","Oprah Winfrey"],
+  ["Be thankful for what you have and you'll end up having more.","Oprah Winfrey"],
+  ["Life is either a daring adventure or nothing at all.","Helen Keller"],
+  ["Optimism is the faith that leads to achievement.","Helen Keller"],
+  ["Keep your face to the sunshine and you cannot see a shadow.","Helen Keller"],
+  ["Alone we can do so little; together we can do so much.","Helen Keller"],
+  ["Nothing in life is to be feared, it is only to be understood.","Marie Curie"],
+  ["Be less curious about people and more curious about ideas.","Marie Curie"],
+  ["I never see what has been done; I only see what remains to be done.","Marie Curie"],
+  ["The most difficult thing is the decision to act; the rest is merely tenacity.","Amelia Earhart"],
+  ["Adventure is worthwhile in itself.","Amelia Earhart"],
+  ["Think of all the beauty still left around you and be happy.","Anne Frank"],
+  ["Whoever is happy will make others happy too.","Anne Frank"],
+  ["No one has ever become poor by giving.","Anne Frank"],
+  ["Not all of us can do great things, but we can do small things with great love.","Mother Teresa"],
+  ["Spread love everywhere you go.","Mother Teresa"],
+  ["Peace begins with a smile.","Mother Teresa"],
+  ["Kind words are short to speak but their echoes are truly endless.","Mother Teresa"],
+  ["One child, one teacher, one book, one pen can change the world.","Malala Yousafzai"],
+  ["When the whole world is silent, even one voice becomes powerful.","Malala Yousafzai"],
+  ["We realize the importance of our voices only when we are silenced.","Malala Yousafzai"],
+  ["It is our choices that show what we truly are, far more than our abilities.","J.K. Rowling"],
+  ["Happiness can be found even in the darkest of times if one remembers to turn on the light.","J.K. Rowling"],
+  ["We carry all the power we need to change the world inside ourselves already.","J.K. Rowling"],
+  ["Talk to yourself like you would to someone you love.","Brené Brown"],
+  ["Vulnerability is the birthplace of innovation, creativity and change.","Brené Brown"],
+  ["Courage starts with showing up and letting ourselves be seen.","Brené Brown"],
+  ["If there's a book you want to read that hasn't been written, you must write it.","Toni Morrison"],
+  ["If you want to fly, give up everything that weighs you down.","Toni Morrison"],
+  ["Caring for myself is not self-indulgence, it is self-preservation.","Audre Lorde"],
+  ["No need to hurry. No need to sparkle. No need to be anybody but oneself.","Virginia Woolf"],
+  ["One cannot think well, love well, sleep well, if one has not dined well.","Virginia Woolf"],
+  ["I am not afraid of storms, for I am learning how to sail my ship.","Louisa May Alcott"],
+  ["Have regular hours for work and play; make each day both useful and pleasant.","Louisa May Alcott"],
+  ["Far away there in the sunshine are my highest aspirations.","Louisa May Alcott"],
+  ["Nothing is impossible; the word itself says 'I'm possible'!","Audrey Hepburn"],
+  ["The most important thing is to enjoy your life and to be happy.","Audrey Hepburn"],
+  ["For beautiful eyes, look for the good in others.","Audrey Hepburn"],
+  ["We have two hands, one to help ourselves, the other to help others.","Audrey Hepburn"],
+  ["Beauty begins the moment you decide to be yourself.","Coco Chanel"],
+  ["The most courageous act is still to think for yourself. Aloud.","Coco Chanel"],
+  ["In order to be irreplaceable one must always be different.","Coco Chanel"],
+  ["Keep smiling, because life is a beautiful thing and there's so much to smile about.","Marilyn Monroe"],
+  ["Life shrinks or expands in proportion to one's courage.","Anaïs Nin"],
+  ["We write to taste life twice, in the moment and in retrospect.","Anaïs Nin"],
+  ["You must never be fearful about what you are doing when it is right.","Rosa Parks"],
+  ["Real change, enduring change, happens one step at a time.","Ruth Bader Ginsburg"],
+  ["Fight for the things you care about, but in a way that leads others to join you.","Ruth Bader Ginsburg"],
+  ["What you do makes a difference, and you decide what kind of difference to make.","Jane Goodall"],
+  ["Every individual matters. Every individual has a role to play.","Jane Goodall"],
+  ["At the end of the day, we can endure much more than we think we can.","Frida Kahlo"],
+  ["Feet, what do I need them for if I have wings to fly.","Frida Kahlo"],
+  ["A champion is defined by how they recover when they fall.","Serena Williams"],
+  ["If you want the rainbow, you gotta put up with the rain.","Dolly Parton"],
+  ["Find out who you are and do it on purpose.","Dolly Parton"],
+  ["Change your life today. Don't gamble on the future, act now.","Simone de Beauvoir"],
+  ["Dwell in possibility.","Emily Dickinson"],
+  ["Hope is the thing with feathers that perches in the soul.","Emily Dickinson"],
+  ["Tell me, what is it you plan to do with your one wild and precious life?","Mary Oliver"],
+  ["Instructions for living a life: pay attention, be astonished, tell about it.","Mary Oliver"],
+  ["Dreaming, after all, is a form of planning.","Gloria Steinem"],
+  ["Never doubt that a small group of thoughtful people can change the world.","Margaret Mead"],
+  ["How very little can be done under the spirit of fear.","Florence Nightingale"],
+  ["You cannot shake hands with a clenched fist.","Indira Gandhi"],
+  ["It's the little things citizens do. That's what will make the difference.","Wangari Maathai"],
+  ["If you obey all the rules, you miss all the fun.","Katharine Hepburn"],
+  ["Done is better than perfect.","Sheryl Sandberg"],
+  ["Failure is not the opposite of success; it's part of success.","Arianna Huffington"],
+  ["Do what you were born to do. You just have to trust yourself.","Beyoncé"],
+  ["Every great dream begins with a dreamer.","Harriet Tubman"],
+  ["I never dreamed about success. I worked for it.","Estée Lauder"],
+  ["Just don't give up trying to do what you really want to do.","Ella Fitzgerald"],
+  ["Love yourself first and everything else falls into line.","Lucille Ball"],
+  ["Above all, be the heroine of your life, not the victim.","Nora Ephron"],
+  ["Trust yourself. Create the self you'll be happy to live with all your life.","Golda Meir"],
+  ["There are years that ask questions and years that answer.","Zora Neale Hurston"],
+  ["Confidence -- if you have it, you can make anything look good.","Diane von Furstenberg"],
+  ["A woman with a voice is, by definition, a strong woman.","Melinda Gates"],
   ["The only way to do great work is to love what you do.","Steve Jobs"],
+  ["Your time is limited, so don't waste it living someone else's life.","Steve Jobs"],
+  ["Stay hungry, stay foolish.","Steve Jobs"],
   ["It always seems impossible until it's done.","Nelson Mandela"],
-  ["Do what you can, with what you have, where you are.","T. Roosevelt"],
-  ["Happiness depends upon ourselves.","Aristotle"],
-  ["A calm mind brings inner strength and self-confidence.","Dalai Lama"],
-  ["What you do today can improve all your tomorrows.","Ralph Marston"],
-  ["Well done is better than well said.","B. Franklin"],
-  ["Little by little, one travels far.","J.R.R. Tolkien"],
-  ["The secret of getting ahead is getting started.","Mark Twain"],
+  ["The greatest glory in living lies in rising every time we fall.","Nelson Mandela"],
+  ["May your choices reflect your hopes, not your fears.","Nelson Mandela"],
+  ["The best way to find yourself is to lose yourself in the service of others.","Mahatma Gandhi"],
+  ["Live as if you were to die tomorrow. Learn as if you were to live forever.","Mahatma Gandhi"],
+  ["The future depends on what you do today.","Mahatma Gandhi"],
+  ["In the middle of difficulty lies opportunity.","Albert Einstein"],
+  ["Life is like riding a bicycle. To keep your balance you must keep moving.","Albert Einstein"],
+  ["Strive not to be a success, but rather to be of value.","Albert Einstein"],
+  ["It does not matter how slowly you go as long as you do not stop.","Confucius"],
   ["Wherever you go, go with all your heart.","Confucius"],
-  ["You are never too old to set a new goal.","C.S. Lewis"],
+  ["Happiness depends upon ourselves.","Aristotle"],
+  ["We are what we repeatedly do; excellence is a habit.","Aristotle"],
+  ["What lies within us matters more than what lies behind or before us.","Ralph Waldo Emerson"],
+  ["Write it on your heart that every day is the best day in the year.","Ralph Waldo Emerson"],
+  ["Go confidently in the direction of your dreams.","Henry David Thoreau"],
+  ["It's not what you look at that matters, it's what you see.","Henry David Thoreau"],
+  ["The secret of getting ahead is getting started.","Mark Twain"],
+  ["Kindness is a language the deaf can hear and the blind can see.","Mark Twain"],
+  ["Well done is better than well said.","Benjamin Franklin"],
+  ["An investment in knowledge pays the best interest.","Benjamin Franklin"],
+  ["Energy and persistence conquer all things.","Benjamin Franklin"],
+  ["Do what you can, with what you have, where you are.","Theodore Roosevelt"],
+  ["Believe you can and you're halfway there.","Theodore Roosevelt"],
+  ["Faith is taking the first step even when you don't see the whole staircase.","Martin Luther King Jr."],
+  ["Darkness cannot drive out darkness; only light can do that.","Martin Luther King Jr."],
+  ["The time is always right to do what is right.","Martin Luther King Jr."],
+  ["Happiness comes from your own actions.","Dalai Lama"],
+  ["A calm mind brings inner strength and self-confidence.","Dalai Lama"],
+  ["Be kind whenever possible. It is always possible.","Dalai Lama"],
+  ["The wound is the place where the light enters you.","Rumi"],
+  ["What you seek is seeking you.","Rumi"],
+  ["Let yourself be silently drawn by what you really love.","Rumi"],
+  ["The journey of a thousand miles begins with a single step.","Lao Tzu"],
+  ["Nature does not hurry, yet everything is accomplished.","Lao Tzu"],
+  ["New beginnings are often disguised as painful endings.","Lao Tzu"],
+  ["Luck is what happens when preparation meets opportunity.","Seneca"],
+  ["The happiness of your life depends upon the quality of your thoughts.","Marcus Aurelius"],
+  ["Very little is needed to make a happy life.","Marcus Aurelius"],
+  ["There are far, far better things ahead than any we leave behind.","C.S. Lewis"],
+  ["You are never too old to set a new goal or to dream a new dream.","C.S. Lewis"],
+  ["The best way out is always through.","Robert Frost"],
+  ["In three words I can sum up everything about life: it goes on.","Robert Frost"],
+  ["Life is what happens when you're busy making other plans.","John Lennon"],
+  ["The way to get started is to quit talking and begin doing.","Walt Disney"],
+  ["If you can dream it, you can do it.","Walt Disney"],
+  ["Take care of your body. It's the only place you have to live.","Jim Rohn"],
+  ["Either you run the day or the day runs you.","Jim Rohn"],
+  ["You don't have to be great to start, but you have to start to be great.","Zig Ziglar"],
+  ["Whether you think you can, or you think you can't, you're right.","Henry Ford"],
+  ["When we can no longer change a situation, we are challenged to change ourselves.","Viktor Frankl"],
+  ["The mind is everything. What you think you become.","Buddha"],
+  ["Health is the greatest gift, contentment the greatest wealth.","Buddha"],
+  ["Act as if what you do makes a difference. It does.","William James"],
+  ["Change your thoughts and you change your world.","Norman Vincent Peale"],
+  ["How people treat you is their karma; how you react is yours.","Wayne Dyer"],
+  ["What you do today can improve all your tomorrows.","Ralph Marston"],
+  ["Little by little, one travels far.","J.R.R. Tolkien"],
+  ["Not all those who wander are lost.","J.R.R. Tolkien"],
+  ["The only place success comes before work is in the dictionary.","Vince Lombardi"],
 ];
-const QUOTE_PERIOD_MS = 3*3600*1000;   // a fresh quote every ~3 hours
+const QUOTE_PERIOD_MS = 3600*1000;   // a fresh quote every hour
 // greedy word-wrap to a pixel width for the given canvas font
 function wrapText(text, maxW, font){
   ctx.font=font;
@@ -1566,30 +1714,20 @@ function wrapText(text, maxW, font){
 }
 
 function drawWallDecor(x,y){
-  // ---- wide whiteboard: PROJECT checklist (left) + rotating quote (right) ----
+  // ---- inspiration board: a quote that changes every hour (whole board) ----
   const bw=210, bh=58; px(x-3,y-3,bw+6,bh+6,PAL.metalDk); px(x,y,bw,bh,PAL.paper);
   px(x,y,bw,2,'#eef0f3'); px(x,y+bh-2,bw,2,'#cfcfd6'); px(x+bw-2,y,2,bh,'#dadbe0');
   ctx.textAlign='left';
-  // left: PROJECT checklist
-  ctx.fillStyle=PAL.ink; ctx.font='7px "Press Start 2P", monospace'; ctx.fillText('PROJECT', x+7, y+13);
-  px(x+7,y+17,84,1,'#c0c0c8');
-  ctx.font='5px "Press Start 2P", monospace';
-  ['RESEARCH','DESIGN','TEST','LAUNCH'].forEach((it,i)=>{ const iy=y+27+i*8;
-    px(x+8,iy-5,5,5,PAL.paper); px(x+8,iy-5,5,1,PAL.ink); px(x+8,iy-1,5,1,PAL.ink); px(x+8,iy-5,1,5,PAL.ink); px(x+12,iy-5,1,5,PAL.ink); // box
-    px(x+9,iy-3,1,2,PAL.leafDk); px(x+10,iy-2,1,1,PAL.leafDk); px(x+11,iy-4,1,3,PAL.leafDk);                                          // check
-    ctx.fillStyle=PAL.ink; ctx.fillText(it, x+17, iy);
-  });
-  // divider
-  px(x+100, y+6, 1, bh-12, '#d5d5dc');
-  // right: an inspirational quote that changes every few hours
   const q = QUOTES[Math.floor(Date.now()/QUOTE_PERIOD_MS) % QUOTES.length];
-  const qx=x+110, qw=bw-118;
-  ctx.fillStyle=PAL.leafDk; ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('DAILY QUOTE', qx, y+11);
-  px(qx,y+15,qw,1,'#dfe6da');
+  // heading + a tiny heart in the corner
+  ctx.fillStyle=PAL.leafDk; ctx.font='6px "Press Start 2P", monospace'; ctx.fillText('INSPIRATION', x+8, y+12);
+  const hh=x+bw-13; px(hh,y+5,3,2,PAL.pink); px(hh+4,y+5,3,2,PAL.pink); px(hh,y+7,7,2,PAL.pink); px(hh+1,y+9,5,1,PAL.pink); px(hh+2,y+10,3,1,PAL.pink);
+  px(x+8,y+16,bw-16,1,'#dfe6da');
+  // quote across the full board width
   ctx.fillStyle=PAL.ink; const qfont='5px "Press Start 2P", monospace';
-  const lines=wrapText('“'+q[0]+'”', qw, qfont).slice(0,4);
-  let qy=y+24; for(const ln of lines){ ctx.fillText(ln, qx, qy); qy+=7; }
-  ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], qx, qy+2);
+  const lines=wrapText('“'+q[0]+'”', bw-18, qfont).slice(0,4);
+  let qy=y+25; for(const ln of lines){ ctx.fillText(ln, x+8, qy); qy+=7; }
+  ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], x+8, qy+2);
   // ---- clean wall clock ----
   const clx=x+bw+12, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
   for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
