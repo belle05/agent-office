@@ -1573,6 +1573,8 @@ function drawOfficeProps(){
   const L=layout(), top=WALL_H;
   // plants flanking the window
   bigPlant(14, top+10); bigPlant(W-30, top+10);
+  // "DO GOOD WORK" poster on the office back wall (far right, above the desks)
+  drawDoGoodWork(W-60, 6);
 
   const lastDeskY = deskSlots.length ? Math.max.apply(null, deskSlots.map(s=>s.y)) : top+120;
   // soft rug spanning the desk area
@@ -1671,26 +1673,8 @@ function drawKitchenProps(){
   ctx.fillStyle=PAL.ink; ctx.font='5px "Press Start 2P", monospace';
   ctx.fillText('COFFEE >', sgx+6, sgy+9); ctx.fillText('CODE > CONQUER', sgx+6, sgy+17);
 
-  // ---- framed "DO GOOD WORK" poster: high on the RIGHT wall, between the counter
-  // and the REFRESH! machine, above the couch (clear of every agent stand spot) ----
-  const pw=48, ph=46, pcx=W-168, pcy=T-2;
-  px(pcx-3,pcy-3,pw+6,ph+6,'#15151a');                       // outer dark frame
-  px(pcx-1,pcy-1,pw+2,ph+2,'#3c3c46');                       // frame bevel
-  px(pcx+2,pcy+2,pw-4,ph-4,PAL.paper);                       // white mat / background
-  px(pcx+2,pcy+2,pw-4,1,'#ffffff'); px(pcx+2,pcy+ph-3,pw-4,1,'#e2e2e8'); // mat sheen
-  // crisp pink heart, centered up top
-  const hx=pcx+pw/2, hy=pcy+9;
-  px(hx-6,hy,4,3,PAL.pink); px(hx+2,hy,4,3,PAL.pink);        // two lobes
-  px(hx-6,hy+3,12,2,PAL.pink); px(hx-5,hy+5,10,2,PAL.pink);  // body
-  px(hx-3,hy+7,6,2,PAL.pink);  px(hx-1,hy+9,2,1,PAL.pink);   // taper to a point
-  px(hx-5,hy+1,2,1,shade(PAL.pink,.45));                     // little highlight
-  // tidy, evenly-spaced lettering on three centered lines
-  ctx.fillStyle=PAL.ink; ctx.textAlign='center';
-  ctx.font='6px "Press Start 2P", monospace';
-  ctx.fillText('DO',   hx, pcy+26);
-  ctx.fillText('GOOD', hx, pcy+35);
-  ctx.fillText('WORK', hx, pcy+44);
-  ctx.textAlign='left';
+  // (the "DO GOOD WORK" poster now hangs in the office; a "RETIRED AGENTS" beach
+  //  sign takes its place -- both drawn elsewhere)
 
   // ---- "REFRESH!" drinks machine (far right): blue cabinet, lit sign, glass grid, side panel ----
   const vx=W-74, vy=T+10, vw=64, vh=88;
@@ -1807,6 +1791,39 @@ function drawBeachProps(){
   px(bx,by,10,10,'#f6f6f8'); px(bx,by,5,5,PAL.red); px(bx+5,by+5,5,5,'#2f93d8'); px(bx,by+5,5,5,PAL.yellow);
   // the office mascot bear, now napping on the sand instead of on a couch
   ctx.save(); scaleAbout(x0+172, y1-40, 1.12); bearMascot(x0+158, y1-52); ctx.restore();
+  drawBeachSign();
+}
+
+// a wooden "RETIRED AGENTS" signpost planted in the sand (between umbrella + REFRESH)
+function drawBeachSign(){
+  const T=layout().kitchenTop, cx=BEACH_X+136;
+  const bw=84, bh=24, bx=cx-bw/2, by=T+32, groundY=T+96;
+  px(cx-5, groundY-2, 10, 3, 'rgba(0,0,0,.15)');                    // sand contact shadow
+  px(cx-2, by+bh, 4, groundY-(by+bh), PAL.woodDk); px(cx-2, by+bh,1, groundY-(by+bh), PAL.wood); // post
+  px(bx-2,by-2,bw+4,bh+4,PAL.woodDk); ro(bx,by,bw,bh,'#cf9350');    // plank
+  px(bx,by,bw,3,shade('#cf9350',.22)); px(bx,by+bh-3,bw,3,shade('#cf9350',-.20));
+  for(let g=0;g<bw-10;g+=15) px(bx+7+g,by+13,11,1,shade('#cf9350',-.12));   // grain
+  px(bx+4,by+4,2,2,PAL.metalDk); px(bx+bw-6,by+4,2,2,PAL.metalDk);          // nails
+  ctx.fillStyle='#3a2410'; ctx.textAlign='center'; ctx.font='7px "Press Start 2P", monospace';
+  ctx.fillText('RETIRED', cx, by+11); ctx.fillText('AGENTS', cx, by+20);
+  ctx.textAlign='left';
+}
+
+// framed "DO GOOD WORK" poster (heart + 3 lines); pcx,pcy = top-left of the mat
+function drawDoGoodWork(pcx, pcy){
+  const pw=48, ph=46;
+  px(pcx-3,pcy-3,pw+6,ph+6,'#15151a');                       // outer dark frame
+  px(pcx-1,pcy-1,pw+2,ph+2,'#3c3c46');                       // frame bevel
+  px(pcx+2,pcy+2,pw-4,ph-4,PAL.paper);                       // white mat
+  px(pcx+2,pcy+2,pw-4,1,'#ffffff'); px(pcx+2,pcy+ph-3,pw-4,1,'#e2e2e8');
+  const hx=pcx+pw/2, hy=pcy+9;
+  px(hx-6,hy,4,3,PAL.pink); px(hx+2,hy,4,3,PAL.pink);
+  px(hx-6,hy+3,12,2,PAL.pink); px(hx-5,hy+5,10,2,PAL.pink);
+  px(hx-3,hy+7,6,2,PAL.pink);  px(hx-1,hy+9,2,1,PAL.pink);
+  px(hx-5,hy+1,2,1,shade(PAL.pink,.45));
+  ctx.fillStyle=PAL.ink; ctx.textAlign='center'; ctx.font='6px "Press Start 2P", monospace';
+  ctx.fillText('DO',   hx, pcy+26); ctx.fillText('GOOD', hx, pcy+35); ctx.fillText('WORK', hx, pcy+44);
+  ctx.textAlign='left';
 }
 
 // outlined rectangle (dark 1px border) - the key to the chunky pixel look
