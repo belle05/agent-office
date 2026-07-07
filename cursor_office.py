@@ -961,9 +961,9 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:6px;overflow:hidden;}
   canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;
     image-rendering:crisp-edges;cursor:pointer;}
-  #hud{position:absolute;left:0;right:0;top:0;display:flex;justify-content:space-between;
-    padding:6px 8px;font-size:8px;color:#fff;pointer-events:none;}
-  #hud .pill{background:rgba(0,0,0,.38);padding:4px 7px;border-radius:4px;}
+  #hud{position:absolute;left:0;top:0;display:flex;flex-direction:column;align-items:flex-start;
+    gap:4px;padding:6px 8px;font-size:8px;color:#fff;pointer-events:none;}
+  #hud .pill{background:rgba(0,0,0,.42);padding:4px 7px;border-radius:4px;}
   #tip{position:absolute;left:8px;bottom:8px;font-size:7px;color:#fff;
     background:rgba(0,0,0,.32);padding:3px 6px;border-radius:4px;pointer-events:none;}
   #nametag{position:absolute;background:var(--panel);
@@ -1391,8 +1391,9 @@ function drawFloor(){
   // back wall + picture-rail + skirting
   px(0,0,W,WALL_H,PAL.wall); px(0,0,W,10,shade(PAL.wall,.05));
   px(0,WALL_H-8,W,2,shade(PAL.wall,-.06)); px(0,WALL_H-5,W,3,PAL.trim); px(0,WALL_H-2,W,2,PAL.base);
-  drawWindow(20, 8, Math.round(W*0.48), WALL_H-20);
-  drawWallDecor(Math.round(W*0.48)+34, 6);
+  const winW = Math.round(W*0.36);   // slimmer window -> room for the wider board
+  drawWindow(20, 8, winW, WALL_H-20);
+  drawWallDecor(20+winW+16, 6);
 
   // kitchen floor (warm tiles)
   for(let y=L.kitchenTop;y<H;y+=20){
@@ -1539,40 +1540,70 @@ function drawWindow(x,y,w,h){
   px(x+2,y+2,Math.round(pw)-5,2, night?'rgba(255,255,255,.07)':'rgba(255,255,255,.20)');
 }
 
+// short, real, positive quotes (motivation / happiness / health) with attribution
+const QUOTES = [
+  ["The only way to do great work is to love what you do.","Steve Jobs"],
+  ["It always seems impossible until it's done.","Nelson Mandela"],
+  ["Do what you can, with what you have, where you are.","T. Roosevelt"],
+  ["Happiness depends upon ourselves.","Aristotle"],
+  ["A calm mind brings inner strength and self-confidence.","Dalai Lama"],
+  ["What you do today can improve all your tomorrows.","Ralph Marston"],
+  ["Well done is better than well said.","B. Franklin"],
+  ["Little by little, one travels far.","J.R.R. Tolkien"],
+  ["The secret of getting ahead is getting started.","Mark Twain"],
+  ["Wherever you go, go with all your heart.","Confucius"],
+  ["You are never too old to set a new goal.","C.S. Lewis"],
+];
+const QUOTE_PERIOD_MS = 3*3600*1000;   // a fresh quote every ~3 hours
+// greedy word-wrap to a pixel width for the given canvas font
+function wrapText(text, maxW, font){
+  ctx.font=font;
+  const words=text.split(' '); const lines=[]; let cur='';
+  for(const w of words){ const test=cur?cur+' '+w:w;
+    if(ctx.measureText(test).width>maxW && cur){ lines.push(cur); cur=w; } else cur=test; }
+  if(cur) lines.push(cur);
+  return lines;
+}
+
 function drawWallDecor(x,y){
-  // ---- PROJECT whiteboard with a tidy checklist (boxes + check marks) ----
-  const bw=98, bh=58; px(x-3,y-3,bw+6,bh+6,PAL.metalDk); px(x,y,bw,bh,PAL.paper);
+  // ---- wide whiteboard: PROJECT checklist (left) + rotating quote (right) ----
+  const bw=210, bh=58; px(x-3,y-3,bw+6,bh+6,PAL.metalDk); px(x,y,bw,bh,PAL.paper);
   px(x,y,bw,2,'#eef0f3'); px(x,y+bh-2,bw,2,'#cfcfd6'); px(x+bw-2,y,2,bh,'#dadbe0');
+  ctx.textAlign='left';
+  // left: PROJECT checklist
   ctx.fillStyle=PAL.ink; ctx.font='7px "Press Start 2P", monospace'; ctx.fillText('PROJECT', x+7, y+13);
-  px(x+7,y+17,bw-14,1,'#c0c0c8');
+  px(x+7,y+17,84,1,'#c0c0c8');
   ctx.font='5px "Press Start 2P", monospace';
-  const items=['RESEARCH','DESIGN','TEST','LAUNCH'];
-  items.forEach((it,i)=>{ const iy=y+27+i*8;
+  ['RESEARCH','DESIGN','TEST','LAUNCH'].forEach((it,i)=>{ const iy=y+27+i*8;
     px(x+8,iy-5,5,5,PAL.paper); px(x+8,iy-5,5,1,PAL.ink); px(x+8,iy-1,5,1,PAL.ink); px(x+8,iy-5,1,5,PAL.ink); px(x+12,iy-5,1,5,PAL.ink); // box
     px(x+9,iy-3,1,2,PAL.leafDk); px(x+10,iy-2,1,1,PAL.leafDk); px(x+11,iy-4,1,3,PAL.leafDk);                                          // check
     ctx.fillStyle=PAL.ink; ctx.fillText(it, x+17, iy);
   });
+  // divider
+  px(x+100, y+6, 1, bh-12, '#d5d5dc');
+  // right: an inspirational quote that changes every few hours
+  const q = QUOTES[Math.floor(Date.now()/QUOTE_PERIOD_MS) % QUOTES.length];
+  const qx=x+110, qw=bw-118;
+  ctx.fillStyle=PAL.leafDk; ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('DAILY QUOTE', qx, y+11);
+  px(qx,y+15,qw,1,'#dfe6da');
+  ctx.fillStyle=PAL.ink; const qfont='5px "Press Start 2P", monospace';
+  const lines=wrapText('“'+q[0]+'”', qw, qfont).slice(0,4);
+  let qy=y+24; for(const ln of lines){ ctx.fillText(ln, qx, qy); qy+=7; }
+  ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], qx, qy+2);
   // ---- clean wall clock ----
-  const clx=x+bw+14, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
+  const clx=x+bw+12, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
   for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
   ctx.strokeStyle=PAL.ink; ctx.lineWidth=1.4; ctx.beginPath();
   ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+9,cly+4); ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+13,cly+11); ctx.stroke();
   px(clx+8,cly+8,2,2,PAL.red);                                  // center hub
   // ---- bookshelf with books + a little plant on top ----
-  const shx=x+bw+40, shy=y-2; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
+  const shx=clx+30, shy=y-2; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
   const cols=[PAL.mugA,PAL.mugB,PAL.mugC,PAL.leafDk,PAL.red,PAL.yellow,PAL.orange,'#8c5fd6'];
   for(let r=0;r<3;r++){ const ry=shy+5+r*16;
     for(let b=0;b<5;b++){ const bbh=11-((b+r)%2)*2; px(shx+4+b*8,ry+(11-bbh),6,bbh,cols[(b+r*3)%cols.length]); }
     px(shx+2,ry+13,42,2,PAL.woodDk);
   }
   smallPlant(shx+30, shy-2);
-  // ---- framed pie-chart poster (far right) ----
-  const ppx=shx+58, ppy=y+2; px(ppx-2,ppy-2,34,34,PAL.woodDk); px(ppx,ppy,30,30,PAL.paper);
-  const cxp=ppx+15, cyp=ppy+13, rp=9;
-  ctx.fillStyle=PAL.mugB; ctx.beginPath(); ctx.moveTo(cxp,cyp); ctx.arc(cxp,cyp,rp,-Math.PI/2,Math.PI*0.6); ctx.closePath(); ctx.fill();
-  ctx.fillStyle=PAL.yellow; ctx.beginPath(); ctx.moveTo(cxp,cyp); ctx.arc(cxp,cyp,rp,Math.PI*0.6,Math.PI*1.2); ctx.closePath(); ctx.fill();
-  ctx.fillStyle=PAL.red; ctx.beginPath(); ctx.moveTo(cxp,cyp); ctx.arc(cxp,cyp,rp,Math.PI*1.2,Math.PI*1.5); ctx.closePath(); ctx.fill();
-  px(ppx+4,ppy+25,4,3,PAL.mugB); px(ppx+13,ppy+25,4,3,PAL.yellow); px(ppx+22,ppy+25,4,3,PAL.red);
 }
 
 function drawOfficeProps(){
