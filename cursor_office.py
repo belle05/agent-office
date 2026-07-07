@@ -959,8 +959,7 @@ PAGE = r"""<!DOCTYPE html>
   #matrix .l2{background:linear-gradient(90deg,#1f3f7a,#7a1f5a);}
   #screen{position:relative;width:100%;aspect-ratio:10/9;background:#65748d;
     border-radius:6px;overflow:hidden;}
-  canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;
-    image-rendering:crisp-edges;cursor:pointer;}
+  canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:auto;cursor:pointer;}
   #hud{position:absolute;left:0;top:0;display:flex;flex-direction:column;align-items:flex-start;
     gap:4px;padding:6px 8px;font-size:8px;color:#fff;pointer-events:none;}
   #hud .pill{background:rgba(0,0,0,.42);padding:4px 7px;border-radius:4px;}
@@ -1072,8 +1071,14 @@ PAGE = r"""<!DOCTYPE html>
 "use strict";
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
+// Logical drawing size stays 640x576 (all layout/hit-test math uses these), but we
+// super-sample the actual backing store so text + art render at much higher
+// resolution and scale down crisply instead of being upscaled/blurred (esp. on
+// HiDPI / retina screens). SS is chosen from devicePixelRatio, capped for perf.
+const W = 640, H = 576;
+const SS = Math.min(4, Math.max(2, Math.ceil((window.devicePixelRatio||1)*2)));
+cv.width = W*SS; cv.height = H*SS;
 ctx.imageSmoothingEnabled = false;
-const W = cv.width, H = cv.height;
 // global art scale: characters + desks are drawn larger (about their anchor) so
 // the rooms feel filled. ALL hitbox / hover-ring / pick() math multiplies by SC.
 const SC = 1.5;
@@ -2315,6 +2320,7 @@ function tick(now){
 }
 
 function render(t){
+  ctx.setTransform(SS,0,0,SS,0,0);   // map logical 640x576 onto the super-sampled backing
   ctx.clearRect(0,0,W,H);
   drawFloor();
   // office desks (always shown); seated worker drawn only once docked, otherwise
