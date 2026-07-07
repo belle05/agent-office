@@ -1133,7 +1133,19 @@ function featuresFor(id){
     big: ((h>>>21) & 1) === 1,             // chunkier body
     female: ((h>>>16) & 1) === 1,          // ~half women, stable by id
     femStyle: (h>>>17) % 3,                // 0 long  1 ponytail  2 bun+bow
+    outfit: (h>>>19) % 5,                  // 0 plain 1 zip 2 stripe 3 v-neck 4 hoodie
   };
+}
+// a small outfit detail + soft left-side sheen, shared by every sprite so the crowd
+// looks varied. cx = torso centre, topY = torso top, halfW = half the torso width.
+function torsoDetail(cx, topY, halfW, h, sh, f){
+  if(f.messenger) return;                                        // couriers keep their plain uniform + badge
+  px(cx-halfW+1, topY+2, 1, h-4, 'rgba(255,255,255,.10)');       // subtle sheen down the left
+  const dk=shade(sh,-.26), lt=shade(sh,.26);
+  if(f.outfit===1){ px(cx, topY+1, 1, h-2, dk); px(cx-1, topY+3, 3,1, dk); px(cx-1, topY+7, 3,1, dk); }     // zip placket
+  else if(f.outfit===2){ px(cx-halfW+2, topY+Math.round(h*0.45), (halfW-2)*2, 2, lt); }                     // chest stripe
+  else if(f.outfit===3){ px(cx-2, topY, 4,2, dk); px(cx-1, topY+2, 2,1, dk); }                              // v-neck
+  else if(f.outfit===4){ px(cx-4, topY, 8,2, dk); px(cx-2, topY+2, 1,4, PAL.paper); px(cx+1, topY+2, 1,4, PAL.paper); } // hoodie
 }
 
 // Scheduled / automated agents (cron, daily monitors, etc.) wear a courier uniform:
@@ -2036,6 +2048,7 @@ function drawHairAcc(x, hy, f){
     px(x-8,hy-4,16,7,hr); px(x-8,hy-4,16,1,hd);          // crown + top outline
     px(x-9,hy+1,3,13,hr); px(x+6,hy+1,3,13,hr);          // long sides past the cheeks
     px(x-7,hy-3,9,1,hl); px(x-9,hy+1,2,5,hl);            // soft crown + side highlight
+    px(x-6,hy-4,7,1,shade(hr,.55)); px(x+5,hy-2,2,6,hd); // bright top sheen + right-side depth
     px(x-9,hy+12,3,3,hd); px(x+6,hy+12,3,3,hd);          // tip shade
     if(f.femStyle===0){                                  // long flowing
       px(x-10,hy+12,3,7,hr); px(x+7,hy+12,3,7,hr); px(x+7,hy+5,1,11,hl); px(x-10,hy+17,3,2,hd);
@@ -2051,8 +2064,9 @@ function drawHairAcc(x, hy, f){
     return;
   }
   // ---- men / neutral ----
-  if(f.hairStyle!==2){ px(x-7,hy-3,14,6,hr); px(x-8,hy+1,2,7,hr); px(x+6,hy+1,2,7,hr);
-    px(x-7,hy-3,14,1,hd); px(x-5,hy-2,7,1,hl); }                                              // base + outline + sheen
+  if(f.hairStyle!==2){ px(x-7,hy-3,14,6,hr); px(x-8,hy+1,2,7,hr); px(x+6,hy+1,2,7,hr);       // base + sideburns
+    px(x-6,hy-4,12,1,hr);                                                                     // rounded crown
+    px(x-7,hy-3,14,1,hd); px(x-5,hy-3,6,1,hl); px(x-6,hy-2,3,1,shade(hr,.5)); px(x+4,hy-2,2,5,hd); } // outline + sheen streak + temple depth
   if(f.hairStyle===1){ px(x-5,hy-7,3,5,hr); px(x-1,hy-8,3,6,hr); px(x+3,hy-7,3,5,hr); px(x-1,hy-8,2,1,hl); } // spiky
   else if(f.hairStyle===3){ px(x-2,hy-7,5,5,hr); px(x-1,hy-7,3,1,hl); }                                      // bun
   else if(f.hairStyle===4){ px(x-8,hy-4,16,8,hr); px(x-9,hy+4,2,6,hr); px(x+7,hy+4,2,6,hr);
@@ -2069,6 +2083,11 @@ function drawFace(x, hy, f, beach){
   // ears
   px(x-9,hy+5,2,4,sk); px(x-9,hy+5,1,4,PAL.outline);
   px(x+7,hy+5,2,4,sk); px(x+8,hy+5,1,4,PAL.outline);
+  // soft roundness: shadow down the right cheek, highlight on the upper-left,
+  // and a gentle chin shade -- gives the face dimension across every skin tone
+  px(x+4,hy,3,11,'rgba(60,40,25,.12)');
+  px(x-6,hy,2,5,'rgba(255,255,255,.16)');
+  px(x-6,hy+11,12,1,'rgba(60,40,25,.12)');
   // relaxed, slightly raised eyebrows (friendly, never angled-down)
   px(x-5,hy+2,3,1,'rgba(70,50,40,.55)'); px(x+2,hy+2,3,1,'rgba(70,50,40,.55)');
   if(beach){ // dark sunglasses (beach only) -- two tinted lenses + a bridge
@@ -2125,6 +2144,7 @@ function drawBeachSitter(p, t){
   ro(x-8, y-9, 16, 13, sh);
   px(x-8,y-9,16,2,shade(sh,.30)); px(x+5,y-8,3,11,shade(sh,-.20)); px(x-8,y+2,16,2,shade(sh,-.16));
   px(x-2,y-9,4,2,shade(sh,-.28));                              // collar
+  torsoDetail(x, y-9, 8, 13, sh, f);                          // outfit variety + sheen
   // left arm propped back on the sand
   ro(x-12, y-6, 5, 8, sh); px(x-12, y+1, 5, 3, sk);
   // right arm raised, holding the cocktail
@@ -2166,6 +2186,7 @@ function drawDeskPod(x, y, p, t){
     ro(x-11, y-12, 22, 16, sh);
     px(x-11,y-12,22,2, shade(sh,.30)); px(x+7,y-11,3,14, shade(sh,-.20)); px(x-11,y+2,22,2, shade(sh,-.16));
     px(x-2,y-12,4,2, shade(sh,-.28));
+    torsoDetail(x, y-12, 11, 16, sh, f);                                // outfit variety + sheen
     if(f.messenger){ drawEnvelope(x, y-5); }                            // courier envelope badge
     // typing arms
     const tap=(Math.floor(t*0.4)&1);
@@ -2238,6 +2259,7 @@ function drawStanding(p, t){
   px(x-9,y-11,18,2, shade(sh,.30)); px(x+6,y-10,3,13, shade(sh,-.20)); px(x-9,y+3,18,2, shade(sh,-.16));
   px(x-2,y-11,4,2, shade(sh,-.28));                         // collar notch
   px(x-9,y+4,18,1, shade(pants,-.10));                      // belt/hem line
+  torsoDetail(x, y-11, 9, 16, sh, f);                       // outfit variety + sheen
   if(f.messenger){ drawEnvelope(x, y-3); }                  // courier envelope badge
   // arms by mode: upper sleeve (shirt) + forearm/hand (skin)
   if(p.mode==='drink' || p.mode==='idle'){
