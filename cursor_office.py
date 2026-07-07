@@ -546,12 +546,13 @@ def _claude_pretty_project(dirname):
 def _normalize_events_claude(path):
     """Normalize a Claude Code .jsonl into the shared event shape.
 
-    Returns ``(events, ai_title, scheduled, scheduled_name)``. Claude Code has no
-    ``turn_ended`` marker, so we only emit user/assistant events; tool-result user
-    messages are flagged so the first *real* user prompt (not a tool result) can be
-    used as the task. Inline sidechain (subagent) records are skipped so the office
-    worker reflects the main thread -- a running Task subagent still surfaces as the
-    parent's pending tool_use.
+    Returns ``(events, title, scheduled, scheduled_name)`` where ``title`` is the
+    session name: a user-set ``custom-title`` if present, else the auto ``ai-title``.
+    Claude Code has no ``turn_ended`` marker, so we only emit user/assistant events;
+    tool-result user messages are flagged so the first *real* user prompt (not a tool
+    result) can be used as the task. Inline sidechain (subagent) records are skipped so
+    the office worker reflects the main thread -- a running Task subagent still surfaces
+    as the parent's pending tool_use.
 
     A session started by a scheduled task / cron opens with a
     ``<scheduled-task name="..." file="...">`` marker in its first user message; we
@@ -559,6 +560,7 @@ def _normalize_events_claude(path):
     """
     events = []
     ai_title = ""
+    custom_title = ""
     scheduled = False
     scheduled_name = ""
     try:
@@ -573,6 +575,9 @@ def _normalize_events_claude(path):
                     continue
                 if obj.get("type") == "ai-title" and obj.get("aiTitle"):
                     ai_title = obj["aiTitle"]
+                    continue
+                if obj.get("type") == "custom-title" and obj.get("customTitle"):
+                    custom_title = obj["customTitle"]   # a name the user gave the session
                     continue
                 if obj.get("isSidechain"):
                     continue
@@ -615,7 +620,8 @@ def _normalize_events_claude(path):
                 })
     except Exception:
         pass
-    return events, ai_title, scheduled, scheduled_name
+    # a name the user gave the session wins over the auto-generated one
+    return events, (custom_title or ai_title), scheduled, scheduled_name
 
 
 def _turn_in_progress_claude(events):
