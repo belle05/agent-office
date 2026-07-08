@@ -943,11 +943,11 @@ PAGE = r"""<!DOCTYPE html>
     font-size:11px;color:#5a564d;letter-spacing:1px;}
   #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
     box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
-  #brand #celebrate,#brand #sound,#brand #filter{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+  #brand #celebrate,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
     background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
-  #brand #celebrate:hover,#brand #sound:hover,#brand #filter:hover{background:#4a4a52;color:#fff;}
-  #brand #celebrate:active,#brand #sound:active,#brand #filter:active{transform:translateY(1px);}
-  #brand #sound,#brand #filter{margin-left:8px;}
+  #brand #celebrate:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
+  #brand #sound,#brand #filter,#brand #names{margin-left:8px;}
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
@@ -1023,7 +1023,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><span id="clock"></span></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button><span id="clock"></span></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
@@ -1373,6 +1373,22 @@ function rebuild(){
 }
 
 function hash(s){let h=0;for(let i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))&0xffffffff;return h>>>0;}
+
+// ---- agent name styles (chosen in the header; names are stable per agent id) ----
+const NAME_SETS = {
+  magical: { label:'MAGICAL', first:["Pip","Willow","Clover","Bun","Maple","Sprout","Waffle","Biscuit","Poppy","Mochi","Pebble","Fern","Cricket","Marshmallow","Pumpkin","Honey","Acorn","Noodle","Pickle","Sunny","Berry","Tofu","Dandelion","Bramble","Hazel","Olive","Tansy","Muffin","Peaches","Juniper"],
+    last:["Sunbeam","Marshmallow","Buttercup","Honeydew","Pumpkinpatch","Snugglebee","Cloudberry","Dewdrop","Meadowlight","Gigglesworth","Cottontail","Brightbloom","Mossypaws","Tinkerwhisk","Sugarplum","Pebblebrook","Willowwisp","Honeycomb","Berrybramble","Twinkletoes","Mapleshade","Cuddleburrow","Dapplewood","Snickerdoodle","Fernwhistle"] },
+  israeli: { label:'ISRAELI', first:["Yossi","Noa","Avi","Shira","Tal","Yael","Eitan","Dana","Gal","Amit","Ronen","Ori","Roni","Maya","Itai","Nadav","Liron","Chen","Bar","Shani","Adi","Yarden","Omer","Hila","Lior","Guy","Tomer","Inbal","Doron","Sivan","Ziv","Nir","Gil","Rotem","Yuval","Moshe","Sagi","Dvir","Ayelet","Almog"],
+    last:["Cohen","Levi","Mizrahi","Peretz","Biton","Dahan","Avraham","Friedman","Katz","Azoulay","Ben-David","Shapira","Bar-On","Malka","Gabai","Segal","Hadad","Barak","Regev","Ohayon","Amar","Klein","Ashkenazi","Elbaz","Tzur","Sasson","Vaknin","Nachmani","Aloni","Shalev"] },
+  dev: { label:'DEV', first:["Segfault","Captain","Null","Sudo","Regex","Commit","Legacy","Hotfix","Boolean","Async","Cache","Merge","Kernel","Turbo","Lazy","Quantum","Rusty","Vim","Recursive","Undefined","Docker","Bcrypt"],
+    last:["Overflow","Pointer","Deploy","Nullson","Bugsley","Pushington","Bytewise","Loopy","Debugger","Refactor","O'Reilly","McStacktrace","von Merge","Yeetson","Hashimoto","Snippets","Ramsson","Kernelson","Rebase","Semicolon","Payload","Heapman"] },
+  robots: { label:'ROBOTS', first:["Unit","Servo","Chip","Proto","Mecha","Robo","Nano","Giga","Auto","Cy","Zeta","Beep","Clank","Data","Pixel","Opti","Turbo","Volt","Gizmo","Sprocket","Bolt","Widget"],
+    last:["Boopmatic","Cogsworth","9000","Mk-II","Whirrley","Sparkplug","Bleepson","Databyte","Clankworth","Buzzbot","Gearhart","Pixelface","Ohmson","Widgeteer","von Circuit","3000","Beepson","Clankstein","Rustbucket","Boltsworth","Zappenheim","Motoroni"] },
+};
+const NAME_ORDER = ['magical','israeli','dev','robots'];
+let nameStyle = localStorage.getItem('office_names'); if(!NAME_SETS[nameStyle]) nameStyle='magical';
+function nameFor(id){ const s=NAME_SETS[nameStyle]||NAME_SETS.magical; const h=hash(id||'x');
+  return s.first[h % s.first.length]+' '+s.last[(h>>>8) % s.last.length]; }
 
 // ---- drawing helpers ----
 function px(x,y,w,h,col){ctx.fillStyle=col;ctx.fillRect(x|0,y|0,w|0,h|0);}
@@ -2710,7 +2726,7 @@ cv.addEventListener('mousemove', e=>{
       ? (k==='tool' ? 'Currently running' : 'Latest activity')
       : (k==='tool' ? 'Last action' : 'Latest message');
     nametag.innerHTML =
-      '<div class="nt-name">'+esc(a.name)+
+      '<div class="nt-name">'+esc(nameFor(a.id))+
         '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
         srcBadgeHTML(a.source)+
         (a.scheduled?'<span class="nt-badge scheduled">scheduled</span>':'')+'</div>'+
@@ -2769,7 +2785,7 @@ async function openDetail(id){
   if(!d||d.error){ toast('not found'); return; }
   currentDetail=d;
   updateFinishBtn(d.id);
-  document.getElementById('d-name').textContent=d.name;
+  document.getElementById('d-name').textContent=nameFor(d.id);
   document.getElementById('d-sub').innerHTML=
     '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
     '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> '+
@@ -2909,6 +2925,18 @@ filterBtn.addEventListener('click',()=>{
   updateFilterBtn();
 });
 updateFilterBtn();
+
+// ---- agent name-style cycle (magical / israeli / dev / robots) ----
+const namesBtn=document.getElementById('names');
+function updateNamesBtn(){ namesBtn.textContent='NAMES: '+NAME_SETS[nameStyle].label; }
+namesBtn.addEventListener('click',()=>{
+  nameStyle=NAME_ORDER[(NAME_ORDER.indexOf(nameStyle)+1)%NAME_ORDER.length];
+  localStorage.setItem('office_names', nameStyle);
+  updateNamesBtn();
+  if(currentDetail) document.getElementById('d-name').textContent=nameFor(currentDetail.id);  // refresh open card
+  toast('names: '+NAME_SETS[nameStyle].label.toLowerCase());
+});
+updateNamesBtn();
 
 // fire a celebration (+ chime) when an agent transitions working -> waiting between polls
 function detectFinishes(list){
