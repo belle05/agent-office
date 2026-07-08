@@ -1125,15 +1125,16 @@ function featuresFor(id){
     skin: SKIN[(h>>>0) % SKIN.length],
     hair: HAIR[(h>>>3) % HAIR.length],
     shirt: SHIRTS[(h>>>6) % SHIRTS.length],
-    hairStyle: (h>>>9) % 6,        // 0 flat 1 spiky 2 bald 3 bun 4 mop 5 mohawk
+    hairStyle: (h>>>9) % 8,        // 0 flat 1 spiky 2 bald 3 bun 4 mop 5 mohawk 6 side-part 7 afro
     acc: (h>>>12) % 6,             // 0 none 1 glasses 2 cap 3 headphones 4 beanie 5 antenna
     accCol: ACCCOL[(h>>>15) % ACCCOL.length],
     pants: ['#3a4654','#4a3a2e','#2f4250','#5a4326','#3a3a44','#2f4a38'][(h>>>23) % 6],
     speed: 0.55 + ((h>>>18) % 5) * 0.14,   // per-person walk speed
     big: ((h>>>21) & 1) === 1,             // chunkier body
     female: ((h>>>16) & 1) === 1,          // ~half women, stable by id
-    femStyle: (h>>>17) % 3,                // 0 long  1 ponytail  2 bun+bow
+    femStyle: (h>>>17) % 4,                // 0 long  1 ponytail  2 bun+bow  3 top-knot
     outfit: (h>>>19) % 5,                  // 0 plain 1 zip 2 stripe 3 v-neck 4 hoodie
+    lanyard: ((h>>>25) % 3) === 0,         // ~1/3 wear an office badge on a lanyard
   };
 }
 // a small outfit detail + soft left-side sheen, shared by every sprite so the crowd
@@ -1141,6 +1142,12 @@ function featuresFor(id){
 function torsoDetail(cx, topY, halfW, h, sh, f){
   if(f.messenger) return;                                        // couriers keep their plain uniform + badge
   px(cx-halfW+1, topY+2, 1, h-4, 'rgba(255,255,255,.10)');       // subtle sheen down the left
+  if(f.lanyard){                                                 // office badge on a lanyard (overrides other detail)
+    px(cx-3,topY,1,5,'#33343e'); px(cx+3,topY,1,5,'#33343e');    // cords from the shoulders
+    px(cx-2,topY+5,5,5,'#eef0f4'); px(cx-2,topY+5,5,1,'#ffffff'); // badge card
+    px(cx-1,topY+6,3,1,'#8f98a4'); px(cx-1,topY+8,2,1,'#8f98a4'); // badge text lines
+    return;
+  }
   const dk=shade(sh,-.26), lt=shade(sh,.26);
   if(f.outfit===1){ px(cx, topY+1, 1, h-2, dk); px(cx-1, topY+3, 3,1, dk); px(cx-1, topY+7, 3,1, dk); }     // zip placket
   else if(f.outfit===2){ px(cx-halfW+2, topY+Math.round(h*0.45), (halfW-2)*2, 2, lt); }                     // chest stripe
@@ -2055,9 +2062,12 @@ function drawHairAcc(x, hy, f){
     } else if(f.femStyle===1){                           // side ponytail
       px(x+8,hy,4,14,hr); px(x+9,hy+12,3,7,hr); px(x+7,hy-1,4,4,hr); px(x+9,hy+2,1,10,hl);
       px(x-5,hy-4,3,2,PAL.pink);                         // little clip
-    } else {                                             // bun + bow
+    } else if(f.femStyle===2){                           // bun + bow
       px(x-3,hy-8,6,5,hr); px(x-2,hy-7,3,1,hl);
       px(x-5,hy-9,3,3,PAL.pink); px(x+2,hy-9,3,3,PAL.pink); px(x-1,hy-8,2,2,PAL.pink);
+    } else {                                             // high top-knot
+      px(x-3,hy-10,6,5,hr); px(x-2,hy-10,4,1,hl); px(x-1,hy-12,2,2,hr);
+      px(x-9,hy+1,3,8,hr); px(x+6,hy+1,3,8,hr);          // shorter tucked sides
     }
     if(f.acc===3){ px(x-9,hy+3,3,7,'#222'); px(x+6,hy+3,3,7,'#222'); px(x-8,hy-4,16,3,'#222'); } // headphones
     if(f.acc===2){ drawCap(x, hy, f.accCol); }           // cap (e.g. courier uniform)
@@ -2072,6 +2082,9 @@ function drawHairAcc(x, hy, f){
   else if(f.hairStyle===4){ px(x-8,hy-4,16,8,hr); px(x-9,hy+4,2,6,hr); px(x+7,hy+4,2,6,hr);
     px(x-6,hy-3,5,1,hl); px(x-1,hy-4,4,1,hl); px(x+3,hy-3,3,1,hl); }                                         // curly mop
   else if(f.hairStyle===5){ px(x-1,hy-8,4,9,hr); px(x-1,hy-8,2,1,hl); }                                      // mohawk
+  else if(f.hairStyle===6){ px(x-2,hy-4,1,5,hd); px(x-6,hy-3,4,1,shade(hr,.5)); px(x+1,hy-3,5,1,hl); }        // side part
+  else if(f.hairStyle===7){ px(x-8,hy-6,16,4,hr); px(x-9,hy-2,3,5,hr); px(x+6,hy-2,3,5,hr);
+    px(x-6,hy-6,10,1,hl); px(x-8,hy-6,16,1,hd); }                                                             // afro / big volume
   else if(f.hairStyle===0){ px(x-7,hy-4,14,4,hr); px(x-6,hy-3,7,1,hl); }                                     // flat
   if(f.acc===2){ drawCap(x, hy, f.accCol); }                                                   // cap
   else if(f.acc===3){ px(x-8,hy-2,16,3,'#222'); px(x-10,hy+3,3,8,'#222'); px(x+7,hy+3,3,8,'#222'); } // headphones
@@ -2097,10 +2110,15 @@ function drawFace(x, hy, f, beach){
     px(x-6,hy+5,5,4,'#1b1b1b'); px(x+1,hy+5,5,4,'#1b1b1b'); px(x-1,hy+6,2,1,'#1b1b1b');
     px(x-5,hy+5,3,3,'#eaf6ff'); px(x+2,hy+5,3,3,'#eaf6ff');
     px(x-4,hy+6,1,1,'#101010'); px(x+3,hy+6,1,1,'#101010');
-  } else { // big bright open eyes (white + pupil + sparkle)
-    px(x-5,hy+5,3,3,'#ffffff'); px(x+2,hy+5,3,3,'#ffffff');
-    px(x-4,hy+6,2,2,PAL.outline); px(x+3,hy+6,2,2,PAL.outline);
-    px(x-4,hy+5,1,1,'#ffffff'); px(x+3,hy+5,1,1,'#ffffff'); // catch-light sparkle
+  } else { // open eyes -- with an occasional blink (staggered per sprite by x)
+    const blink = ((performance.now() + ((x*131)&1023)*4) % 3400) < 130;
+    if(blink){
+      px(x-5,hy+6,3,1,PAL.outline); px(x+2,hy+6,3,1,PAL.outline);   // closed (mid-blink)
+    } else {
+      px(x-5,hy+5,3,3,'#ffffff'); px(x+2,hy+5,3,3,'#ffffff');
+      px(x-4,hy+6,2,2,PAL.outline); px(x+3,hy+6,2,2,PAL.outline);
+      px(x-4,hy+5,1,1,'#ffffff'); px(x+3,hy+5,1,1,'#ffffff'); // catch-light sparkle
+    }
   }
   // eyelashes for women (outer corners)
   if(f.female){ px(x-6,hy+4,1,1,PAL.outline); px(x+6,hy+4,1,1,PAL.outline); }
@@ -2252,6 +2270,7 @@ function drawStanding(p, t){
   const l1=9+(walking?step:0), l2=9+(walking?(1-step):0);
   ro(x-6, y+4, 5, l1, pants); ro(x+1, y+4, 5, l2, pants);
   px(x-6,y+4,5,1, shade(pants,.18)); px(x+1,y+4,5,1, shade(pants,.18));     // pant sheen
+  px(x-2,y+5,1,l1-1, shade(pants,-.20)); px(x+5,y+5,1,l2-1, shade(pants,-.20)); // inner + outer leg shadow
   px(x-8, y+4+l1, 7,3, shoe); px(x-8, y+4+l1, 7,1, shade(shoe,.32));        // left shoe
   px(x,   y+4+l2, 7,3, shoe); px(x,   y+4+l2, 7,1, shade(shoe,.32));        // right shoe
   // torso (soft shaded shirt: top highlight, side + hem shadow, collar, belt)
