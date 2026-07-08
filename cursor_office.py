@@ -1789,6 +1789,11 @@ function drawKitchenProps(){
   const L=layout(), k=L.kitchen, T=L.kitchenTop;
   // back wall band for mounting decor + counters
   px(0,T,W,30,PAL.wall); px(0,T+28,W,2,PAL.base);
+  // tiled kitchen backsplash (subtle offset subway tiles) behind the counter/shelf
+  for(let ty2=T+2; ty2<T+27; ty2+=6){
+    const off=(((ty2-T)/6|0)%2)?5:0;
+    for(let tx2=2-off; tx2<BEACH_X-2; tx2+=10){ px(tx2,ty2,9,5, ((tx2+ty2)&1)?'#e5ddc7':'#ede5d0'); }
+  }
   drawBeachFloor();   // sand + water fill the right band (under the back-wall props)
 
   // ---- tall fridge (far left): freezer/fridge split, handles, magnets, photo ----
@@ -1847,6 +1852,12 @@ function drawKitchenProps(){
   px(shx+18,shy+6,9,10,'rgba(183,217,192,.92)'); px(shx+18,shy+6,9,2,shade('#b7d9c0',.3)); px(shx+17,shy+4,11,2,PAL.leafDk); // green jar + lid
   px(shx+33,shy+4,9,12,PAL.mugC); px(shx+33,shy+4,9,2,shade(PAL.mugC,.34)); px(shx+33,shy+9,9,1,shade(PAL.mugC,-.18)); // canister
   mug(shx+48,shy+7,PAL.mugA); mug(shx+62,shy+7,PAL.mugB);
+  smallPlant(shx+80, shy-1);                                                // a little trailing plant on the shelf end
+  // ---- hanging planter in the gap between the coffee sign and the shelf ----
+  const hgx=166;
+  px(hgx,T,1,6,'#8a7a5a'); px(hgx+8,T,1,6,'#8a7a5a');                       // two cords
+  px(hgx-3,T+6,15,5,PAL.pot); px(hgx-3,T+6,15,2,shade(PAL.pot,.18)); px(hgx-4,T+10,17,1,PAL.potDk); // pot
+  blade(hgx-1,T+11,7,-3,PAL.leafDk); blade(hgx+4,T+11,9,0,PAL.leaf); blade(hgx+9,T+11,6,3,PAL.leafDk); // trailing leaves
   // ---- SINK (center-right): a stainless drop-in basin recessed into the counter
   // (steel rim, two-tone recessed interior, centre drain) with a proper goose-neck
   // faucet rising behind it (riser + arched spout + downspout + lever) -- clearly a sink ----
@@ -2264,6 +2275,10 @@ function drawStanding(p, t){
   const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
   const walking=(Math.abs(p.vx)+Math.abs(p.vy))>0.05;
   const step=walking?(Math.floor(t*0.16)&1):0;
+  // every few seconds a settled kitchen agent takes a coffee sip (staggered per sprite)
+  const canSip = p.kind!=='work' && !walking && (p.mode==='idle'||p.mode==='drink');
+  const sip = canSip && ((performance.now() + ((x*197)&2047)*3) % 5200) < 700;
+  const ht = sip ? -1 : 0;   // head tips back a touch mid-sip
   // shadow
   ctx.fillStyle='rgba(0,0,0,.20)'; ctx.beginPath(); ctx.ellipse(x,y+16,11,3,0,0,Math.PI*2); ctx.fill();
   // legs + rounded shoes (feet stay at ~y+16 to match the hitbox)
@@ -2283,9 +2298,10 @@ function drawStanding(p, t){
   // arms by mode: upper sleeve (shirt) + forearm/hand (skin)
   if(p.mode==='drink' || p.mode==='idle'){
     ro(x-14, y-7, 5, 7, sh); px(x-14, y-1, 5,4, sk);                       // left arm relaxed
-    ro(x+9, y-9, 5, 7, sh); px(x+9, y-3, 5,3, sk);                         // right toward mug
-    ro(x+10, y-13, 7, 7, PAL.paper); px(x+11,y-12,5,5,PAL.mugA); px(x+17,y-12,2,4,PAL.paper);
-    for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } // steam
+    const ay = sip?-4:0, my = sip?-6:0;                                    // raise arm + cup to sip
+    ro(x+9, y-9+ay, 5, 7, sh); px(x+9, y-3+ay, 5,3, sk);                   // right arm toward the mug
+    ro(x+10, y-13+my, 7, 7, PAL.paper); px(x+11,y-12+my,5,5,PAL.mugA); px(x+17,y-12+my,2,4,PAL.paper);
+    if(!sip){ for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } } // steam (paused mid-sip)
   } else if(p.mode==='eat'){
     ro(x-14, y-6, 5, 7, sh); px(x-14, y+1, 5,3, sk);
     ro(x+9, y-7, 5, 6, sh); px(x+10,y-9,5,5,PAL.orange);
@@ -2293,11 +2309,11 @@ function drawStanding(p, t){
     ro(x-14, y-7, 5, 8, sh); px(x-14, y+1, 4,4, sk);                       // hands at sides
     ro(x+10, y-7, 5, 8, sh); px(x+10, y+1, 4,4, sk);
   }
-  // neck + head
-  px(x-3, y-14, 6, 4, sk); px(x-3, y-14, 6, 1, 'rgba(0,0,0,.16)');
-  ro(x-7, y-27, 14, 15, sk);
-  px(x-7,y-13,14,1,'rgba(0,0,0,.10)');                      // soft jaw shade
-  drawHairAcc(x, y-25, f); drawFace(x, y-25, f);
+  // neck + head (tips back slightly while sipping)
+  px(x-3, y-14+ht, 6, 4, sk); px(x-3, y-14+ht, 6, 1, 'rgba(0,0,0,.16)');
+  ro(x-7, y-27+ht, 14, 15, sk);
+  px(x-7,y-13+ht,14,1,'rgba(0,0,0,.10)');                   // soft jaw shade
+  drawHairAcc(x, y-25+ht, f); drawFace(x, y-25+ht, f);
   // source plaque (Cursor vs Claude Code) floating just above the head
   if(p.agent) drawSourceTag(x, y-34, p.agent.source);
   // cozy heart speech bubble for settled kitchen agents (scales with the sprite)
