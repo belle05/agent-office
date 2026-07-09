@@ -2671,7 +2671,8 @@ function updateAmbient(now, dt){
   if(!nextEventAt) scheduleNextEvent(now);          // first event ~30-60s after load
   if(now>=nextEventAt){ fireRandomEvent(now); scheduleNextEvent(now); }
   const sec=dt/1000;
-  if(amb.dog){ const d=amb.dog; d.x += d.dir*d.spd*sec;
+  if(amb.dog){ const d=amb.dog;
+    if(!(d.react && now<d.react.until)) d.x += d.dir*d.spd*sec;   // pause walking mid-pet
     if((d.dir>0 && d.x>W+44) || (d.dir<0 && d.x<-44)) amb.dog=null; }
   if(amb.cat){ const c=amb.cat;
     if(c.state==='in'){
@@ -2696,12 +2697,18 @@ function drawDog(d, t){
   ctx.save();
   scaleAbout(d.x, d.y, SC);
   if(d.dir<0){ ctx.translate(d.x,0); ctx.scale(-1,1); ctx.translate(-d.x,0); }  // face left
-  const x=d.x, y=d.y;
+  // pet reactions: a hop, an extra-waggy tail, or a tongue-out lick
+  const _now=performance.now();
+  const react=(d.react && _now<d.react.until)?d.react:null;
+  const rp = react ? (_now-react.start)/(react.until-react.start) : 0;
+  const jump = (react&&react.type==='jump') ? -Math.abs(Math.sin(rp*Math.PI))*11 : 0;
+  const wagAmp=(react&&react.type==='wag')?4:2, wagSpd=(react&&react.type==='wag')?1.4:0.55;
+  const x=d.x, groundY=d.y, y=d.y+jump;
   const ph = (Math.floor(t*0.34)&1) ? 1 : -1;        // leg swing phase
   const bob = Math.round(Math.sin(t*0.30))|0;        // head bob (0/1)
-  const wag = Math.round(Math.sin(t*0.55)*2);        // tail wag
-  // ground contact shadow
-  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.beginPath(); ctx.ellipse(x, y+1, 22, 4, 0, 0, Math.PI*2); ctx.fill();
+  const wag = Math.round(Math.sin(t*wagSpd)*wagAmp); // tail wag (bigger/faster mid-pet)
+  // ground contact shadow (stays on the floor even during a hop)
+  ctx.fillStyle='rgba(0,0,0,.18)'; ctx.beginPath(); ctx.ellipse(x, groundY+1, 22, 4, 0, 0, Math.PI*2); ctx.fill();
 
   if(d.breed==='dachshund'){
     const c='#8a5a2b', cd='#6b431d', ch='#a3743f', ear='#5a3717', nose='#241c2b';
@@ -2765,6 +2772,11 @@ function drawDog(d, t){
     px(hx-3, hy+1, 5, 11, cd); px(hx-3,hy+1,5,2,c);   // floppy ear
     px(hx+8, hy+4, 2, 2, nose);                       // eye
   }
+  // pet-reaction flourishes: happy hearts, plus a big pink tongue for a 'lick'
+  if(react){
+    miniHeart(x-5, y-24-rp*8); miniHeart(x+5, y-20-rp*10);
+    if(react.type==='lick'){ px(x+20, y-6, 4, 7, '#e79ab0'); px(x+20, y-1, 4, 2, '#d47a92'); px(x+21, y-6, 1, 3, '#f4c0d0'); } // tongue
+  }
   ctx.restore();
 }
 
@@ -2776,6 +2788,9 @@ function drawCat(c, t){
   const fur=c.fur, furDk=shade(fur,-.30), furHi=shade(fur,.30), pink='#e79ab0', nose='#cf7a8e';
   const el=(cx,cy,rx,ry,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fill(); };
   const x=c.x, y=c.y;
+  const _now=performance.now();
+  const react=(c.react && _now<c.react.until)?c.react:null;
+  const rp = react ? (_now-react.start)/(react.until-react.start) : 0;
   ctx.fillStyle='rgba(0,0,0,.16)'; ctx.beginPath(); ctx.ellipse(x, y+2, 16, 4, 0, 0, Math.PI*2); ctx.fill();
 
   if(c.state==='sleep'){
@@ -2795,6 +2810,19 @@ function drawCat(c, t){
     const f=(t*0.6);
     ctx.font='6px "Press Start 2P", monospace'; ctx.fillText('z', x+5-((f)%10), y-16-((f)%10));
     ctx.font='5px "Press Start 2P", monospace'; ctx.fillText('z', x+10-((f+5)%12), y-12-((f+5)%12));
+    // pet reactions while curled up: purr (music notes) or an annoyed screen-swipe
+    if(react && react.type==='purr'){
+      ctx.fillStyle=PAL.leafDk; ctx.font='6px "Press Start 2P", monospace';
+      ctx.fillText('♪', x+7-rp*4, y-15-rp*10); ctx.fillText('♫', x+12-rp*3, y-11-rp*13);
+      miniHeart(x-3, y-17-rp*7);
+    } else if(react && react.type==='violence'){
+      const sw=Math.sin(rp*Math.PI);
+      px(x-13,y-4,4,1,PAL.outline); px(x-8,y-4,4,1,PAL.outline);        // angry slit eyes (over the sleepy ones)
+      px(x-2+sw*7, y-11, 5,3, fur); px(x-2+sw*7, y-11, 5,1, furHi);     // paw swiping at the screen
+      const a=1-Math.abs(rp-0.5)*2;                                     // slashes flash in then out
+      ctx.strokeStyle='rgba(255,255,255,'+(0.6*a).toFixed(2)+')'; ctx.lineWidth=1.6;
+      for(let i=0;i<3;i++){ ctx.beginPath(); ctx.moveTo(x-7+i*6, y-19); ctx.lineTo(x-2+i*6, y-1); ctx.stroke(); }
+    }
   } else {
     if(c.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }  // face walk dir
     const ph=(Math.floor(t*0.4)&1)?1:-1;
@@ -2813,6 +2841,34 @@ function drawCat(c, t){
     px(hx+10, hy+6, 2, 2, nose);                         // nose
   }
   ctx.restore();
+}
+
+// ---- petting the ambient pets ----
+function miniHeart(hx,hy){ px(hx-2,hy,2,2,PAL.pink); px(hx+1,hy,2,2,PAL.pink); px(hx-2,hy+1,5,2,PAL.pink); px(hx-1,hy+3,3,1,PAL.pink); px(hx,hy+4,1,1,PAL.pink); }
+// which pet (if any) is under the cursor -- cat first, then dog
+function pickPet(mx,my){
+  if(amb.cat){ const c=amb.cat, cy=(c.state==='sleep')?c.y-6:c.y-13;
+    if(Math.abs(mx-c.x)<18*SC && Math.abs(my-cy)<16*SC) return 'cat'; }
+  if(amb.dog){ const d=amb.dog;
+    if(Math.abs(mx-d.x)<24*SC && my>d.y-30*SC && my<d.y+8*SC) return 'dog'; }
+  return null;
+}
+function petDog(){ const d=amb.dog; if(!d) return;
+  const type=['wag','lick','jump'][(Math.random()*3)|0];
+  const now=performance.now(); d.react={type, start:now, until:now+950};
+}
+function petCat(){ const c=amb.cat; if(!c) return; initAudio();
+  const type=['purr','reposition','violence'][(Math.random()*3)|0];
+  const now=performance.now();
+  if(type==='reposition'){
+    // stand up and scoot along the floor to a nearby spot, then re-settle
+    c.tx=Math.max(40, Math.min(W-40, c.x + (Math.random()<0.5?-1:1)*(60+Math.random()*80)));
+    c.state='in'; c.react=null;
+  } else if(type==='purr'){
+    c.react={type, start:now, until:now+1600}; c.sleepUntil=Math.max(c.sleepUntil, now+2500); playPurr();
+  } else { // violence: an annoyed swipe at the screen
+    c.react={type, start:now, until:now+800}; c.sleepUntil=Math.max(c.sleepUntil, now+3000); playScratch();
+  }
 }
 
 // ---- interaction ----
@@ -2853,6 +2909,11 @@ function pickHelper(mx,my){ let best=null,bd=1e9;
   return best; }
 cv.addEventListener('mousemove', e=>{
   const m=toCanvas(e);
+  // a pettable pet under the cursor?
+  const pet=pickPet(m.x,m.y);
+  if(pet){ hover=null; cv.style.cursor='pointer';
+    nametag.innerHTML='<div class="nt-hint">click to pet the '+pet+'</div>';
+    nametag.style.display='block'; placeNametag(m); return; }
   // a subagent dwarf? (they sit right by the desk) -- takes precedence over the agent
   const dw=pickHelper(m.x,m.y);
   if(dw){
@@ -2894,7 +2955,10 @@ cv.addEventListener('mousemove', e=>{
 });
 cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';});
 cv.addEventListener('click', e=>{
-  const m=toCanvas(e); const p=pick(m.x,m.y);
+  const m=toCanvas(e);
+  const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
+  if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
+  const p=pick(m.x,m.y);
   if(p) openDetail(p.agent.id);
 });
 
@@ -3041,6 +3105,31 @@ function playFinishChime(){
     o.connect(g).connect(audioCtx.destination);
     o.start(s); o.stop(s+0.35);
   });
+}
+// a low rumbly purr (triangle tone with a fast tremolo LFO) when you pet the cat
+function playPurr(){
+  if(!soundOn || !audioCtx) return;
+  const t0=audioCtx.currentTime;
+  const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+  const lfo=audioCtx.createOscillator(), lg=audioCtx.createGain();
+  o.type='triangle'; o.frequency.value=55;
+  lfo.type='sine'; lfo.frequency.value=24; lg.gain.value=0.035;   // tremolo -> purr rumble
+  lfo.connect(lg).connect(g.gain);
+  g.gain.setValueAtTime(0.06, t0); g.gain.setValueAtTime(0.06, t0+1.1);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0+1.45);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t0); lfo.start(t0); o.stop(t0+1.45); lfo.stop(t0+1.45);
+}
+// a short filtered-noise "scritch" when the cat swipes the screen
+function playScratch(){
+  if(!soundOn || !audioCtx) return;
+  const t0=audioCtx.currentTime, dur=0.18, n=Math.floor(audioCtx.sampleRate*dur);
+  const buf=audioCtx.createBuffer(1,n,audioCtx.sampleRate), ch=buf.getChannelData(0);
+  for(let i=0;i<n;i++) ch[i]=(Math.random()*2-1)*(1-i/n);       // decaying white noise
+  const src=audioCtx.createBufferSource(); src.buffer=buf;
+  const bp=audioCtx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=2800; bp.Q.value=1.1;
+  const g=audioCtx.createGain(); g.gain.value=0.09;
+  src.connect(bp).connect(g).connect(audioCtx.destination); src.start(t0);
 }
 const soundBtn=document.getElementById('sound');
 function updateSoundBtn(){ soundBtn.innerHTML=(soundOn?'&#9834; ON':'&#9834; OFF'); soundBtn.classList.toggle('off', !soundOn); }
