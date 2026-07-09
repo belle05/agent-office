@@ -277,6 +277,75 @@ def _latest_sub_mtime(sub_files):
     return max((m for _, m in sub_files), default=0.0)
 
 
+def _active_sub_count(sub_files):
+    """How many background subagents are *currently running* -- i.e. their transcript
+    was written within the freshness window. The subagents/ dir also holds finished
+    ones, so we count only recently-touched files (the UI shows a little helper per
+    active subagent next to the working agent)."""
+    if not sub_files:
+        return 0
+    now = time.time()
+    return sum(1 for _, m in sub_files if (now - m) <= SUBAGENT_ACTIVE_SECONDS)
+
+
+def _first_user_text(path):
+    """First user-message text from a transcript (works for either Cursor or Claude
+    line format). Used to label a subagent when it has no metadata file."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                role = o.get("role") or ((o.get("message") or {}).get("role"))
+                if role != "user":
+                    continue
+                c = (o.get("message") or {}).get("content")
+                if c is None:
+                    c = o.get("content")
+                if isinstance(c, str):
+                    return _clean_text(c)
+                if isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                            return _clean_text(b["text"])
+    except Exception:
+        pass
+    return ""
+
+
+def _subagent_infos(sub_files):
+    """For the *currently running* subagents, return [{type, detail}] describing what
+    each is doing. Claude subagents carry a sibling ``<name>.meta.json`` with an
+    ``agentType`` + ``description``; otherwise we fall back to the subagent's opening
+    prompt. Sorted by path so a given subagent keeps the same helper slot."""
+    if not sub_files:
+        return []
+    now = time.time()
+    infos = []
+    for path, m in sorted(sub_files, key=lambda pm: pm[0]):
+        if (now - m) > SUBAGENT_ACTIVE_SECONDS:
+            continue
+        typ, detail = "", ""
+        meta = (path[:-len(".jsonl")] + ".meta.json") if path.endswith(".jsonl") else path + ".meta.json"
+        try:
+            if os.path.isfile(meta):
+                with open(meta, "r", encoding="utf-8", errors="replace") as fh:
+                    md = json.load(fh)
+                typ = (md.get("agentType") or "").strip()
+                detail = (md.get("description") or "").strip()
+        except Exception:
+            pass
+        if not detail:
+            detail = _first_user_text(path)
+        infos.append({"type": typ, "detail": detail[:140]})
+    return infos
+
+
 def _is_working(turn_in_progress, eff_mtime, sub_files):
     """Office (working) vs kitchen (waiting), decided by TURN STATE + rollups.
 
@@ -827,6 +896,8 @@ def get_agents(hours, full=False, project_filter=None, sources=None):
             # vs the turn state, so it can change even when the transcript hasn't.
             a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files) else "waiting"
             a["last_activity_rel"] = _rel_time(time.time() - mtime)
+            a["subagents"] = _subagent_infos(_sub_files)   # running subagents -> little helpers
+            a["subs"] = len(a["subagents"])
             agents.append(a)
     agents.sort(key=lambda a: a["mtime"], reverse=True)
     return agents
@@ -855,27 +926,36 @@ def get_agent_detail(uuid):
                 d = parse(uuid, project, path, mtime, sub_files=_sub_files, full=True)
                 d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files) else "waiting"
                 d["last_activity_rel"] = _rel_time(time.time() - mtime)
+                d["subagents"] = _subagent_infos(_sub_files)
+                d["subs"] = len(d["subagents"])
                 return d
     return None
 
 
 def demo_agents():
     now = time.time()
+    subs_a = [{"type": "code-reviewer", "detail": "Review the working diff for bugs"},
+              {"type": "test-runner", "detail": "Run the unit test suite"}]
+    subs_e = [{"type": "explorer", "detail": "Map the ORM query paths"},
+              {"type": "db-analyst", "detail": "EXPLAIN the slow orders query"},
+              {"type": "doc-writer", "detail": "Draft the fix summary"}]
     samples = [
-        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False),
-        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude", False),
-        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor", False),
-        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude", False),
-        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude", False),
-        ("demo-ffff-0006", "waiting", "Daily production error monitor", 9000, "claude", True),
-        ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True),
+        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a),
+        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude", False, []),
+        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor", False, []),
+        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude", False, []),
+        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude", False, subs_e),
+        ("demo-ffff-0006", "waiting", "Daily production error monitor", 9000, "claude", True, []),
+        ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True, []),
     ]
     out = []
-    for uuid, status, title, ago, source, scheduled in samples:
+    for uuid, status, title, ago, source, scheduled, subagents in samples:
         out.append({
             "id": uuid,
             "source": source,
             "scheduled": scheduled,
+            "subagents": subagents,
+            "subs": len(subagents),
             "name": _name_for(uuid),
             "variant": _variant_for(uuid),
             "project": "demo-office",
@@ -1174,6 +1254,7 @@ function featuresForAgent(a){
 let agents = [];      // raw from server
 let people = [];      // live sprites with positions
 let deskSlots = [];   // fixed office desks (always drawn; some hold a worker)
+let helperHits = [];  // per-frame hover regions for the subagent dwarves
 let deskAssign = {};  // agent id -> stable desk slot index (kept across refreshes)
 let seatAssign = {};  // agent id -> stable kitchen seat index
 let beachAssign = {}; // agent id -> stable beach spot index (finished agents)
@@ -2275,6 +2356,48 @@ function drawDeskPod(x, y, p, t){
   // mug with steam if the desk is occupied
   if(p){ mug(x+3, y-1, PAL.mugC);
     for(let i=0;i<3;i++){ const yy=y-3-((t*1.0+i*5)%8); px(x+5,yy,1,2,'rgba(255,255,255,.5)'); } }
+  // running subagents: a helper dwarf digging away next to the desk (one per subagent).
+  // We also register a hover region so you can see what each one is doing.
+  if(p && p.agent && p.agent.subs>0){
+    const subs=p.agent.subagents||[]; const n=Math.min(p.agent.subs,4);
+    for(let i=0;i<n;i++){
+      const cx=x-40-i*22, cy=y+15;
+      drawHelper(cx, cy, t, (hash(p.id)+i*7)%997);
+      // pod is drawn scaled by SC about (x,y); convert the dwarf centre to mouse-logical coords
+      helperHits.push({ x: x+(cx-x)*SC, y: y+((cy-6)-y)*SC, r: 15*SC, sub: subs[i]||null });
+    }
+  }
+}
+
+// a helper "subagent" dwarf: pointy hat, beard, tunic with belt, boots, swinging a
+// pickaxe over a little dirt mound. One is drawn per running subagent, animated.
+function drawHelper(cx, cy, t, seed){
+  const bob = (Math.floor(t*0.22+seed)&1);                 // gentle bob
+  const y = cy - bob;
+  const up = (Math.floor(t*0.40+seed)&1);                  // pickaxe raised / struck
+  px(cx-6, cy+7, 14, 2, 'rgba(0,0,0,.22)');                // ground shadow
+  px(cx+4, cy+4, 7, 3, '#8a5a30'); px(cx+4, cy+4, 7, 1, '#a06a3a'); // little dirt mound
+  // boots
+  px(cx-4, cy+4, 3, 3, '#3a2a18'); px(cx+1, cy+4, 3, 3, '#3a2a18');
+  // tunic (green) + belt + buckle
+  px(cx-5, y-2, 10, 7, '#4f7d3a'); px(cx-5,y-2,10,1,'#67a04c'); px(cx-5,y+4,10,1,'#3c612c');
+  px(cx-5, y+2, 10, 1, '#6b4a2a'); px(cx-1, y+1, 2, 2, '#caa33a');
+  // arms + hands
+  px(cx-6, y, 2, 4, '#4f7d3a'); px(cx+5, y, 2, 4, '#4f7d3a');
+  px(cx-6, y+3, 2, 2, '#f0d2a8'); px(cx+5, y+3, 2, 2, '#f0d2a8');
+  // face + big white beard + eyes + rosy nose
+  px(cx-3, y-6, 7, 4, '#f0d2a8');
+  px(cx-4, y-2, 9, 3, '#eef0f4'); px(cx-3, y+1, 7, 1, '#dcdfe6');
+  px(cx-2, y-5, 1, 1, PAL.outline); px(cx+2, y-5, 1, 1, PAL.outline);
+  px(cx-1, y-4, 2, 1, '#d98f7a');
+  // pointy red hat with brim + pom
+  px(cx-5, y-8, 11, 2, '#a83226');
+  px(cx-3, y-10, 7, 2, '#c0392b'); px(cx-2, y-12, 5, 2, '#c0392b'); px(cx-1, y-14, 3, 2, '#d2452f'); px(cx, y-16, 1, 2, '#d2452f');
+  px(cx, y-16, 1, 1, '#f4f4f4');
+  // pickaxe
+  if(up){ px(cx+7, y-6, 2, 8, '#8a5a30'); px(cx+5, y-7, 6, 2, '#aab2ba'); px(cx+5,y-7,2,1,'#cdd6dd'); }
+  else  { px(cx+7, y+1, 2, 6, '#8a5a30'); px(cx+7, y+6, 6, 2, '#aab2ba');
+          px(cx+11, y+5, 1, 1, 'rgba(150,110,60,.6)'); px(cx+9, y+7, 1, 1, 'rgba(150,110,60,.5)'); }
 }
 
 // a standing person (kitchen / lounge), facing us
@@ -2393,6 +2516,7 @@ function tick(now){
 }
 
 function render(t){
+  helperHits = [];                   // rebuilt each frame as dwarves are drawn
   ctx.setTransform(SS,0,0,SS,0,0);   // map logical 640x576 onto the super-sampled backing
   ctx.clearRect(0,0,W,H);
   drawFloor();
@@ -2713,14 +2837,43 @@ function pick(mx,my){
   return best;
 }
 const nametag=document.getElementById('nametag');
+// place the hover card near the cursor, flipped/clamped to stay on-screen
+function placeNametag(m){
+  const sw=m.r.width, sh=m.r.height, pad=8;
+  const bw=nametag.offsetWidth, bh=nametag.offsetHeight;
+  let left=m.cx+16, top=m.cy-bh-12;
+  if(left+bw+pad>sw) left=m.cx-bw-16;
+  if(left<pad) left=pad;
+  if(top<pad) top=m.cy+18;
+  if(top+bh+pad>sh) top=sh-bh-pad;
+  nametag.style.left=Math.round(left)+'px'; nametag.style.top=Math.round(top)+'px';
+}
+function pickHelper(mx,my){ let best=null,bd=1e9;
+  for(const h of helperHits){ const d=(mx-h.x)*(mx-h.x)+(my-h.y)*(my-h.y); if(d<h.r*h.r && d<bd){bd=d;best=h;} }
+  return best; }
 cv.addEventListener('mousemove', e=>{
-  const m=toCanvas(e); hover=pick(m.x,m.y);
+  const m=toCanvas(e);
+  // a subagent dwarf? (they sit right by the desk) -- takes precedence over the agent
+  const dw=pickHelper(m.x,m.y);
+  if(dw){
+    hover=null; cv.style.cursor='help';
+    const s=dw.sub||{}; const ttl=(s.type&&s.type.length)?s.type:'subagent';
+    nametag.innerHTML =
+      '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge scheduled">helper</span></div>'+
+      '<div class="nt-label">This dwarf is</div>'+
+      '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>'+
+      '<div class="nt-hint">a running subagent</div>';
+    nametag.style.display='block'; placeNametag(m);
+    return;
+  }
+  hover=pick(m.x,m.y);
   if(hover){
     cv.style.cursor='pointer';
     const a=hover.agent;
     const where = a.status==='working' ? 'at a desk' : 'in the kitchen';
     const meta = [a.project, a.last_activity_rel? ('active '+a.last_activity_rel):null,
-                  (a.message_count!=null? a.message_count+' msgs':null)].filter(Boolean).join('  ·  ');
+                  (a.message_count!=null? a.message_count+' msgs':null),
+                  (a.subs>0? (a.subs+' helper'+(a.subs>1?'s':'')):null)].filter(Boolean).join('  ·  ');
     const k = a.latest_kind;
     const label = a.status==='working'
       ? (k==='tool' ? 'Currently running' : 'Latest activity')
@@ -2736,17 +2889,7 @@ cv.addEventListener('mousemove', e=>{
       '<div class="nt-label">'+label+'</div>'+
       '<div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'+
       '<div class="nt-hint">click to open full session</div>';
-    nametag.style.display='block';
-    // clamp inside the screen: place near cursor, flip/shift to stay on-screen
-    const sw=m.r.width, sh=m.r.height, pad=8;
-    const bw=nametag.offsetWidth, bh=nametag.offsetHeight;
-    let left=m.cx+16, top=m.cy-bh-12;
-    if(left+bw+pad>sw) left=m.cx-bw-16;        // flip to the left of cursor
-    if(left<pad) left=pad;
-    if(top<pad) top=m.cy+18;                    // flip below cursor
-    if(top+bh+pad>sh) top=sh-bh-pad;
-    nametag.style.left=Math.round(left)+'px';
-    nametag.style.top=Math.round(top)+'px';
+    nametag.style.display='block'; placeNametag(m);
   } else { nametag.style.display='none'; cv.style.cursor='default'; }
 });
 cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';});
