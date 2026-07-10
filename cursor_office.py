@@ -2394,10 +2394,46 @@ function drawSkyline(x,y,w,h,col,hf,step,lit){
     bx+=bw+3; i++;
   }
 }
-// returns 'night' | 'dusk' | 'day' from the LOCAL computer clock (override hook for tests)
+// ---- day / dusk / night in the window, from the REAL sun position (season- + place-aware,
+// not a hardcoded hour). We ask the browser for the user's location ONCE; the sun angle is then
+// computed locally (nothing leaves the machine). If location is denied/unavailable we fall back
+// to the browser-local clock. window.__forceSky overrides everything (tests). ----
+let __geo = null;   // {lat,lng} once resolved | 'pending' | 'denied' | null
+function requestGeo(){
+  if(__geo!==null || !(navigator && navigator.geolocation)) return;
+  __geo='pending';
+  try{
+    navigator.geolocation.getCurrentPosition(
+      p=>{ __geo={lat:p.coords.latitude, lng:p.coords.longitude}; },
+      ()=>{ __geo='denied'; },
+      {maximumAge: 6*3600*1000, timeout: 8000});
+  }catch(e){ __geo='denied'; }
+}
+requestGeo();
+// sun altitude (degrees above the horizon) right now, at lat/lng. Low-precision USNO formulas
+// (good to a fraction of a degree -- ample for deciding day/dusk/night).
+function sunAltitude(date, lat, lng){
+  const rad=Math.PI/180, deg=180/Math.PI;
+  const d = date.getTime()/86400000 - 10957.5;              // days since J2000 (2000-01-01 12:00 UTC)
+  const g = ((357.529 + 0.98560028*d)%360)*rad;             // mean anomaly
+  const q = (280.459 + 0.98564736*d)%360;                   // mean longitude
+  const L = (q + 1.915*Math.sin(g) + 0.020*Math.sin(2*g))*rad;   // ecliptic longitude
+  const e = (23.439 - 0.00000036*d)*rad;                    // obliquity
+  const dec = Math.asin(Math.sin(e)*Math.sin(L));           // declination
+  const ra  = Math.atan2(Math.cos(e)*Math.sin(L), Math.cos(L))*deg;   // right ascension (deg)
+  let gmst = (18.697374558 + 24.06570982441908*d)%24; if(gmst<0) gmst+=24;
+  let ha = ((gmst*15 + lng) - ra)%360; ha=((ha+540)%360)-180;   // hour angle, folded to [-180,180]
+  return Math.asin(Math.sin(lat*rad)*Math.sin(dec) + Math.cos(lat*rad)*Math.cos(dec)*Math.cos(ha*rad))*deg;
+}
 function skyMode(){
   if(window.__forceSky) return window.__forceSky;
-  const hr=new Date().getHours();
+  if(__geo && __geo.lat!=null){
+    const alt = sunAltitude(new Date(), __geo.lat, __geo.lng);
+    if(alt <= -6) return 'night';      // past civil twilight -> dark
+    if(alt <   6) return 'dusk';       // sun near the horizon -> golden dawn/dusk
+    return 'day';
+  }
+  const hr=new Date().getHours();      // fallback: browser-local clock
   if(hr>=19 || hr<6) return 'night';
   if(hr===18 || hr===6) return 'dusk';
   return 'day';
