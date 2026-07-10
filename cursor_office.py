@@ -95,6 +95,11 @@ SUBAGENT_ACTIVE_SECONDS = 120    # multitask subagent freshness window; --active
 # cap (e.g. 15m) wrongly evicted those active turns to the kitchen, so turn state
 # -- not mtime -- is the primary signal and this only catches genuinely dead ones.
 WORKING_STALE_CAP_SECONDS = 7200
+# A turn that owes the user a PLAIN reply (last event is a real user message, no tool pending)
+# but has produced nothing for this long is stuck/abandoned -- e.g. an interrupted request the
+# user never continued. A real agent starts replying within seconds, so this is safe to keep
+# short WITHOUT evicting long single-tool turns (those are "mid-tool", not "reply", so exempt).
+REPLY_STALE_SECONDS = 600
 
 # --watch (dev hot-reload). START_TOKEN changes every time the process (re-)starts;
 # the page polls /api/version and reloads itself when it sees a new token. Set from
@@ -341,14 +346,16 @@ def _first_user_text(path):
     return ""
 
 
-def _last_assistant_text(path):
-    """Latest assistant-authored text from a transcript (Cursor or Claude line format),
-    scanned from the end. Used to bubble what a subagent just said."""
+def _last_activity(path):
+    """Latest assistant activity from a transcript (Cursor or Claude line format), scanned
+    from the end. Returns (text, kind): kind is 'tool' when the model just called a tool
+    (text = "Tool: detail"), else 'assistant' (text = what it wrote). Drives the ephemeral
+    speech bubble / tool chip over a subagent dwarf. ("", "") when nothing is found."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
     except Exception:
-        return ""
+        return ("", "")
     for line in reversed(lines):
         line = line.strip()
         if not line or '"assistant"' not in line:   # cheap pre-filter
@@ -366,14 +373,26 @@ def _last_assistant_text(path):
         if isinstance(c, str):
             txt = _clean_text(c)
             if txt:
-                return txt
-        elif isinstance(c, list):
-            parts = [b.get("text", "") for b in c
-                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+                return (txt, "assistant")
+            continue
+        if isinstance(c, list):
+            tool = None
+            parts = []
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "tool_use" and tool is None:
+                    tool = ("%s: %s" % (b.get("name", "tool"),
+                                        _tool_detail(b.get("name", ""), b.get("input")))).strip().rstrip(":")
+                elif bt == "text" and b.get("text"):
+                    parts.append(b["text"])
+            if tool:                              # ran a tool -> show the action
+                return (tool, "tool")
             txt = _clean_text("\n".join(parts))
             if txt:
-                return txt
-    return ""
+                return (txt, "assistant")
+    return ("", "")
 
 
 def _subagent_infos(sub_files):
@@ -401,8 +420,9 @@ def _subagent_infos(sub_files):
         if not detail:
             detail = _first_user_text(path)
         sub_id = os.path.splitext(os.path.basename(path))[0]
-        infos.append({"type": typ, "detail": detail[:140],
-                      "id": sub_id, "last_msg": _last_assistant_text(path)[:160], "ts": m})
+        act_txt, act_kind = _last_activity(path)
+        infos.append({"type": typ, "detail": detail[:140], "id": sub_id,
+                      "last_msg": act_txt[:160], "last_kind": act_kind, "ts": m})
     return infos
 
 
@@ -423,6 +443,11 @@ def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0):
     if (now - eff) > WORKING_STALE_CAP_SECONDS:
         return False
     if turn_in_progress:
+        # a turn that owes a PLAIN reply (Claude turn-kind "reply") but has been silent a long
+        # time is stuck/abandoned mid-turn -> idle. Mid-tool turns ("tool"/generic truthy) can
+        # legitimately be silent for one long tool call, so they keep the far-out stale cap.
+        if turn_in_progress == "reply" and (now - eff) > REPLY_STALE_SECONDS:
+            return False
         return True
     latest_sub = _latest_sub_mtime(sub_files)
     if latest_sub and (now - latest_sub) <= SUBAGENT_ACTIVE_SECONDS:
@@ -741,9 +766,14 @@ def _normalize_events_claude(path):
                             })
                         elif btype == "tool_result":
                             is_tool_result = True
-                if role == "user" and not scheduled:
+                injected = False
+                if role == "user":
                     joined = "\n".join(texts)  # raw, before tags are stripped
-                    if "<scheduled-task" in joined:
+                    # slash-command echoes, local-command output, task notifications,
+                    # system reminders and caveats are appended as user-role lines but
+                    # are NOT a real user turn -- flag them so turn-detection can skip them.
+                    injected = _is_injected_user_text(joined)
+                    if not scheduled and "<scheduled-task" in joined:
                         scheduled = True
                         m = re.search(r'name="([^"]+)"', joined)
                         if m:
@@ -753,6 +783,7 @@ def _normalize_events_claude(path):
                     "text": _clean_text("\n\n".join(texts)),
                     "tools": tools,
                     "is_tool_result": is_tool_result,
+                    "injected": injected,
                 })
     except Exception:
         pass
@@ -768,10 +799,21 @@ def _turn_in_progress_claude(events):
     for e in reversed(events):
         if e["kind"] not in ("user", "assistant"):
             continue
-        if e["kind"] == "assistant" and e["text"] and not e["tools"]:
-            return False  # delivered a final response -> waiting on the user
-        return True       # anything else -> mid-turn
-    return False          # no conversation yet
+        # injected/automated user-role lines (system reminders, task notifications,
+        # slash-command echoes, local-command output, caveats) are appended AFTER the
+        # final answer -- they are not a real user turn. Skip them, or a finished
+        # session would look mid-turn (stuck working at a desk) forever.
+        if e["kind"] == "user" and e.get("injected"):
+            continue
+        if e["kind"] == "assistant":
+            if e["text"] and not e["tools"]:
+                return ""      # delivered a final response -> done, waiting on the user
+            return "tool"      # a pending tool_use (may run a long time) -> mid-tool
+        # a user event that is a tool result awaits the model -> also mid-tool
+        if e.get("is_tool_result"):
+            return "tool"
+        return "reply"         # a plain user message with no reply yet -> agent owes a reply
+    return ""                  # no conversation yet
 
 
 # user-role transcript lines that aren't something the user actually typed: slash commands,
@@ -1209,8 +1251,9 @@ def _workflow_progress(run_dir):
         running_fresh += 1
         if len(active) < 6:
             ap = os.path.join(run_dir, "agent-%s.jsonl" % best_aid)
+            act_txt, act_kind = _last_activity(ap)
             active.append({"type": "workflow-subagent", "detail": _first_user_text(ap)[:140],
-                           "id": best_aid, "last_msg": _last_assistant_text(ap)[:160], "ts": best_am})
+                           "id": best_aid, "last_msg": act_txt[:160], "last_kind": act_kind, "ts": best_am})
     return {
         "total": base["total"],
         "done": base["done"],
@@ -1421,17 +1464,20 @@ def get_agent_detail(uuid):
 
 def demo_agents():
     now = time.time()
-    blip = int(now // 6)   # rotates demo messages every 6s so speech bubbles pop in --demo
-    subs_a = [{"type": "code-reviewer", "detail": "Review the working diff for bugs",
-               "id": "demoA-0", "last_msg": "found a bug in the export path (%d)" % blip, "ts": now},
+    # working agents / their live helpers occasionally "say" a new thing; each gets its own
+    # slow, staggered clock so the office shows the odd bubble popping -- not a wall of them.
+    def _blip(off, period=15):
+        return int((now + off) // period)
+    subs_a = [{"type": "general-purpose", "detail": "Review the working diff for bugs",
+               "id": "demoA-0", "last_msg": "Grep: export path (%d)" % _blip(0), "last_kind": "tool", "ts": now},
               {"type": "test-runner", "detail": "Run the unit test suite",
-               "id": "demoA-1", "last_msg": "unit suite running, pass %d" % blip, "ts": now}]
+               "id": "demoA-1", "last_msg": "unit suite green, pass %d" % _blip(5), "last_kind": "assistant", "ts": now}]
     subs_e = [{"type": "explorer", "detail": "Map the ORM query paths",
-               "id": "demoE-0", "last_msg": "tracing ORM path #%d" % blip, "ts": now},
+               "id": "demoE-0", "last_msg": "Read: orders.py (%d)" % _blip(2), "last_kind": "tool", "ts": now},
               {"type": "db-analyst", "detail": "EXPLAIN the slow orders query",
-               "id": "demoE-1", "last_msg": "EXPLAIN pass %d" % blip, "ts": now},
+               "id": "demoE-1", "last_msg": "Bash: EXPLAIN ANALYZE (%d)" % _blip(8), "last_kind": "tool", "ts": now},
               {"type": "doc-writer", "detail": "Draft the fix summary",
-               "id": "demoE-2", "last_msg": "drafting summary v%d" % blip, "ts": now}]
+               "id": "demoE-2", "last_msg": "drafting summary v%d" % _blip(12), "last_kind": "assistant", "ts": now}]
     wf_demo = [{
         "runId": "wf_demo01",
         "name": "exhaustive-security-audit",
@@ -1441,11 +1487,11 @@ def demo_agents():
         "phase_trusted": False,
         "total": 21, "done": 14, "running": 3,
         "active": [{"type": "workflow-subagent", "detail": "Verify the auth-bypass finding",
-                    "id": "demoW-0", "last_msg": "auth-bypass looks real (%d)" % blip, "ts": now},
+                    "id": "demoW-0", "last_msg": "auth-bypass looks real (%d)" % _blip(3), "last_kind": "assistant", "ts": now},
                    {"type": "workflow-subagent", "detail": "Refute the SSRF candidate",
-                    "id": "demoW-1", "last_msg": "SSRF refuted, pass %d" % blip, "ts": now},
+                    "id": "demoW-1", "last_msg": "Edit: sanitizer.py (%d)" % _blip(9), "last_kind": "tool", "ts": now},
                    {"type": "workflow-subagent", "detail": "Check the deserialization sink",
-                    "id": "demoW-2", "last_msg": "checking sink %d" % blip, "ts": now}],
+                    "id": "demoW-2", "last_msg": "WebFetch: cve database (%d)" % _blip(14), "last_kind": "tool", "ts": now}],
     }]
     samples = [
         ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a, []),
@@ -1458,7 +1504,31 @@ def demo_agents():
         ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True, [], []),
     ]
     out = []
-    for uuid, status, title, ago, source, scheduled, subagents, workflows in samples:
+    for idx, (uuid, status, title, ago, source, scheduled, subagents, workflows) in enumerate(samples):
+        # a WORKING agent that is actually typing (no helpers) alternates between writing text
+        # (white bubble) and running a tool (dark chip) on its own slow clock; a delegating
+        # parent (turn ended, dwarves running) and waiting agents keep a static last line so
+        # only their dwarves pop indicators. Nothing syncs up -> the odd bubble/chip, not a wall.
+        active_typing = status == "working" and not subagents and not workflows
+        if active_typing:
+            phase = _blip(idx * 4, 13)
+            if phase % 2:
+                tool = ["Edit", "Bash", "Grep", "Read"][idx % 4]
+                latest = "%s: %s.py [%d]" % (tool, title.split()[0].lower(), phase)
+                lkind = "tool"
+            else:
+                latest = "Reviewing the latest changes about " + title.split()[0].lower() + " [%d]" % phase
+                lkind = "assistant"
+        else:
+            latest = ("Working with helpers on " + title.split()[0].lower()) if status == "working" \
+                     else "Wrapped up -- waiting for your next instruction."
+            lkind = "assistant"
+        # a fresh user instruction lands on a working agent every so often (staggered, slow) ->
+        # the boss walks over to a desk to deliver it. Waiting agents keep their original ask.
+        last_instr = ((("can you also cover the empty case?", "please add a test for this",
+                        "make sure it handles nulls too", "ship it once CI is green",
+                        "rename that so it reads clearer")[_blip(idx * 9, 34) % 5])
+                      if status == "working" else "Please " + title[0].lower() + title[1:])
         out.append({
             "id": uuid,
             "source": source,
@@ -1476,9 +1546,9 @@ def demo_agents():
             "status": status,
             "title": title,
             "preview": title,
-            "latest": ("Reviewing the latest changes and preparing a response about: " + title + (" [%d]" % blip)),
-            "latest_kind": "assistant",
-            "last_instruction": ("Please " + title[0].lower() + title[1:]),
+            "latest": latest,
+            "latest_kind": lkind,
+            "last_instruction": last_instr,
             "message_count": 12,
             "model": "Opus 4.8" if source == "claude" else None,
             "tokens": (1_240_000 if source == "claude" else None),
@@ -1689,8 +1759,9 @@ ctx.imageSmoothingEnabled = false;
 // global art scale: characters + desks are drawn larger (about their anchor) so
 // the rooms feel filled. ALL hitbox / hover-ring / pick() math multiplies by SC.
 const SC = 1.5;
-const BUBBLE_MS = 6200;    // speech-bubble lifetime (ms)
+const BUBBLE_MS = 8200;    // speech-bubble lifetime (ms)
 const BUBBLE_FADE = 900;   // fade-out tail (ms)
+const BOSS_MS = 7200;      // how long the "boss" lingers by a desk delivering a new instruction
 // the bottom band is split: KITCHEN (waiting) on the left, BEACH (finished, resting)
 // on the right. BEACH_X is the divider; everything to its right is sand + water.
 const BEACH_X = Math.round(W*0.60);
@@ -1800,6 +1871,8 @@ let prevStatus = null;      // id -> last status; null until the first poll (no 
 let msgSeen = null;   // id -> last assistant `latest` seen (desk agents); null until first poll
 let subMsgSeen = {};  // subId -> last change-token (subagents + workflow subs)
 let subBubbles = {};  // subId -> {text,start,until} active dwarf bubbles
+let instrSeen = null; // id -> last user instruction seen (working agents); null until first poll
+let bossVisits = {};  // id -> {text,start,until} a supervisor delivering a new instruction at a desk
 let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // filter couriers (default off)
 // agents the user has marked "finished" -- they go rest on the beach until unmarked.
 // User-controlled and sticky (persisted), independent of the working/waiting status.
@@ -2987,7 +3060,8 @@ function drawDeskPod(x, y, p, t){
       // pod is drawn scaled by SC about (x,y); convert the dwarf centre to mouse-logical coords
       helperHits.push({ x: x+(cx-x)*SC, y: y+((cy-6)-y)*SC, r: 15*SC, sub: subs[i]||null });
       const sb0 = subs[i] && subs[i].id ? subBubbles[subs[i].id] : null;
-      if(sb0) bubbleAnchors.push({ x: x+(cx-x)*SC, y: y+((cy-15)-y)*SC, text:sb0.text, start:sb0.start, until:sb0.until });
+      if(sb0){ const lo=(i&1)===1;   // stagger: even dwarf -> above the hat, odd -> below the face
+        bubbleAnchors.push({ x: x+(cx-x)*SC, y: y+((cy+(lo?2:-15))-y)*SC, text:sb0.text, start:sb0.start, until:sb0.until, below:lo, tool:sb0.tool }); }
     }
   }
   // dynamic-workflow easel (drawn beside the desk; returns its hover hit centre)
@@ -3074,7 +3148,8 @@ function drawWorkflowTent(x, y, workflows, t){
     const hx=cxT - (n-1)*8 + i*16, hy=y+18;
     ctx.save(); scaleAbout(hx, hy, 0.7); drawHelper(hx, hy, t, (hash(wname)+i*7)%997); ctx.restore();
     const sbw = acts[i] && acts[i].id ? subBubbles[acts[i].id] : null;
-    if(sbw) bubbleAnchors.push({ x: x+(hx-x)*SC, y: y+((hy-12)-y)*SC, text:sbw.text, start:sbw.start, until:sbw.until });
+    if(sbw){ const lo=(i&1)===1;   // stagger easel dwarves: even -> above the hat, odd -> below the face
+      bubbleAnchors.push({ x: x+(hx-x)*SC, y: y+((hy+(lo?1:-12))-y)*SC, text:sbw.text, start:sbw.start, until:sbw.until, below:lo, tool:sbw.tool }); }
   }
   return { x: cxT, y: y-14, r: 36 };
 }
@@ -3132,8 +3207,10 @@ function wrapChars(text, maxW, maxLines, ell){
 
 // first ~90 chars, whitespace-collapsed (drawBubble wraps + ellipsizes the rest)
 function firstWords(s){ s=String(s||'').replace(/\s+/g,' ').trim(); return s.length>90?s.slice(0,90):s; }
-// small white speech bubble with a downward tail, centred above (x,y) in SCREEN coords.
-function drawBubble(x, y, text, alpha){
+// small white speech bubble centred on (x,y) in SCREEN coords. Tail points DOWN to the
+// anchor (bubble sits above) unless `below` is set, in which case it sits below with an
+// up-pointing tail -- used to stagger neighbouring dwarf bubbles so they don't overlap.
+function drawBubble(x, y, text, alpha, below){
   if(!text || alpha<=0) return;
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
@@ -3142,18 +3219,89 @@ function drawBubble(x, y, text, alpha){
   let tw=0; for(const ln of lines) tw=Math.max(tw, ctx.measureText(ln).width);
   const padX=4, padY=3, lh=6;
   const bw=Math.max(14, Math.ceil(tw)+padX*2), bh=lh*lines.length+padY*2-1;
-  const bx=Math.round(x-bw/2), by=Math.round(y-bh);
+  const bx=Math.round(x-bw/2), by=Math.round(below ? y+4 : y-bh);
   ro(bx, by, bw, bh, PAL.paper);                     // white box + 1px dark outline
   px(bx+1, by+1, bw-2, 1, shade(PAL.paper,-.06));    // faint header shade
-  const tx=Math.round(x);                            // downward pixel tail
-  px(tx-2, by+bh, 4,1, PAL.paper); px(tx-1, by+bh+1, 2,1, PAL.paper); px(tx, by+bh+2, 1,1, PAL.paper);
-  px(tx-3, by+bh, 1,1, PAL.outline); px(tx+2, by+bh, 1,1, PAL.outline);
-  px(tx-2, by+bh+1, 1,1, PAL.outline); px(tx+1, by+bh+1, 1,1, PAL.outline);
-  px(tx-1, by+bh+2, 1,1, PAL.outline); px(tx+1, by+bh+2, 1,1, PAL.outline);
-  px(tx-1, by+bh+3, 2,1, PAL.outline);
+  const tx=Math.round(x);
+  if(below){                                         // upward pixel tail (box hangs below)
+    px(tx-2, by-1, 4,1, PAL.paper); px(tx-1, by-2, 2,1, PAL.paper); px(tx, by-3, 1,1, PAL.paper);
+    px(tx-3, by-1, 1,1, PAL.outline); px(tx+2, by-1, 1,1, PAL.outline);
+    px(tx-2, by-2, 1,1, PAL.outline); px(tx+1, by-2, 1,1, PAL.outline);
+    px(tx-1, by-3, 1,1, PAL.outline); px(tx+1, by-3, 1,1, PAL.outline);
+    px(tx-1, by-4, 2,1, PAL.outline);
+  } else {                                           // downward pixel tail (box sits above)
+    px(tx-2, by+bh, 4,1, PAL.paper); px(tx-1, by+bh+1, 2,1, PAL.paper); px(tx, by+bh+2, 1,1, PAL.paper);
+    px(tx-3, by+bh, 1,1, PAL.outline); px(tx+2, by+bh, 1,1, PAL.outline);
+    px(tx-2, by+bh+1, 1,1, PAL.outline); px(tx+1, by+bh+1, 1,1, PAL.outline);
+    px(tx-1, by+bh+2, 1,1, PAL.outline); px(tx+1, by+bh+2, 1,1, PAL.outline);
+    px(tx-1, by+bh+3, 2,1, PAL.outline);
+  }
   ctx.fillStyle=PAL.ink; ctx.textAlign='center';
   let ty=by+padY+4; for(const ln of lines){ ctx.fillText(ln, x, ty); ty+=lh; }
   ctx.textAlign='left'; ctx.restore();
+}
+// accent colour for a tool chip, by tool family -- so the same class of action reads the same.
+function toolColor(name){
+  const n=(name||'').toLowerCase();
+  if(/bash|shell|exec|run|terminal|command/.test(n)) return '#6ad06a';        // green: run
+  if(/edit|write|replace|create|apply|notebook|patch/.test(n)) return '#f0a23b'; // orange: write
+  if(/read|cat|open|view|file/.test(n)) return '#5bb0e6';                      // blue: read
+  if(/grep|glob|search|find|explore|list|ls/.test(n)) return '#b98cf0';        // purple: search
+  if(/task|agent|workflow|dispatch|spawn/.test(n)) return '#e673a8';           // pink: delegate
+  if(/web|fetch|http|url|browser|navigate/.test(n)) return '#4fd0c0';          // teal: web
+  return '#d9c37a';                                                            // default: sand-gold
+}
+// ephemeral TOOL CHIP: a small dark pill with a tool-coloured icon + the tool name, popped
+// when an agent/dwarf runs a tool. Deliberately distinct from the white speech bubble.
+function drawToolChip(x, y, name, alpha, below){
+  if(!name || alpha<=0) return;
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.font = '4px "Press Start 2P", monospace';
+  const label = (name.length>13 ? name.slice(0,13) : name).toUpperCase();
+  const tw = ctx.measureText(label).width;
+  const icon=5, padX=3, gap=3, h=9;
+  const bw = padX + icon + gap + Math.ceil(tw) + padX;
+  const bx = Math.round(x-bw/2), by = Math.round(below ? y+4 : y-h);
+  const col = toolColor(name);
+  ro(bx, by, bw, h, '#22262e');                      // dark slate pill + outline
+  px(bx+1, by+1, bw-2, 1, '#333a46');                // top sheen
+  const tx=Math.round(x);
+  if(below){ px(tx-1, by-1, 2,1, '#22262e'); px(tx, by-2, 1,1, '#22262e'); }   // small nub up
+  else     { px(tx-1, by+h, 2,1, '#22262e'); px(tx, by+h+1, 1,1, '#22262e'); } // small nub down
+  const ix=bx+padX, iy=by+Math.round((h-icon)/2);    // little gear/cog icon in the tool colour
+  px(ix+1,iy,3,1,col); px(ix,iy+1,5,3,col); px(ix+1,iy+4,3,1,col); px(ix+2,iy+2,1,1,'#22262e');
+  ctx.fillStyle=col; ctx.textAlign='left';
+  ctx.fillText(label, ix+icon+gap, by+h-3);
+  ctx.textAlign='left'; ctx.restore();
+}
+// tool name only (drop the "Tool: detail" tail) for a compact chip label.
+function toolLabel(s){ s=String(s||''); const i=s.indexOf(':'); return (i>0?s.slice(0,i):s).trim(); }
+// a stern "boss" / supervisor in a suit + red tie, one arm pointing at the desk. Same scale as
+// a standing worker -- pops up beside a desk to deliver a fresh user instruction (see below).
+function drawBoss(x, y, t){
+  x=Math.round(x); y=Math.round(y);
+  const suit='#31363f', suitLt='#3d434e', shirt='#eef1f6', tie='#c0392b', skin='#e6b38a', shoe='#191c22', hair='#3a2c20';
+  const pt=(Math.floor(t*0.05)&1);                                   // occasional emphatic point
+  ctx.fillStyle='rgba(0,0,0,.22)'; ctx.beginPath(); ctx.ellipse(x,y+16,11,3,0,0,Math.PI*2); ctx.fill();
+  ro(x-6,y+4,5,10,suit); ro(x+1,y+4,5,10,suit);                      // slacks
+  px(x-2,y+5,1,9,shade(suit,-.25));
+  px(x-8,y+13,7,3,shoe); px(x-8,y+13,7,1,shade(shoe,.4));            // shoes
+  px(x,   y+13,7,3,shoe); px(x,   y+13,7,1,shade(shoe,.4));
+  ro(x-9,y-12,18,17,suit); px(x-9,y-12,18,2,suitLt); px(x-9,y+3,18,1,shade(suit,-.2)); // jacket
+  px(x-2,y-11,4,11,shirt);                                          // shirt panel
+  px(x-4,y-11,3,7,suitLt); px(x+1,y-11,3,7,suitLt);                 // lapels
+  px(x-1,y-10,2,9,tie); px(x-1,y-1,2,2,shade(tie,-.25)); px(x-1,y-11,2,1,shade(tie,.3)); // tie
+  ro(x+7,y-10,4,10,suit); px(x+7,y+0,4,3,skin);                     // right arm at side
+  if(pt){ px(x-15,y-9,7,3,suit); px(x-16,y-9,3,3,skin); }           // left arm out, pointing at the desk
+  else  { ro(x-11,y-10,4,10,suit); px(x-11,y+0,4,3,skin); }         // left arm down
+  px(x-3,y-15,6,4,skin);                                            // neck
+  ro(x-7,y-28,14,15,skin); px(x-7,y-14,14,1,'rgba(0,0,0,.10)');     // head
+  px(x-7,y-28,14,4,hair); px(x-7,y-28,5,7,hair); px(x+5,y-28,2,5,hair); // side-part hair
+  px(x-4,y-22,2,1,PAL.outline); px(x+3,y-22,2,1,PAL.outline);       // brows
+  px(x-4,y-20,2,2,'#33373e'); px(x+3,y-20,2,2,'#33373e');           // eyes
+  px(x-1,y-18,2,1,shade(skin,-.28));                               // nose
+  px(x-3,y-16,7,1,shade(skin,-.35));                              // firm mouth
 }
 
 // a standing person (kitchen / lounge), facing us
@@ -3326,7 +3474,16 @@ function render(t){
   const slots=[...deskSlots].sort((a,b)=>a.y-b.y);
   for(const s of slots){ const w=s.worker;
     ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore();
-    if(w && w.seated && w.bubbleUntil>bt) bubbleAnchors.push({x:s.x, y:s.y-30*SC, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil}); }
+    if(w && w.seated && w.bubbleUntil>bt) bubbleAnchors.push({x:s.x, y:s.y-30*SC, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil, tool:w.bubbleTool}); }
+  // supervisor "boss" visits: a stern figure by the desk delivering a fresh user instruction.
+  // Shown as soon as the instruction lands (even while the agent is still walking to the desk),
+  // so messaging a waiting agent pops the boss right away instead of after the walk-in.
+  for(const s of slots){ const w=s.worker; if(!w) continue;
+    const bv=bossVisits[w.id]; if(!bv || bv.until<=bt) continue;
+    const bs=SC*1.25, bx=s.x+46, by=s.y-10;  // a bit bigger + raised so the head sits at/above the seated agent
+    const a=Math.min(1,(bt-bv.start)/180, (bv.until-bt)/500);
+    ctx.save(); ctx.globalAlpha=Math.max(0,a); scaleAbout(bx, by, bs); drawBoss(bx, by, t); ctx.restore();
+    bubbleAnchors.push({x:bx, y:by-30*bs, text:bv.text, start:bv.start, until:bv.until}); }
   // everyone currently standing/walking (kitchen agents + workers still walking in),
   // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
   const drawList=[];
@@ -3339,7 +3496,7 @@ function render(t){
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
       if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t); else drawStanding(e.p,t);
       ctx.restore();
-      if(e.p.bubbleUntil>bt) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil}); }
+      if(e.p.bubbleUntil>bt) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
   }
@@ -3347,7 +3504,8 @@ function render(t){
   for(const b of bubbleAnchors){
     const rem=b.until-bt; if(rem<=0) continue;
     const fin=Math.min(1,(bt-b.start)/160), fout=Math.min(1, rem/BUBBLE_FADE);
-    drawBubble(b.x, b.y, b.text, Math.min(fin,fout));
+    if(b.tool) drawToolChip(b.x, b.y, b.text, Math.min(fin,fout), b.below);
+    else drawBubble(b.x, b.y, b.text, Math.min(fin,fout), b.below);
   }
   // hover ring (around the drawn sprite, scaled to match SC)
   if(hover){
@@ -3861,11 +4019,16 @@ cv.addEventListener('mousemove', e=>{
   if(dw){
     hover=null; cv.style.cursor='help';
     // subagent dwarf
-    const s=dw.sub||{}; const ttl=(s.type&&s.type.length)?s.type:'subagent';
+    const s=dw.sub||{};
+    // "general-purpose" (the default agent type) tells you nothing -- for it (or a missing
+    // type) show the task detail as the title instead, and drop the now-redundant detail line.
+    const generic = !s.type || !s.type.length || s.type==='general-purpose';
+    const ttl = generic ? (s.detail || 'a background task') : s.type;
     nametag.innerHTML =
       '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge scheduled">helper</span></div>'+
-      '<div class="nt-label">This subagent is</div>'+
-      '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>'+
+      (generic ? '' :
+        '<div class="nt-label">This subagent is</div>'+
+        '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>')+
       '<div class="nt-hint">a running subagent</div>';
     nametag.style.display='block'; placeNametag(m);
     return;
@@ -4061,6 +4224,7 @@ async function refresh(){
     document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
     agents=data.agents||[]; rebuild();
     detectMessages(agents);
+    detectInstructions(agents);
     detectFinishes(agents);
   }catch(e){/* keep last */}
 }
@@ -4158,12 +4322,21 @@ updateNamesBtn();
 function detectMessages(list){
   const now=performance.now();
   const cur={};
-  for(const a of list) cur[a.id] = (a.latest_kind==='assistant') ? (a.latest||'') : '';
+  // ONLY working (at-desk) agents pop an ephemeral indicator -- kitchen (waiting) and beach
+  // (archived) agents are idle. A working agent shows a white speech bubble when it writes
+  // text and a dark TOOL CHIP when it runs a tool (a.latest_kind); 'task' shows nothing.
+  for(const a of list)
+    cur[a.id] = (a.status==='working' && (a.latest_kind==='assistant' || a.latest_kind==='tool'))
+                ? (a.latest_kind+'|'+(a.latest||'')) : '';
   if(msgSeen!==null){
     for(const a of list){ const tok=cur[a.id];
       if(tok && msgSeen[a.id]!==undefined && msgSeen[a.id]!==tok){
         const p=people.find(q=>q.id===a.id);
-        if(p){ p.bubbleText=firstWords(tok); p.bubbleStart=now; p.bubbleUntil=now+BUBBLE_MS; }
+        if(p){ const isTool=a.latest_kind==='tool';
+          p.bubbleTool=isTool;
+          p.bubbleText=isTool?toolLabel(a.latest):firstWords(a.latest);
+          p.bubbleStart=now; p.bubbleUntil=now+BUBBLE_MS;
+        }
       }
     }
   }
@@ -4171,13 +4344,32 @@ function detectMessages(list){
   const alive=new Set();
   const scan=(arr)=>{ (arr||[]).forEach(s=>{ if(!s||!s.id) return; alive.add(s.id);
     const tok=String(s.ts||'')+'|'+(s.last_msg||'');
-    if(s.last_msg && subMsgSeen[s.id]!==undefined && subMsgSeen[s.id]!==tok)
-      subBubbles[s.id]={text:firstWords(s.last_msg), start:now, until:now+BUBBLE_MS};
+    if(s.last_msg && subMsgSeen[s.id]!==undefined && subMsgSeen[s.id]!==tok){
+      const isTool=s.last_kind==='tool';
+      subBubbles[s.id]={text:isTool?toolLabel(s.last_msg):firstWords(s.last_msg),
+                        start:now, until:now+BUBBLE_MS, tool:isTool};
+    }
     subMsgSeen[s.id]=tok;
   }); };
   for(const a of list){ scan(a.subagents); (a.workflows||[]).forEach(w=>scan(w.active)); }
   Object.keys(subMsgSeen).forEach(id=>{ if(!alive.has(id)) delete subMsgSeen[id]; });
   Object.keys(subBubbles).forEach(id=>{ if(subBubbles[id].until < now-BUBBLE_FADE) delete subBubbles[id]; });
+}
+
+// when a NEW user instruction lands on a working agent between polls, send a "boss" over to
+// that agent's desk to deliver it (a supervisor sprite + a speech bubble with the message).
+function detectInstructions(list){
+  const now=performance.now();
+  const cur={};
+  for(const a of list) cur[a.id] = (a.status==='working') ? (a.last_instruction||'') : '';
+  if(instrSeen!==null){
+    for(const a of list){ const tok=cur[a.id];
+      if(tok && instrSeen[a.id]!==undefined && instrSeen[a.id]!==tok)
+        bossVisits[a.id]={text:tok, start:now, until:now+BOSS_MS};
+    }
+  }
+  instrSeen=cur;
+  Object.keys(bossVisits).forEach(id=>{ if(bossVisits[id].until < now-400) delete bossVisits[id]; });
 }
 
 // fire a celebration (+ chime) when an agent transitions working -> waiting between polls
@@ -4314,6 +4506,9 @@ def _start_watcher(interval=1.0):
                 print("[watch] change detected -> reloading server...", flush=True)
                 # small settle delay so a half-written file doesn't re-exec mid-save
                 time.sleep(0.3)
+                # mark the re-exec so the reloaded process skips the banner + browser re-open
+                # (execv keeps the current environment) -- the open tab reloads itself instead.
+                os.environ["AGENT_OFFICE_RELOADED"] = "1"
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 
     threading.Thread(target=_watch, daemon=True).start()
@@ -4390,25 +4585,31 @@ def main():
                 print(f"[!] {d} not found - is {label} installed for this user?")
             print("    You can still preview the office with:  python3 cursor_office.py --demo")
 
-    src_labels = " + ".join(s.capitalize() for s in sources)
-    data_dirs = []
-    if "cursor" in sources:
-        data_dirs.append(CURSOR_PROJECTS_DIR)
-    if "claude" in sources:
-        data_dirs.append(CLAUDE_PROJECTS_DIR)
-    print("=" * 60)
-    print("  AGENT OFFICE  (Game Boy edition)")
-    print("=" * 60)
-    print(f"  Serving at:   {url}")
-    print(f"  Window:       last {args.hours:g}h" + ("   [DEMO MODE]" if args.demo else ""))
-    print(f"  Sources:      {src_labels}")
-    print(f"  Scope:        {args.project or 'ALL projects / roots'}")
-    print(f"  Status:       turn-state (office=turn in progress; multitask subagent window {args.active_secs:g}s; stale cap {WORKING_STALE_CAP_SECONDS:g}s)")
-    print(f"  Data source:  {', '.join(data_dirs)}")
-    print("  Press Ctrl+C to stop.")
-    print("=" * 60)
+    # a --watch re-exec re-runs main(): don't reprint the full banner or reopen the browser
+    # (the already-open tab reloads itself off the new START_TOKEN). Only the FIRST launch does.
+    reloaded = os.environ.get("AGENT_OFFICE_RELOADED") == "1"
+    if reloaded:
+        print(f"[watch] reloaded -> serving at {url}", flush=True)
+    else:
+        src_labels = " + ".join(s.capitalize() for s in sources)
+        data_dirs = []
+        if "cursor" in sources:
+            data_dirs.append(CURSOR_PROJECTS_DIR)
+        if "claude" in sources:
+            data_dirs.append(CLAUDE_PROJECTS_DIR)
+        print("=" * 60)
+        print("  AGENT OFFICE  (Game Boy edition)")
+        print("=" * 60)
+        print(f"  Serving at:   {url}")
+        print(f"  Window:       last {args.hours:g}h" + ("   [DEMO MODE]" if args.demo else ""))
+        print(f"  Sources:      {src_labels}")
+        print(f"  Scope:        {args.project or 'ALL projects / roots'}")
+        print(f"  Status:       turn-state (office=turn in progress; multitask subagent window {args.active_secs:g}s; stale cap {WORKING_STALE_CAP_SECONDS:g}s)")
+        print(f"  Data source:  {', '.join(data_dirs)}")
+        print("  Press Ctrl+C to stop.")
+        print("=" * 60)
 
-    if not args.no_open:
+    if not args.no_open and not reloaded:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
     try:
