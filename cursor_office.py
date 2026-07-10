@@ -3212,7 +3212,9 @@ function drawDeskPod(x, y, p, t){
   if(p && p.agent && p.agent.shells && p.agent.shells.length){
     const shells=p.agent.shells, n=Math.min(shells.length,3);
     for(let i=0;i<n;i++){
-      const sx=x-26+i*18, sy=y+16;                  // row bottom sits just above the name-plate (y+30)
+      // shells[] is newest-first -> draw oldest at the leftmost slot so they fill L->R in the
+      // order the shells were opened. 22px pitch on 17px windows -> ~5px gap between them.
+      const slot=n-1-i, sx=x-30+slot*22, sy=y+8;    // row bottom (sy+12) clears the name-plate (y+30) with a ~10px local gap
       drawShellWin(sx, sy, t, (hash(p.id)+i*5)%997);
       shellHits.push({ x: x+((sx+8)-x)*SC, y: y+((sy+6)-y)*SC, r: 11*SC, shell: shells[i] });
     }
