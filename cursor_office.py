@@ -8,8 +8,8 @@ read from the local transcript files on this machine. BOTH tools are shown toget
   * Cursor agents      (~/.cursor/projects/*/agent-transcripts/)
   * Claude Code agents (~/.claude/projects/*/)
 
-Every worker wears a small colored plaque so you can tell them apart at a glance
-(teal = Cursor, coral = Claude Code); the same shows in the hover card and detail view.
+Hover any worker to see which tool it belongs to (teal = Cursor, coral = Claude Code),
+along with its live token/spend/model, its task, and the last instruction you sent it.
 
   * WORKING agents sit at a desk and type on their computer.
   * WAITING agents (finished a turn and waiting for your reply) hang out in the
@@ -54,6 +54,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import threading
 import time
 import webbrowser
@@ -94,6 +95,33 @@ SUBAGENT_ACTIVE_SECONDS = 120    # multitask subagent freshness window; --active
 # cap (e.g. 15m) wrongly evicted those active turns to the kitchen, so turn state
 # -- not mtime -- is the primary signal and this only catches genuinely dead ones.
 WORKING_STALE_CAP_SECONDS = 7200
+# A turn that owes the user a PLAIN reply (last event is a real user message, no tool pending)
+# but has produced nothing for this long is stuck/abandoned -- e.g. an interrupted request the
+# user never continued. A real agent starts replying within seconds, so this is safe to keep
+# short WITHOUT evicting long single-tool turns (those are "mid-tool", not "reply", so exempt).
+REPLY_STALE_SECONDS = 600
+
+# --watch (dev hot-reload). START_TOKEN changes every time the process (re-)starts;
+# the page polls /api/version and reloads itself when it sees a new token. Set from
+# the pid + import time so a re-exec after a file change produces a fresh value.
+START_TOKEN = str(os.getpid()) + "-" + str(int(os.stat(__file__).st_mtime))
+WATCH_MODE = False
+
+# Dynamic Workflow (the Workflow tool) tents. A workflow run's tent is shown while it
+# is running, and lingers this long after its last write before it closes (a finished
+# workflow's full summary always stays in the chat's detail panel).
+SHOW_WORKFLOWS = True
+WORKFLOW_FRESH_SECONDS = 300
+_WORKFLOW_SCRIPT_CACHE = {}     # script_path -> (mtime, meta_dict)
+_WORKFLOW_IDENTITY_CACHE = {}   # uuid -> (parent_mtime, {runId: {name,summary,scriptPath}})
+_WORKFLOW_JOURNAL_CACHE = {}    # run_dir -> ((mtime,size), {total,done,running_ids})
+
+# rough per-1M-token pricing (USD) by model family, for a best-effort $ spend estimate.
+_MODEL_PRICING = {  # (input, output); cache-read ~= 0.1x input, cache-write ~= 1.25x input
+    "opus": (15.0, 75.0),
+    "sonnet": (3.0, 15.0),
+    "haiku": (0.80, 4.0),
+}
 
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"[ \t]+")
@@ -318,6 +346,55 @@ def _first_user_text(path):
     return ""
 
 
+def _last_activity(path):
+    """Latest assistant activity from a transcript (Cursor or Claude line format), scanned
+    from the end. Returns (text, kind): kind is 'tool' when the model just called a tool
+    (text = "Tool: detail"), else 'assistant' (text = what it wrote). Drives the ephemeral
+    speech bubble / tool chip over a subagent dwarf. ("", "") when nothing is found."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return ("", "")
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or '"assistant"' not in line:   # cheap pre-filter
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        role = o.get("role") or ((o.get("message") or {}).get("role"))
+        if role != "assistant":
+            continue
+        c = (o.get("message") or {}).get("content")
+        if c is None:
+            c = o.get("content")
+        if isinstance(c, str):
+            txt = _clean_text(c)
+            if txt:
+                return (txt, "assistant")
+            continue
+        if isinstance(c, list):
+            tool = None
+            parts = []
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "tool_use" and tool is None:
+                    tool = ("%s: %s" % (b.get("name", "tool"),
+                                        _tool_detail(b.get("name", ""), b.get("input")))).strip().rstrip(":")
+                elif bt == "text" and b.get("text"):
+                    parts.append(b["text"])
+            if tool:                              # ran a tool -> show the action
+                return (tool, "tool")
+            txt = _clean_text("\n".join(parts))
+            if txt:
+                return (txt, "assistant")
+    return ("", "")
+
+
 def _subagent_infos(sub_files):
     """For the *currently running* subagents, return [{type, detail}] describing what
     each is doing. Claude subagents carry a sibling ``<name>.meta.json`` with an
@@ -342,27 +419,124 @@ def _subagent_infos(sub_files):
             pass
         if not detail:
             detail = _first_user_text(path)
-        infos.append({"type": typ, "detail": detail[:140]})
+        sub_id = os.path.splitext(os.path.basename(path))[0]
+        act_txt, act_kind = _last_activity(path)
+        infos.append({"type": typ, "detail": detail[:140], "id": sub_id,
+                      "last_msg": act_txt[:160], "last_kind": act_kind, "ts": m})
     return infos
 
 
-def _is_working(turn_in_progress, eff_mtime, sub_files):
+_BG_CONTENT_RE = re.compile(
+    r"background with ID:\s*(\w+)\.\s*Output is being written to:\s*(\S+?\.output)")
+
+
+def _open_shells_claude(path, cap=6):
+    """Background shells a Claude session started that are (as far as disk can tell) still
+    running -- shown as little terminal windows by the desk.
+
+    A background shell is a ``Bash`` tool_use with ``run_in_background: true``; its result
+    line reports a task id + an output-file path. A shell is considered FINISHED once a
+    terminal ``<task-notification>`` (status completed/failed) references its id -- in EITHER
+    of the two on-disk forms (a consumed user-message line, or a queued ``attachment``).
+    Absence of that notification = still running (this mirrors Claude's own "N shells"
+    counter, and shares its one blind spot: a shell killed out-of-band via ``kill``/``pkill``
+    leaves no transcript trace, so it can be over-reported). Returns up to ``cap`` shells
+    newest-first: ``[{id, command, running, output_tail}]``."""
+    cmd_by_tuid, shells, order, finished = {}, {}, [], set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                m = o.get("message")
+                if isinstance(m, dict) and isinstance(m.get("content"), list):
+                    for b in m["content"]:
+                        if not isinstance(b, dict):
+                            continue
+                        if (b.get("type") == "tool_use" and b.get("name") == "Bash"
+                                and isinstance(b.get("input"), dict)
+                                and b["input"].get("run_in_background")):
+                            cmd_by_tuid[b.get("id")] = b["input"].get("command", "")
+                        elif b.get("type") == "tool_result" and isinstance(b.get("content"), str):
+                            tur = o.get("toolUseResult")
+                            tid = tur.get("backgroundTaskId") if isinstance(tur, dict) else None
+                            mt = _BG_CONTENT_RE.search(b["content"])
+                            if tid and mt:
+                                shells[tid] = {"command": cmd_by_tuid.get(b.get("tool_use_id"), ""),
+                                               "output_file": mt.group(2)}
+                                if tid not in order:
+                                    order.append(tid)
+                # terminal task-notifications mark a shell finished -- both on-disk forms
+                txt = None
+                if isinstance(m, dict) and isinstance(m.get("content"), str) and "<task-notification>" in m["content"]:
+                    txt = m["content"]
+                att = o.get("attachment")
+                if isinstance(att, dict) and att.get("commandMode") == "task-notification":
+                    txt = att.get("prompt", "")
+                if txt:
+                    ti = re.search(r"<task-id>(\w+)</task-id>", txt)
+                    st = re.search(r"<status>(\w+)</status>", txt)
+                    if ti and st and st.group(1) in ("completed", "failed"):
+                        finished.add(ti.group(1))
+    except Exception:
+        return []
+    # PRIORITISE running shells (newest-first), then fill with the most-recent finished ones,
+    # THEN cap. Otherwise a long-lived shell (e.g. a --watch dev server) gets capped out by a
+    # burst of newer, already-finished commands and never shows -- even while still running.
+    newest = list(reversed(order))
+    ordered = [t for t in newest if t not in finished] + [t for t in newest if t in finished]
+    out = []
+    for tid in ordered[:cap]:
+        s = shells[tid]
+        tail = ""
+        try:
+            f = s["output_file"]
+            if os.path.exists(f) and not os.path.islink(f):
+                nz = [ln for ln in open(f, "r", encoding="utf-8", errors="replace").read().splitlines() if ln.strip()]
+                tail = " / ".join(nz[-2:])[:150]
+        except Exception:
+            pass
+        out.append({"id": tid,
+                    "command": _clean_text(s["command"])[:200],
+                    "running": tid not in finished,
+                    "output_tail": tail})
+    return out
+
+
+def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0):
     """Office (working) vs kitchen (waiting), decided by TURN STATE + rollups.
 
     Working when the latest turn is still in progress, OR a background subagent
-    was written very recently (multitask: parent idle, worker running). Either way
-    a turn that has been completely silent past the staleness cap is considered
-    abandoned and sent to the kitchen so it can't occupy a desk indefinitely.
+    was written very recently (multitask: parent idle, worker running), OR a dynamic
+    Workflow's files were written very recently (the Workflow tool returns immediately
+    after launch, so the parent's own turn ends while its subagents are still running).
+    Either way a turn completely silent past the staleness cap is considered abandoned
+    and sent to the kitchen so it can't occupy a desk indefinitely.
 
     Computed fresh per request (depends on wall-clock vs the rolled-up mtimes).
     """
     now = time.time()
-    if (now - eff_mtime) > WORKING_STALE_CAP_SECONDS:
+    eff = max(eff_mtime, wf_latest or 0.0)
+    if (now - eff) > WORKING_STALE_CAP_SECONDS:
         return False
     if turn_in_progress:
+        # a turn that owes a PLAIN reply (Claude turn-kind "reply") but has been silent a long
+        # time is stuck/abandoned mid-turn -> idle. Mid-tool turns ("tool"/generic truthy) can
+        # legitimately be silent for one long tool call, so they keep the far-out stale cap.
+        if turn_in_progress == "reply" and (now - eff) > REPLY_STALE_SECONDS:
+            return False
         return True
     latest_sub = _latest_sub_mtime(sub_files)
-    return bool(latest_sub) and (now - latest_sub) <= SUBAGENT_ACTIVE_SECONDS
+    if latest_sub and (now - latest_sub) <= SUBAGENT_ACTIVE_SECONDS:
+        return True
+    # a dynamic Workflow whose journal / agent transcripts were touched within the
+    # freshness window keeps the parent "working" even though its own turn has ended.
+    return bool(wf_latest) and (now - wf_latest) <= SUBAGENT_ACTIVE_SECONDS
 
 
 def _rel_time(seconds_ago):
@@ -558,6 +732,10 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "preview": (task_full[:360].rstrip() + (" ..." if len(task_full) > 360 else "")) or title,
         "latest": latest_short or title,
         "latest_kind": latest_kind,
+        # for the hover card: the last tool used (with detail) and the last text message,
+        # kept SEPARATE (the ephemeral chip only shows the short tool name).
+        "last_tool": (("%s: %s" % (latest_tool["name"], latest_tool.get("detail", ""))).strip().rstrip(":") if latest_tool else ""),
+        "last_message": ((latest_response[:360].rstrip() + (" ..." if len(latest_response) > 360 else "")) if latest_response else ""),
         "message_count": msg_count,
         "mtime": mtime,
         "last_activity_rel": _rel_time(time.time() - mtime),
@@ -674,9 +852,14 @@ def _normalize_events_claude(path):
                             })
                         elif btype == "tool_result":
                             is_tool_result = True
-                if role == "user" and not scheduled:
+                injected = False
+                if role == "user":
                     joined = "\n".join(texts)  # raw, before tags are stripped
-                    if "<scheduled-task" in joined:
+                    # slash-command echoes, local-command output, task notifications,
+                    # system reminders and caveats are appended as user-role lines but
+                    # are NOT a real user turn -- flag them so turn-detection can skip them.
+                    injected = _is_injected_user_text(joined)
+                    if not scheduled and "<scheduled-task" in joined:
                         scheduled = True
                         m = re.search(r'name="([^"]+)"', joined)
                         if m:
@@ -686,6 +869,7 @@ def _normalize_events_claude(path):
                     "text": _clean_text("\n\n".join(texts)),
                     "tools": tools,
                     "is_tool_result": is_tool_result,
+                    "injected": injected,
                 })
     except Exception:
         pass
@@ -701,10 +885,86 @@ def _turn_in_progress_claude(events):
     for e in reversed(events):
         if e["kind"] not in ("user", "assistant"):
             continue
-        if e["kind"] == "assistant" and e["text"] and not e["tools"]:
-            return False  # delivered a final response -> waiting on the user
-        return True       # anything else -> mid-turn
-    return False          # no conversation yet
+        # injected/automated user-role lines (system reminders, task notifications,
+        # slash-command echoes, local-command output, caveats) are appended AFTER the
+        # final answer -- they are not a real user turn. Skip them, or a finished
+        # session would look mid-turn (stuck working at a desk) forever.
+        if e["kind"] == "user" and e.get("injected"):
+            continue
+        # a user interrupt (Ctrl-C / Esc) aborts the turn: the transcript records
+        # "[Request interrupted by user...]" and nothing runs after it until the user
+        # speaks again. Treat it as a turn boundary -> waiting, not stuck-working forever.
+        if e["kind"] == "user" and (e["text"] or "").lstrip().startswith("[Request interrupted by user"):
+            return ""
+        if e["kind"] == "assistant":
+            if e["text"] and not e["tools"]:
+                return ""      # delivered a final response -> done, waiting on the user
+            return "tool"      # a pending tool_use (may run a long time) -> mid-tool
+        # a user event that is a tool result awaits the model -> also mid-tool
+        if e.get("is_tool_result"):
+            return "tool"
+        return "reply"         # a plain user message with no reply yet -> agent owes a reply
+    return ""                  # no conversation yet
+
+
+# user-role transcript lines that aren't something the user actually typed: slash commands,
+# local command output, task notifications, system reminders, and the local-command caveat.
+_INJECTED_USER_PREFIXES = (
+    "<command-name>", "<command-message>", "<command-args>", "<command-contents>",
+    "<local-command-stdout>", "<local-command-stderr>",
+    "<task-notification>", "<system-reminder>", "<user-prompt-submit-hook>",
+    "<bash-input>", "<bash-stdout>", "<bash-stderr>",
+    "[system notification",
+    "caveat: the messages below were generated by the user while running",
+)
+_TRAILING_INJECT_RE = re.compile(
+    r"\n\s*<(?:system-reminder|command-|local-command|task-notification|bash-)", re.IGNORECASE)
+
+
+def _is_injected_user_text(text):
+    return (text or "").lstrip().lower().startswith(_INJECTED_USER_PREFIXES)
+
+
+def _last_user_instruction(path):
+    """Most recent genuine user instruction from a Claude transcript: the last user-role
+    text block that is NOT a tool result and NOT injected/automated content (slash commands,
+    command output, task notifications, system reminders, caveats). Any injected block the
+    harness appended after a real message is trimmed off the end."""
+    result = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"user"' not in line:            # cheap pre-filter (user lines only)
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                m = o.get("message") or {}
+                if (o.get("role") or m.get("role")) != "user":
+                    continue
+                c = m.get("content")
+                if c is None:
+                    c = o.get("content")
+                if isinstance(c, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                    continue                        # tool output, not a typed message
+                txt = ""
+                if isinstance(c, str):
+                    txt = c
+                elif isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            txt += b.get("text", "")
+                txt = txt.strip()
+                if not txt or _is_injected_user_text(txt):
+                    continue
+                txt = _TRAILING_INJECT_RE.split(txt, 1)[0].strip()   # drop appended reminders
+                if txt:
+                    result = txt
+    except OSError:
+        pass
+    return result
 
 
 def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
@@ -753,6 +1013,15 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
         latest_kind = "task"
     latest_short = latest_activity[:360].rstrip() + (" ..." if len(latest_activity) > 360 else "")
 
+    # the most recent real thing the user typed (skip tool-result / system turns) --
+    # shown as "Last instruction" alongside the agent's own latest activity.
+    last_instruction = _last_user_instruction(path)
+    last_instruction = _strip_leading_timestamp(last_instruction) or last_instruction
+    if len(last_instruction) > 200:
+        last_instruction = last_instruction[:200].rstrip() + " ..."
+
+    usage = _claude_usage(path)
+
     result = {
         "id": uuid,
         "source": "claude",
@@ -766,7 +1035,15 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "preview": (task_full[:360].rstrip() + (" ..." if len(task_full) > 360 else "")) or title,
         "latest": latest_short or title,
         "latest_kind": latest_kind,
+        # hover card: last tool used (with detail) + last text message, kept SEPARATE
+        # (the ephemeral chip only shows the short tool name).
+        "last_tool": (("%s: %s" % (latest_tool["name"], latest_tool.get("detail", ""))).strip().rstrip(":") if latest_tool else ""),
+        "last_message": ((latest_response[:360].rstrip() + (" ..." if len(latest_response) > 360 else "")) if latest_response else ""),
+        "last_instruction": last_instruction,
         "message_count": msg_count,
+        "model": usage["model"],
+        "tokens": usage["tokens"],
+        "spend": usage["spend"],
         "mtime": mtime,
         "last_activity_rel": _rel_time(time.time() - mtime),
         "_full": False,
@@ -856,6 +1133,338 @@ def discover_claude_transcripts():
         yield uuid, project, jsonl, eff_mtime, sf
 
 
+# --------------------------------------------------------------------------------------
+# Per-session usage: model, token throughput, rough $ spend  (Claude transcripts)
+# --------------------------------------------------------------------------------------
+
+def _model_family(model_id):
+    m = (model_id or "").lower()
+    if "opus" in m:
+        return "opus"
+    if "sonnet" in m:
+        return "sonnet"
+    if "haiku" in m:
+        return "haiku"
+    return None
+
+
+def _pretty_model(model_id):
+    """'claude-opus-4-8' -> 'Opus 4.8'; unknown ids returned as-is."""
+    fam = _model_family(model_id)
+    if not fam:
+        return model_id or ""
+    label = fam.capitalize()
+    ver = re.search(r"(\d+)[-.](\d+)", model_id or "")
+    return f"{label} {ver.group(1)}.{ver.group(2)}" if ver else label
+
+
+def _claude_usage(path):
+    """One raw scan of a Claude transcript: latest model, cumulative token throughput
+    (input+output+cache) and a best-effort $ spend estimate from _MODEL_PRICING."""
+    model_id = ""
+    total = 0
+    spend = 0.0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line and '"model"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                msg = o.get("message") or {}
+                if not (o.get("type") == "assistant" or msg.get("role") == "assistant"):
+                    continue
+                if msg.get("model"):
+                    model_id = msg["model"]
+                u = msg.get("usage") or {}
+                it = u.get("input_tokens") or 0
+                ot = u.get("output_tokens") or 0
+                cr = u.get("cache_read_input_tokens") or 0
+                cw = u.get("cache_creation_input_tokens") or 0
+                total += it + ot + cr + cw
+                fam = _model_family(msg.get("model") or model_id)
+                if fam:
+                    pin, pout = _MODEL_PRICING[fam]
+                    spend += (it * pin + ot * pout + cr * pin * 0.1 + cw * pin * 1.25) / 1_000_000
+    except OSError:
+        pass
+    return {
+        "model": _pretty_model(model_id),
+        "tokens": total or None,
+        "spend": round(spend, 2) if spend else None,
+    }
+
+
+# --------------------------------------------------------------------------------------
+# Dynamic Workflow (the Workflow tool) discovery  (Claude-only, like the transcripts)
+# --------------------------------------------------------------------------------------
+
+def _find_workflow_script(session_dir, run_id):
+    """The sibling script for a run lives at <session>/workflows/scripts/*-<run_id>.js."""
+    sdir = os.path.join(session_dir, "workflows", "scripts")
+    try:
+        for fn in os.listdir(sdir):
+            if fn.endswith(run_id + ".js"):
+                return os.path.join(sdir, fn)
+    except OSError:
+        pass
+    return None
+
+
+def _parse_workflow_script(script_path):
+    """Best-effort regex-extract of the script's `export const meta = {...}` literal:
+    name, description and phase titles (capped). Never load-bearing -- always a fallback."""
+    try:
+        st = os.stat(script_path)
+    except OSError:
+        return {}
+    cached = _WORKFLOW_SCRIPT_CACHE.get(script_path)
+    if cached and cached[0] == st.st_mtime:
+        return cached[1]
+    meta = {"name": "", "description": "", "phases": []}
+    try:
+        with open(script_path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(20000)
+        m = re.search(r"name:\s*['\"]([^'\"]+)['\"]", head)
+        if m:
+            meta["name"] = m.group(1)
+        m = re.search(r"description:\s*['\"]([^'\"]+)['\"]", head)
+        if m:
+            meta["description"] = m.group(1)
+        block = re.search(r"phases:\s*\[(.*?)\]", head, re.S)
+        if block:
+            for pm in re.finditer(r"title:\s*['\"]([^'\"]+)['\"]", block.group(1)):
+                meta["phases"].append({"title": pm.group(1)})
+                if len(meta["phases"]) >= 12:
+                    break
+    except OSError:
+        pass
+    _WORKFLOW_SCRIPT_CACHE[script_path] = (st.st_mtime, meta)
+    return meta
+
+
+def _workflow_identities(uuid, jsonl_path, mtime):
+    """Scan the PARENT transcript for `toolUseResult` blobs of launched local workflows,
+    returning {runId: {name, summary, scriptPath}}. Cached by parent mtime."""
+    cached = _WORKFLOW_IDENTITY_CACHE.get(uuid)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    out = {}
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "local_workflow" not in line:   # cheap pre-filter before json.loads
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                tur = o.get("toolUseResult")
+                if isinstance(tur, dict) and tur.get("taskType") == "local_workflow":
+                    rid = tur.get("runId")
+                    if rid:
+                        out[rid] = {
+                            "name": tur.get("workflowName") or "",
+                            "summary": tur.get("summary") or "",
+                            "scriptPath": tur.get("scriptPath") or "",
+                        }
+    except OSError:
+        pass
+    _WORKFLOW_IDENTITY_CACHE[uuid] = (mtime, out)
+    return out
+
+
+def _workflow_progress(run_dir):
+    """Parse a run's journal.jsonl into {total, done, running, active[], latest_mtime,
+    had_retries}. Logical tasks are keyed by the journal ``key`` (not agentId) so a retried
+    task collapses to one; a task is counted RUNNING only when it has a started event, no
+    result, AND its freshest agent-<id>.jsonl was written within SUBAGENT_ACTIVE_SECONDS --
+    a started-with-no-result whose transcript went cold long ago died/finished silently and
+    must not show as running. Journal parse cached by (mtime, size); freshness refreshed
+    cheaply each call."""
+    journal = os.path.join(run_dir, "journal.jsonl")
+    try:
+        st = os.stat(journal)
+    except OSError:
+        return {"total": 0, "done": 0, "running": 0, "active": [], "latest_mtime": 0.0, "had_retries": False}
+    cache_key = (st.st_mtime, st.st_size)
+    cached = _WORKFLOW_JOURNAL_CACHE.get(run_dir)
+    if cached and cached[0] == cache_key:
+        base = cached[1]
+    else:
+        started_keys, result_keys, key_agents = set(), set(), {}
+        n_started = 0
+        try:
+            with open(journal, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    k = o.get("key"); aid = o.get("agentId"); t = o.get("type")
+                    if not k or not aid:
+                        continue
+                    if t == "started":
+                        n_started += 1
+                        started_keys.add(k)
+                        key_agents.setdefault(k, []).append(aid)
+                    elif t == "result":
+                        result_keys.add(k)
+        except OSError:
+            started_keys, result_keys, key_agents, n_started = set(), set(), {}, 0
+        base = {
+            "total": len(started_keys),
+            "done": len(started_keys & result_keys),
+            "open_keys": [k for k in started_keys if k not in result_keys],
+            "key_agents": key_agents,
+            "had_retries": n_started != len(started_keys),
+        }
+        _WORKFLOW_JOURNAL_CACHE[run_dir] = (cache_key, base)
+    now = time.time()
+    latest = st.st_mtime
+    running_fresh = 0
+    active = []
+    for k in base["open_keys"]:
+        best_am, best_aid = None, None
+        for aid in base["key_agents"].get(k, []):
+            ap = os.path.join(run_dir, "agent-%s.jsonl" % aid)
+            try:
+                am = os.path.getmtime(ap)
+            except OSError:
+                continue
+            if am > latest:
+                latest = am
+            if best_am is None or am > best_am:
+                best_am, best_aid = am, aid
+        if best_am is None or (now - best_am) > SUBAGENT_ACTIVE_SECONDS:
+            continue   # never written, or went cold -> died/finished without a result
+        running_fresh += 1
+        if len(active) < 6:
+            ap = os.path.join(run_dir, "agent-%s.jsonl" % best_aid)
+            act_txt, act_kind = _last_activity(ap)
+            active.append({"type": "workflow-subagent", "detail": _first_user_text(ap)[:140],
+                           "id": best_aid, "last_msg": act_txt[:160], "last_kind": act_kind, "ts": best_am})
+    return {
+        "total": base["total"],
+        "done": base["done"],
+        "running": running_fresh,
+        "active": active,
+        "latest_mtime": latest,
+        "had_retries": base["had_retries"],
+    }
+
+
+def _phase_states(phases, total, done, running, counts, trustworthy):
+    """Colour an ordered phase list done/active/pending. Phases complete strictly in order
+    (each phase is fully awaited before the next), so overall progress maps monotonically
+    onto the stepper. When `trustworthy` (exact per-phase counts known and consistent) we
+    greedily fill done-then-running across the counts for real per-phase (done, running,
+    count); otherwise we only highlight the single phase the overall fraction lands in and
+    print NO per-phase number (fabricating one would be dishonest -- per-phase counts are
+    not recoverable from disk for most runs)."""
+    k = len(phases)
+    states = ["pending"] * k
+    if k == 0:
+        return states, None
+    if trustworthy and counts and sum(counts) == total:
+        rd, rr, per = done, running, []
+        for c in counts:
+            d = min(c, rd); rd -= d
+            r = min(c - d, rr); rr -= r
+            per.append((d, r, c))
+        for i, (d, r, c) in enumerate(per):
+            states[i] = "done" if (c > 0 and d == c) else ("active" if (d > 0 or r > 0) else "pending")
+        return states, per
+    if total and running == 0 and done >= total:
+        return ["done"] * k, None
+    idx = 0 if not total else min(k - 1, int((done / max(total, 1)) * k))
+    for i in range(k):
+        states[i] = "done" if i < idx else ("active" if i == idx else "pending")
+    return states, None
+
+
+def _discover_workflow_runs(uuid, jsonl_path, mtime, session_dir):
+    """(display_runs, wf_latest) for a Claude session. display_runs are the runs that are
+    currently running or finished within WORKFLOW_FRESH_SECONDS (running first, then by
+    size); wf_latest is the freshest write across ALL runs (drives working/kitchen)."""
+    wf_root = os.path.join(session_dir, "subagents", "workflows")
+    if not os.path.isdir(wf_root):
+        return [], 0.0
+    try:
+        names = os.listdir(wf_root)
+    except OSError:
+        return [], 0.0
+    identities = None
+    runs = []
+    wf_latest = 0.0
+    for name in names:
+        if not name.startswith("wf_"):
+            continue
+        run_dir = os.path.join(wf_root, name)
+        if not os.path.isdir(run_dir):
+            continue
+        prog = _workflow_progress(run_dir)
+        wf_latest = max(wf_latest, prog["latest_mtime"])   # must stay BEFORE the gate (feeds _is_working)
+        if prog["running"] <= 0:      # only show a run that has a genuinely-live agent right now
+            continue
+        if identities is None:
+            identities = _workflow_identities(uuid, jsonl_path, mtime)
+        ident = identities.get(name, {})
+        wname = ident.get("name") or ""
+        summary = ident.get("summary") or ""
+        meta = {}
+        script_path = ident.get("scriptPath") or _find_workflow_script(session_dir, name)
+        if script_path:
+            meta = _parse_workflow_script(script_path)
+            wname = wname or meta.get("name") or ""
+            summary = summary or meta.get("description") or ""
+        phases = meta.get("phases") or []
+        # honest phase stepper: colour each phase done/active/pending from overall logical
+        # progress. Real per-phase counts are NOT recoverable from disk, so they appear only
+        # when a strict trust gate proves them (currently never -- counts stay None). See
+        # _phase_states.
+        counts = [p.get("count") for p in phases]
+        have_counts = len(counts) > 0 and all(c is not None for c in counts)
+        trustworthy = (have_counts and not meta.get("dynamic")
+                       and not prog["had_retries"]
+                       and sum(c for c in counts) == prog["total"] and prog["total"] > 0)
+        states, per = _phase_states(phases, prog["total"], prog["done"], prog["running"],
+                                    counts if have_counts else None, trustworthy)
+        enriched = []
+        for i, p in enumerate(phases):
+            e = {"title": p.get("title", ""), "detail": p.get("detail", ""), "state": states[i]}
+            if per is not None:
+                d, r, c = per[i]
+                e["done"], e["running"], e["count"] = d, r, c
+            enriched.append(e)
+        phases = enriched
+        if not wname:
+            wname = name
+        runs.append({
+            "runId": name,
+            "name": wname,
+            "summary": summary,
+            "phases": phases,
+            "phase_trusted": per is not None,
+            "total": prog["total"],
+            "done": prog["done"],
+            "running": prog["running"],
+            "active": prog["active"],
+        })
+    runs.sort(key=lambda r: (0 if r["running"] > 0 else 1, -r["total"]))
+    return runs, wf_latest
+
+
+def _session_dir_for(path):
+    """The session subdir (holding subagents/ and workflows/) for a parent transcript."""
+    return path[:-len(".jsonl")] if path.endswith(".jsonl") else path
+
+
 # Registry so get_agents / list_projects / get_agent_detail can walk every source
 # uniformly. Each entry: (source_name, discover_fn, parse_fn).
 _SOURCES = [
@@ -891,13 +1500,32 @@ def get_agents(hours, full=False, project_filter=None, sources=None):
             a = parse(uuid, project, path, mtime, sub_files=_sub_files, full=full)
             if not _project_matches(project_filter, project, a["project"]):
                 continue
+            # dynamic Workflow tents (Claude only) + their freshness (keeps a parent at a
+            # desk while its workflow subagents run, even though its own turn has ended).
+            if SHOW_WORKFLOWS and _src == "claude":
+                wf_runs, wf_latest = _discover_workflow_runs(uuid, path, mtime, _session_dir_for(path))
+            else:
+                wf_runs, wf_latest = [], 0.0
+            a["workflows"] = wf_runs
+            a["wf_running_agents"] = sum(r["running"] for r in wf_runs)
             # recompute status fresh each request: parse is cached, but working/
             # kitchen depends on wall-clock (the staleness cap + subagent freshness)
             # vs the turn state, so it can change even when the transcript hasn't.
-            a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files) else "waiting"
+            a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files, wf_latest) else "waiting"
+            # parent is "self active" only while its OWN turn is in progress; when it's merely
+            # working because a subagent/workflow is live, the desk should stop typing (item 8).
+            a["self_active"] = bool(a.get("turn_in_progress")) and a["status"] == "working"
             a["last_activity_rel"] = _rel_time(time.time() - mtime)
             a["subagents"] = _subagent_infos(_sub_files)   # running subagents -> little helpers
             a["subs"] = len(a["subagents"])
+            # open background shells (Claude only) -> little terminal windows. A background
+            # shell survives the turn, so show it whether the chat is at a desk (working) or
+            # in the kitchen (waiting) -- but not for archived/beach agents. Only genuinely-
+            # running ones become sprites.
+            if _src == "claude" and a["status"] in ("working", "waiting"):
+                a["shells"] = [s for s in _open_shells_claude(path) if s["running"]][:3]
+            else:
+                a["shells"] = []
             agents.append(a)
     agents.sort(key=lambda a: a["mtime"], reverse=True)
     return agents
@@ -924,47 +1552,139 @@ def get_agent_detail(uuid):
         for u, project, path, mtime, _sub_files in discover():
             if u == uuid:
                 d = parse(uuid, project, path, mtime, sub_files=_sub_files, full=True)
-                d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files) else "waiting"
+                if SHOW_WORKFLOWS and _src == "claude":
+                    wf_runs, wf_latest = _discover_workflow_runs(uuid, path, mtime, _session_dir_for(path))
+                else:
+                    wf_runs, wf_latest = [], 0.0
+                d["workflows"] = wf_runs
+                d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files, wf_latest) else "waiting"
                 d["last_activity_rel"] = _rel_time(time.time() - mtime)
                 d["subagents"] = _subagent_infos(_sub_files)
                 d["subs"] = len(d["subagents"])
+                d["shells"] = ([s for s in _open_shells_claude(path) if s["running"]][:3]
+                               if _src == "claude" else [])
                 return d
     return None
 
 
 def demo_agents():
     now = time.time()
-    subs_a = [{"type": "code-reviewer", "detail": "Review the working diff for bugs"},
-              {"type": "test-runner", "detail": "Run the unit test suite"}]
-    subs_e = [{"type": "explorer", "detail": "Map the ORM query paths"},
-              {"type": "db-analyst", "detail": "EXPLAIN the slow orders query"},
-              {"type": "doc-writer", "detail": "Draft the fix summary"}]
+    # working agents / their live helpers occasionally "say" a new thing; each gets its own
+    # slow, staggered clock so the office shows the odd bubble popping -- not a wall of them.
+    def _blip(off, period=15):
+        return int((now + off) // period)
+    subs_a = [{"type": "general-purpose", "detail": "Review the working diff for bugs",
+               "id": "demoA-0", "last_msg": "Grep: export path (%d)" % _blip(0), "last_kind": "tool", "ts": now},
+              {"type": "test-runner", "detail": "Run the unit test suite",
+               "id": "demoA-1", "last_msg": "unit suite green, pass %d" % _blip(5), "last_kind": "assistant", "ts": now}]
+    subs_e = [{"type": "explorer", "detail": "Map the ORM query paths",
+               "id": "demoE-0", "last_msg": "Read: orders.py (%d)" % _blip(2), "last_kind": "tool", "ts": now},
+              {"type": "db-analyst", "detail": "EXPLAIN the slow orders query",
+               "id": "demoE-1", "last_msg": "Bash: EXPLAIN ANALYZE (%d)" % _blip(8), "last_kind": "tool", "ts": now},
+              {"type": "doc-writer", "detail": "Draft the fix summary",
+               "id": "demoE-2", "last_msg": "drafting summary v%d" % _blip(12), "last_kind": "assistant", "ts": now}]
+    wf_demo = [{
+        "runId": "wf_demo01",
+        "name": "exhaustive-security-audit",
+        "summary": "Fan out finders across every subsystem, then adversarially verify each finding before reporting",
+        "phases": [{"title": "Find", "state": "done"}, {"title": "Verify", "state": "active"},
+                   {"title": "Synthesize", "state": "pending"}],
+        "phase_trusted": False,
+        "total": 21, "done": 14, "running": 3,
+        "active": [{"type": "workflow-subagent", "detail": "Verify the auth-bypass finding",
+                    "id": "demoW-0", "last_msg": "auth-bypass looks real (%d)" % _blip(3), "last_kind": "assistant", "ts": now},
+                   {"type": "workflow-subagent", "detail": "Refute the SSRF candidate",
+                    "id": "demoW-1", "last_msg": "Edit: sanitizer.py (%d)" % _blip(9), "last_kind": "tool", "ts": now},
+                   {"type": "workflow-subagent", "detail": "Check the deserialization sink",
+                    "id": "demoW-2", "last_msg": "WebFetch: cve database (%d)" % _blip(14), "last_kind": "tool", "ts": now}],
+    }]
     samples = [
-        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a),
-        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude", False, []),
-        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor", False, []),
-        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude", False, []),
-        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude", False, subs_e),
-        ("demo-ffff-0006", "waiting", "Daily production error monitor", 9000, "claude", True, []),
-        ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True, []),
+        ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a, []),
+        ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude", False, [], []),
+        ("demo-cccc-0003", "waiting", "Why is this record showing up as archived?", 1800, "cursor", False, [], []),
+        ("demo-dddd-0004", "waiting", "Write tests for the CSV importer", 5400, "claude", False, [], []),
+        ("demo-eeee-0005", "working", "Investigate slow query on the orders table", 300, "claude", False, subs_e, []),
+        ("demo-hhhh-0008", "working", "Audit the payments service for vulnerabilities", 45, "claude", False, [], wf_demo),
+        ("demo-ffff-0006", "waiting", "Daily production error monitor", 9000, "claude", True, [], []),
+        ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True, [], []),
     ]
+    # demo open background shells (little terminal windows by the desk): one clean single
+    # shell, a 3-shell max case (alongside helper dwarves), and a 2-shell case (alongside a
+    # workflow easel) so QA covers coexistence with both neighbours.
+    demo_shells = {
+        "demo-bbbb-0002": [
+            {"id": "sh-b1", "command": "npm run dev -- --port 3000", "running": True,
+             "output_tail": "VITE ready in 431 ms / ➜ Local: http://localhost:3000/"}],
+        "demo-eeee-0005": [
+            {"id": "sh-e1", "command": "python manage.py runserver 0.0.0.0:8000", "running": True,
+             "output_tail": "Watching for file changes with StatReloader / System check identified no issues"},
+            {"id": "sh-e2", "command": "tail -f logs/orders-slow.log", "running": True,
+             "output_tail": "SELECT * FROM orders WHERE status=? (1.83s) / slow query logged"},
+            {"id": "sh-e3", "command": "redis-server --port 6380", "running": True,
+             "output_tail": "Ready to accept connections tcp"}],
+        "demo-hhhh-0008": [
+            {"id": "sh-h1", "command": "docker compose up payments", "running": True,
+             "output_tail": "payments-1  | Listening on :9099"},
+            {"id": "sh-h2", "command": "python3 -m http.server 8080", "running": True,
+             "output_tail": "Serving HTTP on 0.0.0.0 port 8080 ..."}],
+        # a WAITING (kitchen) agent with a live shell -> exercises kitchen-shell rendering
+        "demo-dddd-0004": [
+            {"id": "sh-d1", "command": "pytest -q --looponfail tests/importer", "running": True,
+             "output_tail": "watching for changes... / 12 passed in 0.42s"}],
+    }
     out = []
-    for uuid, status, title, ago, source, scheduled, subagents in samples:
+    for idx, (uuid, status, title, ago, source, scheduled, subagents, workflows) in enumerate(samples):
+        # a WORKING agent that is actually typing (no helpers) alternates between writing text
+        # (white bubble) and running a tool (dark chip) on its own slow clock; a delegating
+        # parent (turn ended, dwarves running) and waiting agents keep a static last line so
+        # only their dwarves pop indicators. Nothing syncs up -> the odd bubble/chip, not a wall.
+        active_typing = status == "working" and not subagents and not workflows
+        if active_typing:
+            phase = _blip(idx * 4, 13)
+            if phase % 2:
+                tool = ["Edit", "Bash", "Grep", "Read"][idx % 4]
+                latest = "%s: %s.py [%d]" % (tool, title.split()[0].lower(), phase)
+                lkind = "tool"
+            else:
+                latest = "Reviewing the latest changes about " + title.split()[0].lower() + " [%d]" % phase
+                lkind = "assistant"
+        else:
+            latest = ("Working with helpers on " + title.split()[0].lower()) if status == "working" \
+                     else "Wrapped up -- waiting for your next instruction."
+            lkind = "assistant"
+        # a fresh user instruction lands on a working agent every so often (staggered, slow) ->
+        # the boss walks over to a desk to deliver it. Waiting agents keep their original ask.
+        last_instr = ((("can you also cover the empty case?", "please add a test for this",
+                        "make sure it handles nulls too", "ship it once CI is green",
+                        "rename that so it reads clearer")[_blip(idx * 9, 34) % 5])
+                      if status == "working" else "Please " + title[0].lower() + title[1:])
         out.append({
             "id": uuid,
             "source": source,
             "scheduled": scheduled,
             "subagents": subagents,
             "subs": len(subagents),
+            "shells": demo_shells.get(uuid, []),
+            "workflows": workflows,
+            "wf_running_agents": sum(w["running"] for w in workflows),
+            # a working parent that has helpers/workflows running is NOT typing itself
+            # (its own turn ended) -> demonstrates the frozen-desk animation (item 8).
+            "self_active": status == "working" and not subagents and not workflows,
             "name": _name_for(uuid),
             "variant": _variant_for(uuid),
             "project": "demo-office",
             "status": status,
             "title": title,
             "preview": title,
-            "latest": ("Reviewing the latest changes and preparing a response about: " + title),
-            "latest_kind": "assistant",
+            "latest": latest,
+            "latest_kind": lkind,
+            "last_tool": ["Bash: pytest -q tests/", "Edit: service.py", "Grep: export path", "Read: config.yaml"][idx % 4],
+            "last_message": latest if lkind == "assistant" else ("Reviewing the changes about " + title.split()[0].lower()),
+            "last_instruction": last_instr,
             "message_count": 12,
+            "model": "Opus 4.8" if source == "claude" else None,
+            "tokens": (1_240_000 if source == "claude" else None),
+            "spend": (3.42 if source == "claude" else None),
             "mtime": now - ago,
             "last_activity_rel": _rel_time(ago),
             "demo": True,
@@ -1000,7 +1720,7 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Cursor Office</title>
+<title>Agent Office</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
 <style>
@@ -1023,11 +1743,11 @@ PAGE = r"""<!DOCTYPE html>
     font-size:11px;color:#5a564d;letter-spacing:1px;}
   #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
     box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
-  #brand #celebrate,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+  #brand #celebrate,#brand #whip,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
     background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
-  #brand #celebrate:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
-  #brand #celebrate:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
-  #brand #sound,#brand #filter,#brand #names{margin-left:8px;}
+  #brand #celebrate:hover,#brand #whip:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active,#brand #whip:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
+  #brand #sound,#brand #filter,#brand #names,#brand #whip{margin-left:8px;}
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
@@ -1037,7 +1757,7 @@ PAGE = r"""<!DOCTYPE html>
   #matrix .ln{height:3px;flex:1;max-width:120px;border-radius:2px;}
   #matrix .l1{background:linear-gradient(90deg,#7a1f5a,#1f3f7a);}
   #matrix .l2{background:linear-gradient(90deg,#1f3f7a,#7a1f5a);}
-  #screen{position:relative;width:100%;aspect-ratio:10/9;background:#65748d;
+  #screen{position:relative;width:100%;aspect-ratio:11/9;background:#65748d;
     border-radius:6px;overflow:hidden;}
   canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:auto;cursor:pointer;}
   #hud{position:absolute;left:0;top:0;display:flex;flex-direction:column;align-items:flex-start;
@@ -1050,6 +1770,7 @@ PAGE = r"""<!DOCTYPE html>
     width:300px;max-width:78%;white-space:normal;word-break:break-word;
     border:1px solid var(--panel-line);
     box-shadow:0 10px 26px rgba(0,0,0,.55);
+    max-height:82vh;overflow-y:auto;
     pointer-events:none;display:none;z-index:15;}
   #nametag .nt-name{font-size:13px;color:var(--ink-hi);font-weight:bold;}
   #nametag .nt-badge{display:inline-block;font-size:9px;padding:2px 7px;border-radius:4px;margin-left:7px;vertical-align:middle;}
@@ -1058,10 +1779,16 @@ PAGE = r"""<!DOCTYPE html>
   .nt-badge.src-cursor,.badge.src-cursor{background:#2b6d84;color:#eaf6fb;}
   .nt-badge.src-claude,.badge.src-claude{background:#d97757;color:#2a1409;}
   .nt-badge.scheduled,.badge.scheduled{background:#2f5fb0;color:#eaf1ff;}
+  .nt-badge.workflow,.badge.workflow{background:#6a4fb0;color:#f1eaff;}
   #nametag .nt-meta{font-size:9px;color:var(--ink-lo);margin:6px 0 8px;}
   #nametag .nt-label{font-size:8px;letter-spacing:1px;color:var(--ink-lo);text-transform:uppercase;margin-top:8px;}
   #nametag .nt-text{font-size:11px;color:var(--ink-mid);margin-top:3px;}
   #nametag .nt-hint{font-size:8px;color:var(--ink-lo);margin-top:9px;text-align:right;opacity:.85;}
+  #nametag .wf-phase{display:inline-block;padding:1px 5px;border-radius:3px;margin:2px 2px 0 0;font-size:10px;}
+  #nametag .wf-phase.done{background:#2f5d3a;color:#dff5e4;}
+  #nametag .wf-phase.active{background:#b7791f;color:#fff4dd;}
+  #nametag .wf-phase.pending{background:#33363f;color:#9aa0ab;}
+  #nametag .wf-sep{color:var(--ink-lo);margin:0 3px;}
   #legend{display:flex;gap:14px;justify-content:center;margin-top:12px;font-size:8px;color:#5a564d;}
   #legend span{display:inline-flex;align-items:center;gap:6px;}
   #legend i{width:10px;height:10px;border-radius:2px;display:inline-block;}
@@ -1103,15 +1830,17 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button><span id="clock"></span></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="whip" title="crack the whip &mdash; everyone works harder">WHIP</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button><span id="clock"></span></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
-        <canvas id="cv" width="640" height="576"></canvas>
+        <canvas id="cv" width="704" height="576"></canvas>
         <div id="hud">
           <span class="pill" id="hud-work">working: 0</span>
           <span class="pill" id="hud-wait">in kitchen: 0</span>
           <span class="pill" id="hud-beach" style="display:none">on beach: 0</span>
+          <span class="pill" id="hud-subs" style="display:none">subagents: 0</span>
+          <span class="pill" id="hud-wf" style="display:none">workflows: 0</span>
         </div>
         <div id="tip">click a worker</div>
         <div id="nametag"></div>
@@ -1155,13 +1884,16 @@ const ctx = cv.getContext('2d');
 // super-sample the actual backing store so text + art render at much higher
 // resolution and scale down crisply instead of being upscaled/blurred (esp. on
 // HiDPI / retina screens). SS is chosen from devicePixelRatio, capped for perf.
-const W = 640, H = 576;
+const W = 704, H = 576;   // 704 = 576*11/9 -> matches #screen aspect-ratio:11/9 (widened so edge desks' dwarves/easels don't clip)
 const SS = Math.min(4, Math.max(2, Math.ceil((window.devicePixelRatio||1)*2)));
 cv.width = W*SS; cv.height = H*SS;
 ctx.imageSmoothingEnabled = false;
 // global art scale: characters + desks are drawn larger (about their anchor) so
 // the rooms feel filled. ALL hitbox / hover-ring / pick() math multiplies by SC.
 const SC = 1.5;
+const BUBBLE_MS = 8200;    // speech-bubble lifetime (ms)
+const BUBBLE_FADE = 900;   // fade-out tail (ms)
+const BOSS_MS = 7200;      // how long the "boss" lingers by a desk delivering a new instruction
 // the bottom band is split: KITCHEN (waiting) on the left, BEACH (finished, resting)
 // on the right. BEACH_X is the divider; everything to its right is sand + water.
 const BEACH_X = Math.round(W*0.60);
@@ -1255,6 +1987,11 @@ let agents = [];      // raw from server
 let people = [];      // live sprites with positions
 let deskSlots = [];   // fixed office desks (always drawn; some hold a worker)
 let helperHits = [];  // per-frame hover regions for the subagent dwarves
+let workflowHits = []; // per-frame hover regions for the workflow tents
+let shellHits = [];    // per-frame hover regions for the open-shell terminal windows
+let bubbleAnchors = []; // per-frame: bubbles to draw as a screen-space overlay
+let vendSlots = [];   // per-frame click rects for the vending-machine drink slots
+let vendDrops = {};   // slot idx -> {start,col,fromX,fromY} while a can is dropping/resting
 let deskAssign = {};  // agent id -> stable desk slot index (kept across refreshes)
 let seatAssign = {};  // agent id -> stable kitchen seat index
 let beachAssign = {}; // agent id -> stable beach spot index (finished agents)
@@ -1262,7 +1999,13 @@ let hover = null;
 let detailCache = {};
 let WINDOW_HOURS = 24;
 let confetti = [];          // celebration particles (capped, auto-expire)
+let whipFx = [];            // whip-crack particles: one lash line + shock streaks (capped, auto-expire)
 let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
+let msgSeen = null;   // id -> last assistant `latest` seen (desk agents); null until first poll
+let subMsgSeen = {};  // subId -> last change-token (subagents + workflow subs)
+let subBubbles = {};  // subId -> {text,start,until} active dwarf bubbles
+let instrSeen = null; // id -> last user instruction seen (working agents); null until first poll
+let bossVisits = {};  // id -> {text,start,until} a supervisor delivering a new instruction at a desk
 let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // filter couriers (default off)
 // agents the user has marked "finished" -- they go rest on the beach until unmarked.
 // User-controlled and sticky (persisted), independent of the working/waiting status.
@@ -1273,9 +2016,10 @@ function saveFinished(){ localStorage.setItem('office_finished', JSON.stringify(
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
 // the same rAF clock so it can't drift like a stray setInterval. These critters live
 // ONLY in the animation layer: pick(), hover, confetti and polling never see them.
-let amb = { dog:null, cat:null };   // at most one of each on screen
+let amb = { dog:null, cat:null, plane:null };   // at most one of each on screen
 let nextEventAt = 0;                // performance.now() ms of the next event
 let lastEventType = null;           // avoid firing the same type twice in a row
+let nextPlaneAt = 0;                // performance.now() ms of the next window fly-by
 
 // stable kitchen floor spots (hand-placed, ≥~44px apart, CLEAR of the fridge/counter,
 // the lounge table+poufs, the couch, the REFRESH! machine and the wall signs). Used
@@ -1344,7 +2088,7 @@ function rebuild(){
   const maxSlot = Object.values(deskAssign).reduce((m,v)=>Math.max(m,v), -1);
   const need = Math.max(6, Math.ceil((maxSlot+1)/cols)*cols);
   // tighter grid sized for the bigger (SC) desks so the office reads as full
-  const left = 104, right = W-104, top = WALL_H+48, rowH = 112;
+  const left = 140, right = W-140, top = WALL_H+48, rowH = 128;   // wider insets (edge desks fit their dwarves/easels) + taller rows (more gap between the 2 rows)
   deskSlots = [];
   for(let i=0;i<need;i++){
     const c=i%cols, r=Math.floor(i/cols);
@@ -1404,6 +2148,18 @@ function rebuild(){
     }));
   });
 
+  // pair each waiting agent with its nearest kitchen neighbour (by anchor) so they can
+  // occasionally turn and chat. Recomputed every poll, so it tracks relocations.
+  const waitList = next.filter(p=>p.kind==='wait');
+  for(const p of waitList){
+    let bx=null, bd=80;                       // only pair within ~80px
+    for(const q of waitList){ if(q===p) continue;
+      const d=Math.hypot(p.home.x-q.home.x, p.home.y-q.home.y);
+      if(d<bd){ bd=d; bx=q.home.x; }
+    }
+    p.talkX = bx;   // x of the neighbour to face while chatting (null = nobody near)
+  }
+
   // beach: finished agents walk over to the sand and chill until you unmark them.
   beachers.forEach(a=>{
     const old = prevById[a.id];
@@ -1450,6 +2206,13 @@ function rebuild(){
   const hb=document.getElementById('hud-beach');
   hb.textContent = 'on beach: '+beachers.length;
   hb.style.display = beachers.length ? '' : 'none';   // only show the pill when in use
+  // running subagents + active workflow runs across all agents (only shown when in use)
+  const subCount = agents.reduce((n,a)=>n+(a.subs||0)+(a.wf_running_agents||0),0);
+  const wfCount  = agents.reduce((n,a)=>n+((a.workflows||[]).length),0);
+  const hs=document.getElementById('hud-subs');
+  hs.textContent='subagents: '+subCount; hs.style.display = subCount ? '' : 'none';
+  const hw=document.getElementById('hud-wf');
+  hw.textContent='workflows: '+wfCount; hw.style.display = wfCount ? '' : 'none';
   document.getElementById('empty').style.display = agents.length? 'none':'flex';
 }
 
@@ -1459,15 +2222,15 @@ function hash(s){let h=0;for(let i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))&0xf
 const NAME_SETS = {
   magical: { label:'MAGICAL', first:["Pip","Willow","Clover","Bun","Maple","Sprout","Waffle","Biscuit","Poppy","Mochi","Pebble","Fern","Cricket","Marshmallow","Pumpkin","Honey","Acorn","Noodle","Pickle","Sunny","Berry","Tofu","Dandelion","Bramble","Hazel","Olive","Tansy","Muffin","Peaches","Juniper"],
     last:["Sunbeam","Marshmallow","Buttercup","Honeydew","Pumpkinpatch","Snugglebee","Cloudberry","Dewdrop","Meadowlight","Gigglesworth","Cottontail","Brightbloom","Mossypaws","Tinkerwhisk","Sugarplum","Pebblebrook","Willowwisp","Honeycomb","Berrybramble","Twinkletoes","Mapleshade","Cuddleburrow","Dapplewood","Snickerdoodle","Fernwhistle"] },
-  israeli: { label:'ISRAELI', first:["Yossi","Noa","Avi","Shira","Tal","Yael","Eitan","Dana","Gal","Amit","Ronen","Ori","Roni","Maya","Itai","Nadav","Liron","Chen","Bar","Shani","Adi","Yarden","Omer","Hila","Lior","Guy","Tomer","Inbal","Doron","Sivan","Ziv","Nir","Gil","Rotem","Yuval","Moshe","Sagi","Dvir","Ayelet","Almog"],
-    last:["Cohen","Levi","Mizrahi","Peretz","Biton","Dahan","Avraham","Friedman","Katz","Azoulay","Ben-David","Shapira","Bar-On","Malka","Gabai","Segal","Hadad","Barak","Regev","Ohayon","Amar","Klein","Ashkenazi","Elbaz","Tzur","Sasson","Vaknin","Nachmani","Aloni","Shalev"] },
+  israeli: { label:'ISRAELI', first:["Yossi","Noa","Avi","Shira","Tal","Yael","Eitan","Dana","Gal","Amit","Ronen","Ori","Roni","Maya","Itai","Nadav","Liron","Chen","Bar","Shani","Adi","Yarden","Omer","Hila","Lior","Guy","Tomer","Inbal","Doron","Sivan","Ziv","Nir","Gil","Rotem","Yuval","Moshe","Sagi","Dvir","Ayelet","Almog","Oren","Carin-Belle"],
+    last:["Cohen","Levi","Mizrahi","Peretz","Biton","Dahan","Avraham","Friedman","Katz","Azoulay","Ben-David","Shapira","Bar-On","Malka","Gabai","Segal","Hadad","Barak","Regev","Ohayon","Amar","Klein","Ashkenazi","Elbaz","Tzur","Sasson","Vaknin","Nachmani","Aloni","Shalev","Yomtov","Feder"] },
   dev: { label:'DEV', first:["Segfault","Captain","Null","Sudo","Regex","Commit","Legacy","Hotfix","Boolean","Async","Cache","Merge","Kernel","Turbo","Lazy","Quantum","Rusty","Vim","Recursive","Undefined","Docker","Bcrypt"],
     last:["Overflow","Pointer","Deploy","Nullson","Bugsley","Pushington","Bytewise","Loopy","Debugger","Refactor","O'Reilly","McStacktrace","von Merge","Yeetson","Hashimoto","Snippets","Ramsson","Kernelson","Rebase","Semicolon","Payload","Heapman"] },
   robots: { label:'ROBOTS', first:["Unit","Servo","Chip","Proto","Mecha","Robo","Nano","Giga","Auto","Cy","Zeta","Beep","Clank","Data","Pixel","Opti","Turbo","Volt","Gizmo","Sprocket","Bolt","Widget"],
     last:["Boopmatic","Cogsworth","9000","Mk-II","Whirrley","Sparkplug","Bleepson","Databyte","Clankworth","Buzzbot","Gearhart","Pixelface","Ohmson","Widgeteer","von Circuit","3000","Beepson","Clankstein","Rustbucket","Boltsworth","Zappenheim","Motoroni"] },
 };
 const NAME_ORDER = ['magical','israeli','dev','robots'];
-let nameStyle = localStorage.getItem('office_names'); if(!NAME_SETS[nameStyle]) nameStyle='magical';
+let nameStyle = localStorage.getItem('office_names'); if(!NAME_SETS[nameStyle]) nameStyle='israeli';
 function nameFor(id){ const s=NAME_SETS[nameStyle]||NAME_SETS.magical; const h=hash(id||'x');
   return s.first[h % s.first.length]+' '+s.last[(h>>>8) % s.last.length]; }
 
@@ -1493,8 +2256,17 @@ function heartBubble(x,y){
   px(x-3,y-4,3,3,PAL.pink); px(x+1,y-4,3,3,PAL.pink);        // heart lobes
   px(x-4,y-2,9,2,PAL.pink); px(x-2,y,5,2,PAL.pink); px(x,y+2,1,1,PAL.pink);
 }
+// a small speech bubble with 1-3 chat dots (kitchen small-talk)
+function talkBubble(x,y,n){
+  px(x-8,y-7,18,11,PAL.paper); px(x-8,y-7,18,1,'#ececf2'); px(x-8,y+3,18,1,'#d6d6de');
+  px(x-9,y-5,1,7,PAL.paper); px(x+10,y-5,1,7,PAL.paper);
+  px(x-3,y+4,3,3,PAL.paper); px(x-2,y+7,2,2,PAL.paper);     // little tail
+  const dk='#8a8f9c';
+  for(let i=0;i<n;i++) px(x-5+i*5,y-2,3,3,dk);              // 1..3 talk dots
+}
 
 const WALL_H = 78;
+const WIN = { x:20, y:8, w:Math.round(W*0.36), h:WALL_H-20 };  // sky-window glass rect (drawWindow args)
 
 function drawFloor(){
   const L=layout(), oh=L.office.h;
@@ -1514,7 +2286,8 @@ function drawFloor(){
   px(0,WALL_H-8,W,2,shade(PAL.wall,-.06)); px(0,WALL_H-5,W,3,PAL.trim); px(0,WALL_H-2,W,2,PAL.base);
   const winW = Math.round(W*0.36);   // slimmer window -> room for the wider board
   drawWindow(20, 8, winW, WALL_H-20);
-  drawWallDecor(20+winW+16, 6);
+  const wl = wallRowLayout();
+  drawWallDecor(wl.boardX, 6, wl.clkL, wl.shfL);
 
   // kitchen floor (warm tiles)
   for(let y=L.kitchenTop;y<H;y+=20){
@@ -1621,12 +2394,81 @@ function drawSkyline(x,y,w,h,col,hf,step,lit){
     bx+=bw+3; i++;
   }
 }
-// returns 'night' | 'dusk' | 'day' from the LOCAL computer clock (override hook for tests)
+// ---- day / dusk / night in the window, from the REAL sun position -- season- AND place-aware,
+// with NO location permission. The browser hands us the IANA time-zone name for free via Intl;
+// we map it to a representative city lat/lng (tz-database zone.tab) and compute the sun's altitude
+// locally. Nothing leaves the machine, and there is never a GPS prompt. __forceSky overrides. ----
+const TZ_COORDS = {
+  // North America
+  "America/New_York":[40.71,-74.01],"America/Detroit":[42.33,-83.05],"America/Toronto":[43.65,-79.38],
+  "America/Chicago":[41.85,-87.65],"America/Winnipeg":[49.90,-97.14],"America/Mexico_City":[19.43,-99.13],
+  "America/Denver":[39.74,-104.98],"America/Edmonton":[53.55,-113.49],"America/Phoenix":[33.45,-112.07],
+  "America/Los_Angeles":[34.05,-118.24],"America/Vancouver":[49.28,-123.12],"America/Tijuana":[32.53,-117.02],
+  "America/Anchorage":[61.22,-149.90],"America/Halifax":[44.65,-63.57],"Pacific/Honolulu":[21.31,-157.86],
+  // Central & South America
+  "America/Guatemala":[14.61,-90.53],"America/Panama":[8.98,-79.52],"America/Bogota":[4.61,-74.08],
+  "America/Lima":[-12.05,-77.04],"America/Caracas":[10.50,-66.92],"America/Santiago":[-33.45,-70.67],
+  "America/Sao_Paulo":[-23.55,-46.63],"America/Argentina/Buenos_Aires":[-34.61,-58.38],
+  // Europe
+  "Europe/London":[51.51,-0.13],"Europe/Dublin":[53.35,-6.26],"Europe/Lisbon":[38.72,-9.14],
+  "Europe/Madrid":[40.42,-3.70],"Europe/Paris":[48.85,2.35],"Europe/Brussels":[50.85,4.35],
+  "Europe/Amsterdam":[52.37,4.90],"Europe/Berlin":[52.52,13.40],"Europe/Zurich":[47.37,8.55],
+  "Europe/Rome":[41.90,12.50],"Europe/Vienna":[48.21,16.37],"Europe/Prague":[50.08,14.44],
+  "Europe/Warsaw":[52.23,21.01],"Europe/Budapest":[47.50,19.04],"Europe/Copenhagen":[55.68,12.57],
+  "Europe/Stockholm":[59.33,18.07],"Europe/Oslo":[59.91,10.75],"Europe/Helsinki":[60.17,24.94],
+  "Europe/Athens":[37.98,23.73],"Europe/Bucharest":[44.43,26.10],"Europe/Sofia":[42.70,23.32],
+  "Europe/Kyiv":[50.45,30.52],"Europe/Kiev":[50.45,30.52],"Europe/Moscow":[55.76,37.62],
+  "Europe/Istanbul":[41.01,28.98],
+  // Middle East
+  "Asia/Jerusalem":[31.78,35.22],"Asia/Tel_Aviv":[32.07,34.79],"Asia/Beirut":[33.89,35.50],
+  "Asia/Amman":[31.95,35.93],"Asia/Damascus":[33.51,36.29],"Asia/Baghdad":[33.31,44.36],
+  "Asia/Riyadh":[24.71,46.68],"Asia/Dubai":[25.20,55.27],"Asia/Qatar":[25.29,51.53],
+  "Asia/Kuwait":[29.38,47.99],"Asia/Tehran":[35.69,51.39],"Asia/Nicosia":[35.17,33.36],
+  // Africa
+  "Africa/Casablanca":[33.57,-7.59],"Africa/Algiers":[36.75,3.06],"Africa/Cairo":[30.04,31.24],
+  "Africa/Lagos":[6.52,3.38],"Africa/Nairobi":[-1.29,36.82],"Africa/Addis_Ababa":[9.03,38.74],
+  "Africa/Johannesburg":[-26.20,28.05],"Africa/Accra":[5.60,-0.19],
+  // South, Central & East Asia
+  "Asia/Karachi":[24.86,67.01],"Asia/Kolkata":[22.57,88.36],"Asia/Calcutta":[22.57,88.36],
+  "Asia/Colombo":[6.93,79.85],"Asia/Kathmandu":[27.72,85.32],"Asia/Dhaka":[23.71,90.41],
+  "Asia/Yangon":[16.87,96.20],"Asia/Bangkok":[13.75,100.52],"Asia/Ho_Chi_Minh":[10.82,106.63],
+  "Asia/Saigon":[10.82,106.63],"Asia/Jakarta":[-6.21,106.85],"Asia/Singapore":[1.29,103.85],
+  "Asia/Kuala_Lumpur":[3.14,101.69],"Asia/Manila":[14.60,120.98],"Asia/Hong_Kong":[22.32,114.17],
+  "Asia/Shanghai":[31.23,121.47],"Asia/Taipei":[25.03,121.57],"Asia/Seoul":[37.57,126.98],
+  "Asia/Tokyo":[35.68,139.65],"Asia/Almaty":[43.25,76.95],"Asia/Tashkent":[41.31,69.24],
+  "Asia/Yekaterinburg":[56.84,60.65],"Asia/Novosibirsk":[55.01,82.93],"Asia/Vladivostok":[43.12,131.89],
+  // Australia & Pacific
+  "Australia/Perth":[-31.95,115.86],"Australia/Adelaide":[-34.93,138.60],"Australia/Darwin":[-12.46,130.84],
+  "Australia/Brisbane":[-27.47,153.03],"Australia/Sydney":[-33.87,151.21],"Australia/Melbourne":[-37.81,144.96],
+  "Pacific/Auckland":[-36.85,174.76],"Pacific/Fiji":[-18.14,178.44]
+};
+function localCoords(){
+  let tz='';
+  try{ tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''; }catch(e){}
+  if(TZ_COORDS[tz]) return TZ_COORDS[tz];
+  // unknown zone: longitude from the UTC offset, equatorial latitude (a neutral ~6pm sunset)
+  return [0, -new Date().getTimezoneOffset()/4];
+}
+// sun altitude (degrees above the horizon) right now, at lat/lng. Low-precision USNO formulas
+// (good to a fraction of a degree -- ample for deciding day/dusk/night).
+function sunAltitude(date, lat, lng){
+  const rad=Math.PI/180, deg=180/Math.PI;
+  const d = date.getTime()/86400000 - 10957.5;              // days since J2000 (2000-01-01 12:00 UTC)
+  const g = ((357.529 + 0.98560028*d)%360)*rad;             // mean anomaly
+  const q = (280.459 + 0.98564736*d)%360;                   // mean longitude
+  const L = (q + 1.915*Math.sin(g) + 0.020*Math.sin(2*g))*rad;   // ecliptic longitude
+  const e = (23.439 - 0.00000036*d)*rad;                    // obliquity
+  const dec = Math.asin(Math.sin(e)*Math.sin(L));           // declination
+  const ra  = Math.atan2(Math.cos(e)*Math.sin(L), Math.cos(L))*deg;   // right ascension (deg)
+  let gmst = (18.697374558 + 24.06570982441908*d)%24; if(gmst<0) gmst+=24;
+  let ha = ((gmst*15 + lng) - ra)%360; ha=((ha+540)%360)-180;   // hour angle, folded to [-180,180]
+  return Math.asin(Math.sin(lat*rad)*Math.sin(dec) + Math.cos(lat*rad)*Math.cos(dec)*Math.cos(ha*rad))*deg;
+}
 function skyMode(){
   if(window.__forceSky) return window.__forceSky;
-  const hr=new Date().getHours();
-  if(hr>=19 || hr<6) return 'night';
-  if(hr===18 || hr===6) return 'dusk';
+  const c=localCoords(), alt=sunAltitude(new Date(), c[0], c[1]);
+  if(alt <= -6) return 'night';        // sun past civil twilight -> dark
+  if(alt <   6) return 'dusk';         // sun near the horizon -> golden dawn/dusk
   return 'day';
 }
 function drawWindow(x,y,w,h){
@@ -1652,6 +2494,8 @@ function drawWindow(x,y,w,h){
     cloud(x+w*0.16, y+h*0.20); cloud(x+w*0.44, y+h*0.12); cloud(x+w*0.70, y+h*0.26);
     drawSkyline(x,y,w,h, PAL.bldg1, 0.62, 11, false);
   }
+  // occasional airliner drifting across the sky (clipped to the glass, behind the mullions)
+  if(amb.plane){ ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip(); drawPlane(amb.plane); ctx.restore(); }
   // chunky mullions: vertical panes + one horizontal transom (dark core + light edge)
   const panes=4, pw=w/panes;
   for(let i=1;i<panes;i++){ px(x+Math.round(i*pw)-1,y,3,h,PAL.woodDk); px(x+Math.round(i*pw)-1,y,1,h,PAL.wood); }
@@ -1662,7 +2506,8 @@ function drawWindow(x,y,w,h){
 }
 
 // real, positive quotes (motivation / happiness / health) with attribution.
-// 150+ entries, majority by women -- the board shows a new one every hour.
+// 150+ entries, majority by women, plus a lighter witty/programmer-humour batch --
+// the board shows a new one every 10 minutes.
 const QUOTES = [
   ["Try to be a rainbow in someone's cloud.","Maya Angelou"],
   ["If you don't like something, change it. If you can't change it, change your attitude.","Maya Angelou"],
@@ -1822,8 +2667,29 @@ const QUOTES = [
   ["Little by little, one travels far.","J.R.R. Tolkien"],
   ["Not all those who wander are lost.","J.R.R. Tolkien"],
   ["The only place success comes before work is in the dictionary.","Vince Lombardi"],
+  // --- a lighter batch: witty / surprising / programmer-humour (all real & attributed) ---
+  ["Do not let what you cannot do interfere with what you can do.","John Wooden"],
+  ["There is no education like adversity.","Benjamin Disraeli"],
+  ["Happiness is a direction, not a place.","Sydney J. Harris"],
+  ["Trust yourself. You know more than you think you do.","Benjamin Spock"],
+  ["The greater the obstacle, the more glory in overcoming it.","Molière"],
+  ["The best way to predict the future is to invent it.","Alan Kay"],
+  ["To live is the rarest thing in the world. Most people exist, that is all.","Oscar Wilde"],
+  ["Talk is cheap. Show me the code.","Linus Torvalds"],
+  ["One of my most productive days was throwing away 1000 lines of code.","Ken Thompson"],
+  ["There are only two hard things in Computer Science: cache invalidation and naming things.","Phil Karlton"],
+  ["Debugging is twice as hard as writing the code in the first place.","Brian Kernighan"],
+  ["There are two ways to write error-free programs; only the third one works.","Alan J. Perlis"],
+  ["I love deadlines. I like the whooshing sound they make as they fly by.","Douglas Adams"],
+  ["I intend to live forever. So far, so good.","Steven Wright"],
+  ["An escalator can never break: it can only become stairs.","Mitch Hedberg"],
+  ["If it wasn't for coffee, I'd have no identifiable personality at all.","David Letterman"],
+  ["A mathematician is a device for turning coffee into theorems.","Paul Erdős"],
+  ["I'd rather take coffee than compliments just now.","Louisa May Alcott"],
+  ["Doing nothing is very hard to do; you never know when you're finished.","Leslie Nielsen"],
+  ["I work for myself, which is fun. Except when I call in sick, I know I'm lying.","Rita Rudner"],
 ];
-const QUOTE_PERIOD_MS = 3600*1000;   // a fresh quote every hour
+const QUOTE_PERIOD_MS = 600*1000;   // a fresh quote every 10 minutes
 // greedy word-wrap to a pixel width for the given canvas font
 function wrapText(text, maxW, font){
   ctx.font=font;
@@ -1834,8 +2700,22 @@ function wrapText(text, maxW, font){
   return lines;
 }
 
-function drawWallDecor(x,y){
-  // ---- inspiration board: a quote that changes every hour (whole board) ----
+// evenly space the clock (24w), bookshelf (50w) and DO GOOD WORK poster (54w) across the wall
+// to the RIGHT of the inspiration board -> equal gaps between the three, robust to canvas W.
+// Shared by drawWallDecor (clock + shelf) and drawOfficeProps (poster) so they stay in sync.
+function wallRowLayout(){
+  const boardX = 20 + Math.round(W*0.36) + 16, boardW = 210;
+  const clkW = 24, shfW = 50, posW = 54;
+  const boardRight = boardX + boardW;
+  const gap = ((W-9 - (boardRight+12)) - (clkW+shfW+posW)) / 2;   // 2 equal gaps between 3 items
+  const clkL = boardRight + 12;
+  const shfL = clkL + clkW + gap;
+  const posL = shfL + shfW + gap;
+  return { boardX, clkL, shfL, posL };
+}
+
+function drawWallDecor(x, y, clkL, shfL){
+  // ---- inspiration board: a quote that changes every 10 minutes (whole board) ----
   const bw=210, bh=58; px(x-3,y-3,bw+6,bh+6,PAL.metalDk); px(x,y,bw,bh,PAL.paper);
   px(x,y,bw,2,'#eef0f3'); px(x,y+bh-2,bw,2,'#cfcfd6'); px(x+bw-2,y,2,bh,'#dadbe0');
   ctx.textAlign='left';
@@ -1849,14 +2729,24 @@ function drawWallDecor(x,y){
   const lines=wrapText('“'+q[0]+'”', bw-18, qfont).slice(0,4);
   let qy=y+25; for(const ln of lines){ ctx.fillText(ln, x+8, qy); qy+=7; }
   ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], x+8, qy+2);
-  // ---- clean wall clock ----
-  const clx=x+bw+12, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
+  // ---- wall clock (live local time) -- x-pos comes from wallRowLayout() (even spacing) ----
+  const clx=clkL+3, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
   for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
-  ctx.strokeStyle=PAL.ink; ctx.lineWidth=1.4; ctx.beginPath();
-  ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+9,cly+4); ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+13,cly+11); ctx.stroke();
+  const ccx=clx+9, ccy=cly+9, now=new Date();
+  const hA=((now.getHours()%12)+now.getMinutes()/60)*Math.PI/6;    // 30 deg/hr + drift
+  const mA=(now.getMinutes()+now.getSeconds()/60)*Math.PI/30;      // 6 deg/min
+  const sA=now.getSeconds()*Math.PI/30;                            // 6 deg/sec
+  ctx.lineCap='round';
+  ctx.strokeStyle=PAL.ink; ctx.lineWidth=1.5; ctx.beginPath();     // hour hand (short, thick)
+  ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+4.5*Math.sin(hA), ccy-4.5*Math.cos(hA)); ctx.stroke();
+  ctx.lineWidth=1.1; ctx.beginPath();                              // minute hand (long)
+  ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+7*Math.sin(mA), ccy-7*Math.cos(mA)); ctx.stroke();
+  ctx.strokeStyle=PAL.red; ctx.lineWidth=0.7; ctx.beginPath();     // thin red second hand
+  ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+7.5*Math.sin(sA), ccy-7.5*Math.cos(sA)); ctx.stroke();
+  ctx.lineCap='butt';
   px(clx+8,cly+8,2,2,PAL.red);                                  // center hub
-  // ---- bookshelf with books + a little plant on top ----
-  const shx=clx+30, shy=y-2; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
+  // ---- bookshelf with books + a little plant on top (x-pos from wallRowLayout) ----
+  const shx=shfL+2, shy=y+12; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
   const cols=[PAL.mugA,PAL.mugB,PAL.mugC,PAL.leafDk,PAL.red,PAL.yellow,PAL.orange,'#8c5fd6'];
   for(let r=0;r<3;r++){ const ry=shy+5+r*16;
     for(let b=0;b<5;b++){ const bbh=11-((b+r)%2)*2; px(shx+4+b*8,ry+(11-bbh),6,bbh,cols[(b+r*3)%cols.length]); }
@@ -1869,8 +2759,8 @@ function drawOfficeProps(){
   const L=layout(), top=WALL_H;
   // plants flanking the window
   bigPlant(14, top+10); bigPlant(W-30, top+10);
-  // "DO GOOD WORK" poster on the office back wall (far right, above the desks)
-  drawDoGoodWork(W-60, 6);
+  // "DO GOOD WORK" poster on the office back wall -- evenly spaced with the clock + bookshelf
+  drawDoGoodWork(wallRowLayout().posL+3, 6);
 
   const lastDeskY = deskSlots.length ? Math.max.apply(null, deskSlots.map(s=>s.y)) : top+120;
   // soft rug spanning the desk area
@@ -1995,8 +2885,10 @@ function drawKitchenProps(){
   const drinks=[PAL.red,PAL.mugB,PAL.yellow,PAL.leaf,PAL.orange,PAL.pink,PAL.mugC,'#8c5fd6','#22b9b9','#e673a8','#5bc05b','#3f74d6'];
   for(let r=0;r<3;r++){ const ry=gy+4+r*17;
     px(gx+1,ry+14,gw-2,2,'#243a6a');                                                                  // shelf
-    for(let c=0;c<4;c++){ const bxv=gx+3+c*10, col=drinks[r*4+c];
-      px(bxv,ry+2,6,12,col); px(bxv,ry+2,6,2,shade(col,.32)); px(bxv+1,ry,3,3,col); } }              // bottle + cap
+    for(let c=0;c<4;c++){ const idx=r*4+c, bxv=gx+3+c*10, col=drinks[idx];
+      vendSlots.push({idx, bxv, ry, x0:bxv-1, y0:ry-1, x1:bxv+7, y1:ry+15, col});                     // click target
+      if(vendDrops[idx]) continue;                                                                    // slot empty while its can is out
+      px(bxv,ry+2,6,12,col); px(bxv,ry+2,6,2,shade(col,.32)); px(bxv+1,ry,3,3,col); } }               // bottle + cap
   px(gx+3,gy+2,2,gh-6,'rgba(255,255,255,.12)'); px(gx+8,gy+2,1,gh-6,'rgba(255,255,255,.06)');         // glass reflection
   // side panel: keypad + card reader + coin slot
   const spx=vx+48, spw=vw-(spx-vx)-4; px(spx,vy+19,spw,54,'#24407e'); px(spx,vy+19,spw,1,shade('#24407e',.3));
@@ -2005,6 +2897,14 @@ function drawKitchenProps(){
   px(spx+2,vy+55,spw-4,3,'#0a1024');                                                                  // coin slot
   // dispense slot / tray at the bottom
   px(vx+5,vy+vh-13,vw-10,9,'#0e1c44'); px(vx+7,vy+vh-11,vw-14,5,'#0a1024');
+  // clicked drinks fall from their slot into the tray, rest a few seconds, then restock (see tick())
+  const _vnow=performance.now(), trayCX=vx+vw/2-3, trayTopY=vy+vh-22;   // rest: centered, poking out of the tray
+  for(const k in vendDrops){ const dp=vendDrops[k], el=_vnow-dp.start;
+    const pf=Math.min(1, el/620), ease=pf*pf;                            // accelerate downward (gravity)
+    const cx0=dp.fromX+(trayCX-dp.fromX)*pf;                             // slide toward tray x
+    let   cy0=dp.fromY+(trayTopY-dp.fromY)*ease;                         // fall with easing
+    if(pf>=1){ const bt=Math.max(0,1-(el-620)/240); cy0-=Math.abs(Math.sin((el-620)*0.03))*4*bt; }    // small settle bounce
+    px(cx0,cy0+2,6,12,dp.col); px(cx0,cy0+2,6,2,shade(dp.col,.32)); px(cx0+1,cy0,3,3,dp.col); }        // the dispensed can
 
   // ---- lounge: BIG wood table w/ fruit bowl + two white mugs, flanked by round
   // pink poufs (bottom-left). Sized to fill the corner; agents kept clear. ----
@@ -2076,15 +2976,29 @@ function beachUmbrella(x,y){
   px(cx-27,y+22,54,1,PAL.outline);                                     // canopy rim
   px(cx-2,y+2,4,4,'#ffd34d');                                          // finial
 }
+let _sandGrains=null;                                                   // grain built once -> no per-frame flicker & no per-frame hashing
 function drawBeachFloor(){
-  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H;
-  px(x0-1,y0,2,y1-y0,shade(PAL.base,-.10));                            // divider edge
-  for(let y=y0;y<y1;y+=8) for(let x=x0;x<W;x+=8)                       // speckled sand
-    px(x,y,8,8, ((x/8+y/8)&1) ? '#efdca6' : '#e7d199');
-  for(let i=0;i<44;i++){ const sx=x0+((i*57)%(W-x0)), sy=y0+((i*89)%(y1-y0)); px(sx,sy,1,1,'rgba(150,120,60,.22)'); }
-  // water strip + foam shoreline along the far-right edge
-  const wx=W-22;
-  px(wx-3,y0,3,y1-y0,'#dcc891');                                       // damp sand
+  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H, wx=W-22;
+  const base='#e7d3a0', sandW=wx-x0, hgt=y1-y0;
+  px(x0-1,y0,2,hgt,shade(PAL.base,-.10));                              // divider edge
+  // --- dry sand: warm base + soft vertical gradient (paler/drier up near the wall) ---
+  px(x0,y0,sandW,hgt,base);
+  px(x0,y0,sandW,Math.round(hgt*0.30),shade(base,.05));               // dry top strip
+  const _by=y0+Math.round(hgt*0.74); px(x0,_by,sandW,y1-_by,shade(base,-.05)); // warmer front
+  // --- damp sand graduating toward the waterline on the right ---
+  px(wx-11,y0,11,hgt,shade(base,-.06)); px(wx-5,y0,5,hgt,shade(base,-.13)); px(wx-2,y0,2,hgt,'#cfb77c');
+  // --- fine grain: deterministic stipple, computed once from hash() (stable, no flicker) ---
+  if(!_sandGrains){
+    _sandGrains=[];
+    for(let y=y0;y<y1;y+=4) for(let x=x0;x<wx-2;x+=4){
+      const h=hash(x+'_'+y), r=h%11;
+      if(r===0)      _sandGrains.push([x,y,1,1,'rgba(120,96,52,.22)']);         // dark grain
+      else if(r===1) _sandGrains.push([x,y,1,1,'rgba(255,247,216,.30)']);       // light fleck
+      else if(r===2 && (h>>>4)%5===0) _sandGrains.push([x,y,2,1,'rgba(150,122,64,.16)']); // pebble
+    }
+  }
+  for(const g of _sandGrains) px(g[0],g[1],g[2],g[3],g[4]);
+  // --- water strip + foam shoreline along the far-right edge (unchanged) ---
   for(let y=y0;y<y1;y+=6) px(wx,y,W-wx,6, ((y/6)&1)?'#49b0c8':'#57c2d8');
   px(wx,y0,W-wx,2,'rgba(255,255,255,.40)');                            // foam
   for(let y=y0+5;y<y1;y+=14) px(wx+3,y,6,1,'rgba(255,255,255,.5)');    // ripples
@@ -2123,13 +3037,13 @@ function drawDoGoodWork(pcx, pcy){
   px(pcx-1,pcy-1,pw+2,ph+2,'#3c3c46');                       // frame bevel
   px(pcx+2,pcy+2,pw-4,ph-4,PAL.paper);                       // white mat
   px(pcx+2,pcy+2,pw-4,1,'#ffffff'); px(pcx+2,pcy+ph-3,pw-4,1,'#e2e2e8');
-  const hx=pcx+pw/2, hy=pcy+9;
+  const hx=pcx+pw/2, hy=pcy+6;
   px(hx-6,hy,4,3,PAL.pink); px(hx+2,hy,4,3,PAL.pink);
   px(hx-6,hy+3,12,2,PAL.pink); px(hx-5,hy+5,10,2,PAL.pink);
   px(hx-3,hy+7,6,2,PAL.pink);  px(hx-1,hy+9,2,1,PAL.pink);
   px(hx-5,hy+1,2,1,shade(PAL.pink,.45));
   ctx.fillStyle=PAL.ink; ctx.textAlign='center'; ctx.font='6px "Press Start 2P", monospace';
-  ctx.fillText('DO',   hx, pcy+26); ctx.fillText('GOOD', hx, pcy+35); ctx.fillText('WORK', hx, pcy+44);
+  ctx.fillText('DO',   hx, pcy+24); ctx.fillText('GOOD', hx, pcy+32); ctx.fillText('WORK', hx, pcy+40);
   ctx.textAlign='left';
 }
 
@@ -2281,13 +3195,17 @@ function drawBeachSitter(p, t){
   ro(x-7, y-26, 14, 15, sk);
   px(x-7,y-12,14,1,'rgba(0,0,0,.10)');
   drawHairAcc(x, y-24, f); drawFace(x, y-24, f, true);        // sunglasses ON (beach only)
-  if(p.agent) drawSourceTag(x, y-33, p.agent.source);
 }
 
 // a full workstation: office chair + desk + monitor + filing cabinet + plant,
 // with (optionally) a worker seated behind it, facing us. Even empty it looks furnished.
 function drawDeskPod(x, y, p, t){
   const f = p ? (p.feat||featuresFor(p.id)) : null;
+  // a seated worker "works" (types, its screen animates, its mug steams) only while its OWN
+  // turn is active; when it is merely working because a subagent / workflow is live it sits
+  // still with a dimmed standby screen, so only the helper dwarves animate (item 8).
+  const selfActive = !p || !p.agent || p.agent.self_active !== false;
+  const whipped = !!(p && p.whipUntil && performance.now()<p.whipUntil);   // "work harder": faster typing/scroll + a shudder
   // --- soft contact shadow on the floor under the whole workstation ---
   ctx.fillStyle='rgba(0,0,0,.14)'; ctx.beginPath(); ctx.ellipse(x, y+26, 35, 6, 0, 0, Math.PI*2); ctx.fill();
   // --- rolling office chair: gas post + 5-star wheel base (peeks below the desk) ---
@@ -2307,15 +3225,16 @@ function drawDeskPod(x, y, p, t){
     // hitbox uses deskX/deskY, so a transient offset is safe)
     const hop=(p.celebrateUntil && performance.now()<p.celebrateUntil)
       ? -Math.abs(Math.sin(performance.now()*0.018))*4 : 0;
-    const y=Math.round(arguments[1]+hop);   // shadow the desk y for the worker body only
+    const flin=whipped ? Math.sin(performance.now()*0.06)*1.6 : 0;   // whip: a brief startled shudder
+    const x=Math.round(arguments[0]+flin), y=Math.round(arguments[1]+hop); // shadow desk x/y for the worker BODY only
     // torso (soft shaded shirt + collar)  -- anchors UNCHANGED (hitbox-critical)
     ro(x-11, y-12, 22, 16, sh);
     px(x-11,y-12,22,2, shade(sh,.30)); px(x+7,y-11,3,14, shade(sh,-.20)); px(x-11,y+2,22,2, shade(sh,-.16));
     px(x-2,y-12,4,2, shade(sh,-.28));
     torsoDetail(x, y-12, 11, 16, sh, f);                                // outfit variety + sheen
     if(f.messenger){ drawEnvelope(x, y-5); }                            // courier envelope badge
-    // typing arms
-    const tap=(Math.floor(t*0.4)&1);
+    // typing arms -- frozen when the parent is idle-waiting on a subagent (selfActive above)
+    const tap = selfActive ? (Math.floor(t*(whipped?1.1:0.4))&1) : 0;
     ro(x-15, y-2+tap, 6, 8, sh); ro(x+9, y-2+(1-tap), 6, 8, sh);
     px(x-14, y+5+tap, 5,3, sk); px(x+10, y+5+(1-tap), 5,3, sk);
     // neck + head  -- anchors UNCHANGED (hitbox-critical)
@@ -2323,8 +3242,6 @@ function drawDeskPod(x, y, p, t){
     ro(x-7, y-28, 14, 15, sk);
     px(x-7,y-14,14,1,'rgba(0,0,0,.10)');                                // soft jaw shade
     drawHairAcc(x, y-26, f); drawFace(x, y-26, f);
-    // source plaque (Cursor vs Claude Code) floating just above the head
-    if(p.agent) drawSourceTag(x, y-35, p.agent.source);
   }
   // --- wood desk top: bright surface + grain hint + shaded front edge ---
   px(x-26,y+1,52,4,PAL.woodHi);                                         // bright top surface
@@ -2341,8 +3258,9 @@ function drawDeskPod(x, y, p, t){
   ctx.fillStyle='rgba(150,222,236,.16)'; ctx.fillRect(mx-2,my-1,mw+4,18);  // glow halo
   px(x-11,y-1,4,3,PAL.monitorLip); px(x-15,y+2,12,2,PAL.monitorLip);       // stand + base
   ro(mx, my, mw, 16, PAL.monitor); px(mx,my,mw,2, shade(PAL.monitor,.5));
-  if(p){ const tints=['#7fd3e0','#9fe0c0','#7fb0e0','#cfe9a0']; const fr=Math.floor((t*0.12+p.seed)%4);
-    px(mx+2,my+2,mw-4,12,tints[fr]);                                      // animated "code" lines
+  if(p){ const tints=['#7fd3e0','#9fe0c0','#7fb0e0','#cfe9a0'];
+    const fr = selfActive ? Math.floor((t*(whipped?0.34:0.12)+p.seed)%4) : 0;            // freeze frame when idle
+    px(mx+2,my+2,mw-4,12, selfActive ? tints[fr] : '#586a72');           // bright code vs dim standby
     px(mx+3,my+4,16,2,PAL.ink); px(mx+3,my+7,10,2,PAL.ink); px(mx+3,my+10,19,2,PAL.ink);
     px(mx+2,my+2,mw-4,1,'rgba(255,255,255,.22)');                         // screen gloss
   } else { px(mx+2,my+2,mw-4,12,'#39404a'); px(mx+4,my+7,12,2,'#4a525d'); } // dim when empty
@@ -2353,9 +3271,24 @@ function drawDeskPod(x, y, p, t){
   px(x+13,y-4,9,6,PAL.pot); px(x+13,y-4,9,2,shade(PAL.pot,.18)); px(x+12,y,11,1,PAL.potDk);
   blade(x+15,y-4,9,-2,PAL.leafDk); blade(x+17,y-4,12,0,PAL.leaf); blade(x+19,y-4,8,2,PAL.leafDk);
   px(x-22,y+6,9,5,PAL.paper); px(x-22,y+6,9,1,'#e6e6ec'); px(x-21,y+8,7,1,'#cfcfd6');
-  // mug with steam if the desk is occupied
+  // mug on the desk; steam rises only while the worker is actively at its own turn
   if(p){ mug(x+3, y-1, PAL.mugC);
-    for(let i=0;i<3;i++){ const yy=y-3-((t*1.0+i*5)%8); px(x+5,yy,1,2,'rgba(255,255,255,.5)'); } }
+    if(selfActive) for(let i=0;i<3;i++){ const yy=y-3-((t*1.0+i*5)%8); px(x+5,yy,1,2,'rgba(255,255,255,.5)'); } }
+  // desk name-plate: the agent's task on a little white placard in front of the desk,
+  // white-board look like the workflow easel; wrapped by LETTER (packs the most text in)
+  // in a slightly smaller font (item 7).
+  if(p && p.agent && p.agent.title){
+    ctx.font='4px "Press Start 2P", monospace';
+    const plLines = wrapChars(p.agent.title, 50, 2, '');       // no trailing ellipsis
+    const pw=56, ph=5*plLines.length+3, plx=x-pw/2, ply=y+30;   // centered, below the chair wheels
+    ro(plx, ply, pw, ph, PAL.paper);                            // white plate + dark ro() outline
+    px(plx+1, ply+1, pw-2, 1, shade(PAL.paper,-.08));
+    ctx.fillStyle=PAL.ink; ctx.textAlign='center';
+    // vertically centre the 1-2 lines: 4px glyphs (~4px ascent) on a 5px line step give a
+    // text block 5n-1 tall, so first baseline ply+6 leaves equal ~2px padding top & bottom.
+    let ppy=ply+6; for(const ln of plLines){ ctx.fillText(ln, x, ppy); ppy+=5; }
+    ctx.textAlign='left';
+  }
   // running subagents: a helper dwarf digging away next to the desk (one per subagent).
   // We also register a hover region so you can see what each one is doing.
   if(p && p.agent && p.agent.subs>0){
@@ -2365,8 +3298,44 @@ function drawDeskPod(x, y, p, t){
       drawHelper(cx, cy, t, (hash(p.id)+i*7)%997);
       // pod is drawn scaled by SC about (x,y); convert the dwarf centre to mouse-logical coords
       helperHits.push({ x: x+(cx-x)*SC, y: y+((cy-6)-y)*SC, r: 15*SC, sub: subs[i]||null });
+      const sb0 = subs[i] && subs[i].id ? subBubbles[subs[i].id] : null;
+      if(sb0){ const lo=(i&1)===1;   // stagger: even dwarf -> above the hat, odd -> below the face
+        bubbleAnchors.push({ x: x+(cx-x)*SC, y: y+((cy+(lo?2:-15))-y)*SC, text:sb0.text, start:sb0.start, until:sb0.until, below:lo, tool:sb0.tool }); }
     }
   }
+  // dynamic-workflow easel (drawn beside the desk; returns its hover hit centre)
+  if(p && p.agent && p.agent.workflows && p.agent.workflows.length){
+    const hit = drawWorkflowTent(x, y, p.agent.workflows, t);
+    if(hit) workflowHits.push({ x: x+(hit.x-x)*SC, y: y+(hit.y-y)*SC, r: hit.r*SC, workflow: p.agent.workflows });
+  }
+  // open background shells: up to 3 tiny terminal windows in a row just above the desk
+  // name-plate, filling left -> middle -> right. Hover shows the command + output tail.
+  if(p && p.agent && p.agent.shells && p.agent.shells.length){
+    const shells=p.agent.shells, n=Math.min(shells.length,3);
+    for(let i=0;i<n;i++){
+      // shells[] is newest-first -> draw oldest at the leftmost slot so they fill L->R in the
+      // order the shells were opened. 22px pitch on 17px windows -> ~5px gap between them.
+      const slot=n-1-i, sx=x-30+slot*22, sy=y+8;    // row bottom (sy+12) clears the name-plate (y+30) with a ~10px local gap
+      drawShellWin(sx, sy, t, (hash(p.id)+i*5)%997);
+      shellHits.push({ x: x+((sx+8)-x)*SC, y: y+((sy+6)-y)*SC, r: 11*SC, shell: shells[i] });
+    }
+  }
+}
+
+// a small "open shell" terminal window humming above the desk: a dark CRT with a title
+// bar, a green prompt/command line, an output line, and a blinking cursor. One per running
+// background shell (up to 3). Drawn in the pod's local frame (scaled by SC with the desk).
+function drawShellWin(sx, sy, t, seed){
+  sx=Math.round(sx); sy=Math.round(sy);
+  const w=17, h=12;
+  px(sx+1, sy+h, w, 1, 'rgba(0,0,0,.28)');                 // drop shadow
+  ro(sx, sy, w, h, '#111620');                             // dark terminal body (+ dark outline)
+  px(sx+1, sy+1, w-2, 3, '#2b313d');                       // title bar
+  px(sx+2, sy+2, 1,1, '#e0564e'); px(sx+4, sy+2, 1,1, '#e0a53e'); px(sx+6, sy+2, 1,1, '#5fbf5a'); // 3 dots
+  px(sx+2, sy+6, 1,1, '#63e6a0');                          // green ">" prompt
+  px(sx+4, sy+6, 8,1, '#3c7a58');                          // dim command echo
+  px(sx+2, sy+9, 10,1, '#356b4e');                         // output line
+  if((Math.floor(t*0.10)+seed)&1) px(sx+13, sy+6, 2,1, '#a6f2c6');  // blinking cursor
 }
 
 // a helper "subagent" dwarf: pointy hat, beard, tunic with belt, boots, swinging a
@@ -2400,6 +3369,217 @@ function drawHelper(cx, cy, t, seed){
           px(cx+11, y+5, 1, 1, 'rgba(150,110,60,.6)'); px(cx+9, y+7, 1, 1, 'rgba(150,110,60,.5)'); }
 }
 
+// dynamic-workflow easel: a little whiteboard on legs beside the desk showing the
+// workflow name (wrapped, mid-word if a token is too long), a big WHITE done/total
+// count, and 1-3 tiny helper dwarves at its base (one per running agent). Only drawn
+// while something is running. Returns the hover hit centre (local coords) or null.
+function drawWorkflowTent(x, y, workflows, t){
+  if(!workflows || !workflows.length) return null;   // backend already gates to genuinely-live runs
+  // a WHITE whiteboard (like the wall inspiration board), floating a few px above the desk
+  // on easel legs. Always to the RIGHT of the desk with a small horizontal gap so it reads
+  // as "beside" the desk, not sitting on it; desks are ~216px apart so adjacent easels
+  // never collide, and the far-right column clips only a few px past the edge.
+  const bw=44, bh=40, cxT = x + 56, byT = y - 46, bxT = cxT - bw/2;   // left edge clears the desk + the above desk's name-plate (which reaches anchor+42px on screen)
+  // easel: just the 2 side legs (no middle leg), each on a little caster wheel
+  const legH = (y+22) - (byT + bh - 2);
+  px(bxT+4, byT+bh-2, 2, legH-2, PAL.woodDk); px(bxT+bw-6, byT+bh-2, 2, legH-2, PAL.woodDk);
+  const wheel=(wx)=>{ px(wx-2, y+21, 6,2,'rgba(0,0,0,.20)');          // floor shadow
+                      px(wx-2, y+18, 5,4, '#2b2f36'); px(wx-1, y+19, 3,2, '#565c66'); }; // dark caster + hub
+  wheel(bxT+5); wheel(bxT+bw-5);
+  // white board face (ro() paints the 1px dark outline for free) + light-grey header strip
+  ro(bxT, byT, bw, bh, PAL.paper);
+  px(bxT+1, byT+bh-2, bw-2, 1, 'rgba(0,0,0,.10)');                    // faint bottom shade
+  px(bxT+1, byT+1, bw-2, 7, shade(PAL.paper,-.10));
+  ctx.fillStyle=PAL.ink; ctx.textAlign='center'; ctx.font='4px "Press Start 2P", monospace';
+  ctx.fillText(workflows.length>1?'WORKFLOWS':'WORKFLOW', cxT, byT+6);
+  // workflow name (or "N runs" when several share a desk), wrapped mid-word, max 3 lines.
+  // small font (matches the desk name-plate), tight side inset, no trailing ellipsis.
+  const wname = workflows.length>1 ? (workflows.length+' runs') : (workflows[0].name||'workflow');
+  ctx.fillStyle=PAL.ink; ctx.font='4px "Press Start 2P", monospace';
+  const nameLines = wrapTextMid(wname, bw-4, 3, '');
+  // vertically centre the name in the band between the header strip and the count
+  const nblk = 5*nameLines.length - 1;                       // 4px glyphs on a 5px step
+  const bandTop = byT+9, bandBot = byT+bh-10;                // header strip ends ~byT+8; count sits at the bottom
+  let ty = Math.round(bandTop + (bandBot-bandTop-nblk)/2) + 4;   // +4 ascent -> first baseline
+  for(const ln of nameLines){ ctx.fillText(ln, cxT, ty); ty+=5; }
+  // progress: done/total in dark ink
+  const done=workflows.reduce((s,w)=>s+(w.done||0),0);
+  const total=workflows.reduce((s,w)=>s+(w.total||0),0);
+  const running=workflows.reduce((s,w)=>s+(w.running||0),0);
+  ctx.fillStyle=PAL.ink; ctx.font='bold 7px "Press Start 2P", monospace';
+  ctx.fillText(done+'/'+total, cxT, byT+bh-4);
+  ctx.textAlign='left';
+  // tiny helper dwarves at the easel base (one per running agent, capped 3, 0.7 scale)
+  const n=Math.min(3, running);
+  const acts=workflows.reduce((L,w)=>L.concat(w.active||[]),[]);   // flatten running-sub infos
+  for(let i=0;i<n;i++){
+    const hx=cxT - (n-1)*8 + i*16, hy=y+18;
+    ctx.save(); scaleAbout(hx, hy, 0.7); drawHelper(hx, hy, t, (hash(wname)+i*7)%997); ctx.restore();
+    // each easel dwarf IS a running workflow subagent -> its own hover region showing what
+    // it's doing (not the whole-workflow tooltip). Small radius so the board still hovers
+    // as the workflow; the easel hit below is shrunk to the board so these win at the base.
+    helperHits.push({ x: x+(hx-x)*SC, y: y+((hy-4)-y)*SC, r: 10*SC, sub: acts[i]||null });
+    const sbw = acts[i] && acts[i].id ? subBubbles[acts[i].id] : null;
+    if(sbw){ const lo=(i&1)===1;   // stagger easel dwarves: even -> above the hat, odd -> below the face
+      bubbleAnchors.push({ x: x+(hx-x)*SC, y: y+((hy+(lo?1:-12))-y)*SC, text:sbw.text, start:sbw.start, until:sbw.until, below:lo, tool:sbw.tool }); }
+  }
+  return { x: cxT, y: y-26, r: 26 };   // hit only the board face, not the dwarves at its base
+}
+
+// wrap `text` to <= maxLines lines that each fit `maxW` px at the CURRENT ctx.font,
+// breaking INSIDE a word when a single token is too long. `ell` is the clip marker
+// appended when the text overflows maxLines -- pass '' to truncate with no marker.
+function wrapTextMid(text, maxW, maxLines, ell){
+  ell = (ell===undefined ? '…' : ell);
+  const fits = s => ctx.measureText(s).width <= maxW;
+  const words = String(text).split(/\s+/).filter(Boolean);
+  const lines=[]; let cur='';
+  const flush=()=>{ if(cur){ lines.push(cur); cur=''; } };
+  for(let w of words){
+    while(!fits(w) && w.length>1){                 // hard-break an over-long token
+      flush();
+      let i=1; while(i<w.length && fits(w.slice(0,i+1))) i++;
+      lines.push(w.slice(0,i)); w=w.slice(i);
+    }
+    const cand = cur ? cur+' '+w : w;
+    if(fits(cand)) cur=cand; else { flush(); cur=w; }
+  }
+  flush();
+  if(maxLines && lines.length>maxLines){
+    const out=lines.slice(0,maxLines);
+    let last=out[maxLines-1];
+    while(last.length>1 && !fits(last+ell)) last=last.slice(0,-1);
+    out[maxLines-1]=last+ell;
+    return out;
+  }
+  return lines;
+}
+
+// pack `text` into <= maxLines lines that each fit `maxW` px at the CURRENT ctx.font,
+// breaking at ANY character (fills the most text per line -- used by the desk name-plate).
+// `ell` is the clip marker appended on overflow -- pass '' to truncate with no marker.
+function wrapChars(text, maxW, maxLines, ell){
+  ell = (ell===undefined ? '…' : ell);
+  const fits = s => ctx.measureText(s).width <= maxW;
+  const s = String(text); const lines=[]; let cur='';
+  for(const ch of s){
+    if(cur && !fits(cur+ch)){ lines.push(cur); cur=''; }
+    cur += ch;
+  }
+  if(cur) lines.push(cur);
+  if(maxLines && lines.length>maxLines){
+    const out=lines.slice(0,maxLines);
+    let last=out[maxLines-1];
+    while(last.length && !fits(last+ell)) last=last.slice(0,-1);
+    out[maxLines-1]=last+ell;
+    return out;
+  }
+  return lines;
+}
+
+// first ~90 chars, whitespace-collapsed (drawBubble wraps + ellipsizes the rest)
+function firstWords(s){ s=String(s||'').replace(/\s+/g,' ').trim(); return s.length>90?s.slice(0,90):s; }
+// small white speech bubble centred on (x,y) in SCREEN coords. Tail points DOWN to the
+// anchor (bubble sits above) unless `below` is set, in which case it sits below with an
+// up-pointing tail -- used to stagger neighbouring dwarf bubbles so they don't overlap.
+function drawBubble(x, y, text, alpha, below){
+  if(!text || alpha<=0) return;
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.font = '4px "Press Start 2P", monospace';
+  const lines = wrapTextMid(text, 78, 3, '…');       // reuse existing word-wrap + ellipsis
+  let tw=0; for(const ln of lines) tw=Math.max(tw, ctx.measureText(ln).width);
+  const padX=4, padY=3, lh=6;
+  const bw=Math.max(14, Math.ceil(tw)+padX*2), bh=lh*lines.length+padY*2-1;
+  const bx=Math.round(x-bw/2), by=Math.round(below ? y+4 : y-bh);
+  ro(bx, by, bw, bh, PAL.paper);                     // white box + 1px dark outline
+  px(bx+1, by+1, bw-2, 1, shade(PAL.paper,-.06));    // faint header shade
+  const tx=Math.round(x);
+  if(below){                                         // upward pixel tail (box hangs below)
+    px(tx-2, by-1, 4,1, PAL.paper); px(tx-1, by-2, 2,1, PAL.paper); px(tx, by-3, 1,1, PAL.paper);
+    px(tx-3, by-1, 1,1, PAL.outline); px(tx+2, by-1, 1,1, PAL.outline);
+    px(tx-2, by-2, 1,1, PAL.outline); px(tx+1, by-2, 1,1, PAL.outline);
+    px(tx-1, by-3, 1,1, PAL.outline); px(tx+1, by-3, 1,1, PAL.outline);
+    px(tx-1, by-4, 2,1, PAL.outline);
+  } else {                                           // downward pixel tail (box sits above)
+    px(tx-2, by+bh, 4,1, PAL.paper); px(tx-1, by+bh+1, 2,1, PAL.paper); px(tx, by+bh+2, 1,1, PAL.paper);
+    px(tx-3, by+bh, 1,1, PAL.outline); px(tx+2, by+bh, 1,1, PAL.outline);
+    px(tx-2, by+bh+1, 1,1, PAL.outline); px(tx+1, by+bh+1, 1,1, PAL.outline);
+    px(tx-1, by+bh+2, 1,1, PAL.outline); px(tx+1, by+bh+2, 1,1, PAL.outline);
+    px(tx-1, by+bh+3, 2,1, PAL.outline);
+  }
+  ctx.fillStyle=PAL.ink; ctx.textAlign='center';
+  let ty=by+padY+4; for(const ln of lines){ ctx.fillText(ln, x, ty); ty+=lh; }
+  ctx.textAlign='left'; ctx.restore();
+}
+// accent colour for a tool chip, by tool family -- so the same class of action reads the same.
+function toolColor(name){
+  const n=(name||'').toLowerCase();
+  if(/bash|shell|exec|run|terminal|command/.test(n)) return '#6ad06a';        // green: run
+  if(/edit|write|replace|create|apply|notebook|patch/.test(n)) return '#f0a23b'; // orange: write
+  if(/read|cat|open|view|file/.test(n)) return '#5bb0e6';                      // blue: read
+  if(/grep|glob|search|find|explore|list|ls/.test(n)) return '#b98cf0';        // purple: search
+  if(/task|agent|workflow|dispatch|spawn/.test(n)) return '#e673a8';           // pink: delegate
+  if(/web|fetch|http|url|browser|navigate/.test(n)) return '#4fd0c0';          // teal: web
+  return '#d9c37a';                                                            // default: sand-gold
+}
+// ephemeral TOOL CHIP: a small dark pill with a tool-coloured icon + the tool name, popped
+// when an agent/dwarf runs a tool. Deliberately distinct from the white speech bubble.
+function drawToolChip(x, y, name, alpha, below){
+  if(!name || alpha<=0) return;
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.font = '4px "Press Start 2P", monospace';
+  const label = name.length>24 ? name.slice(0,24) : name;   // pre-formatted "NAME detail"; keep the detail
+  const tw = ctx.measureText(label).width;
+  const icon=5, padX=3, gap=3, h=9;
+  const bw = padX + icon + gap + Math.ceil(tw) + padX;
+  const bx = Math.round(x-bw/2), by = Math.round(below ? y+4 : y-h);
+  const col = toolColor(name.split(' ')[0]);                 // colour by the tool name, not the detail
+  ro(bx, by, bw, h, '#22262e');                      // dark slate pill + outline
+  px(bx+1, by+1, bw-2, 1, '#333a46');                // top sheen
+  const tx=Math.round(x);
+  if(below){ px(tx-1, by-1, 2,1, '#22262e'); px(tx, by-2, 1,1, '#22262e'); }   // small nub up
+  else     { px(tx-1, by+h, 2,1, '#22262e'); px(tx, by+h+1, 1,1, '#22262e'); } // small nub down
+  const ix=bx+padX, iy=by+Math.round((h-icon)/2);    // little gear/cog icon in the tool colour
+  px(ix+1,iy,3,1,col); px(ix,iy+1,5,3,col); px(ix+1,iy+4,3,1,col); px(ix+2,iy+2,1,1,'#22262e');
+  ctx.fillStyle=col; ctx.textAlign='left';
+  ctx.fillText(label, ix+icon+gap, by+h-3);
+  ctx.textAlign='left'; ctx.restore();
+}
+// tool chip label: just the short tool NAME (e.g. "BASH", "EDIT") for the compact ephemeral
+// chip. The detailed "Bash: npm run dev" lives in the hover card (last_tool), not here.
+function toolChip(s){ s=String(s||''); const i=s.indexOf(':'); return (i>0?s.slice(0,i):s).trim().toUpperCase(); }
+// a stern "boss" / supervisor in a suit + red tie, one arm pointing at the desk. Same scale as
+// a standing worker -- pops up beside a desk to deliver a fresh user instruction (see below).
+function drawBoss(x, y, t, moving){
+  x=Math.round(x); y=Math.round(y);
+  const suit='#31363f', suitLt='#3d434e', shirt='#eef1f6', tie='#c0392b', skin='#e6b38a', shoe='#191c22', hair='#3a2c20';
+  const walking=!!moving;
+  const step=walking?(Math.floor(t*0.16)&1):-1;                     // -1 = both feet planted (standing)
+  const pt=(!walking) && (Math.floor(t*0.05)&1);                     // point only when stopped at the desk
+  ctx.fillStyle='rgba(0,0,0,.22)'; ctx.beginPath(); ctx.ellipse(x,y+16,11,3,0,0,Math.PI*2); ctx.fill();
+  ro(x-6,y+4,5,10,suit); ro(x+1,y+4,5,10,suit);                      // slacks
+  px(x-2,y+5,1,9,shade(suit,-.25));
+  const fa=step<0?0:(step?2:-2), fb=step<0?0:(step?-2:2);           // walk: swing the feet fore/aft
+  px(x-8+fa,y+13,7,3,shoe); px(x-8+fa,y+13,7,1,shade(shoe,.4));      // left shoe
+  px(x+fb,  y+13,7,3,shoe); px(x+fb,  y+13,7,1,shade(shoe,.4));      // right shoe
+  ro(x-9,y-12,18,17,suit); px(x-9,y-12,18,2,suitLt); px(x-9,y+3,18,1,shade(suit,-.2)); // jacket
+  px(x-2,y-11,4,11,shirt);                                          // shirt panel
+  px(x-4,y-11,3,7,suitLt); px(x+1,y-11,3,7,suitLt);                 // lapels
+  px(x-1,y-10,2,9,tie); px(x-1,y-1,2,2,shade(tie,-.25)); px(x-1,y-11,2,1,shade(tie,.3)); // tie
+  ro(x+7,y-10,4,10,suit); px(x+7,y+0,4,3,skin);                     // right arm at side
+  if(pt){ px(x-15,y-9,7,3,suit); px(x-16,y-9,3,3,skin); }           // left arm out, pointing at the desk
+  else  { ro(x-11,y-10,4,10,suit); px(x-11,y+0,4,3,skin); }         // left arm down
+  px(x-3,y-15,6,4,skin);                                            // neck
+  ro(x-7,y-28,14,15,skin); px(x-7,y-14,14,1,'rgba(0,0,0,.10)');     // head
+  px(x-7,y-28,14,4,hair); px(x-7,y-28,5,7,hair); px(x+5,y-28,2,5,hair); // side-part hair
+  px(x-4,y-22,2,1,PAL.outline); px(x+3,y-22,2,1,PAL.outline);       // brows
+  px(x-4,y-20,2,2,'#33373e'); px(x+3,y-20,2,2,'#33373e');           // eyes
+  px(x-1,y-18,2,1,shade(skin,-.28));                               // nose
+  px(x-3,y-16,7,1,shade(skin,-.35));                              // firm mouth
+}
+
 // a standing person (kitchen / lounge), facing us
 function drawStanding(p, t){
   // celebration dance: little hops + side-to-side wiggle while the flag is live
@@ -2408,16 +3588,28 @@ function drawStanding(p, t){
     const tt=performance.now();
     dy0 = -Math.abs(Math.sin(tt*0.018))*5;     // quick hops
     dx0 = Math.sin(tt*0.013)*3;                // wiggle
+  } else if(p.whipUntil && performance.now()<p.whipUntil){
+    dx0 = Math.sin(performance.now()*0.06)*2;  // whip: startled shudder (no hop)
   }
   const x=Math.round(p.x+dx0), y=Math.round(p.y+dy0);
   const f=p.feat||featuresFor(p.id||'x');
   const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
   const walking=(Math.abs(p.vx)+Math.abs(p.vy))>0.05;
   const step=walking?(Math.floor(t*0.16)&1):0;
-  // every few seconds a settled kitchen agent takes a coffee sip (staggered per sprite)
-  const canSip = p.kind!=='work' && !walking && (p.mode==='idle'||p.mode==='drink');
-  const sip = canSip && ((performance.now() + ((x*197)&2047)*3) % 5200) < 700;
-  const ht = sip ? -1 : 0;   // head tips back a touch mid-sip
+  // deterministic kitchen "persona": a held item, stable per agent id (salted so it
+  // doesn't merely echo the appearance bits featuresFor() already used).
+  const kh = hash((p.id||'x')+'|kit');
+  const item = (f.messenger || p.kind==='work') ? -1 : (kh % 6);
+  //  -1 courier/worker(none)  0 mug  1 pastry  2 phone  3 plate  4 bottle  5 hands-free
+  const settled = p.kind!=='work' && !walking && p.mode==='idle';
+  const now = performance.now();
+  const canSip = settled && item===0;                       // only the mug persona sips
+  const sip = canSip && ((now + ((x*197)&2047)*3) % 5200) < 700;
+  // occasional small-talk: face the paired neighbour on a staggered ~4.2s-in-12s window
+  const talking = settled && p.talkX!=null && ((now + (kh%24000)) % 26000) < 2600;  // chat rarely: ~2.6s in every 26s
+  const faceDir = talking ? (Math.sign(p.talkX - x)||0) : 0; // -1 look left, +1 look right
+  const ht = sip ? -1 : (item===2 ? 1 : 0);                  // sip: tip back; phone: glance down
+  const hx = faceDir*2;                                      // subtle head turn toward neighbour
   // shadow
   ctx.fillStyle='rgba(0,0,0,.20)'; ctx.beginPath(); ctx.ellipse(x,y+16,11,3,0,0,Math.PI*2); ctx.fill();
   // legs + rounded shoes (feet stay at ~y+16 to match the hitbox)
@@ -2434,29 +3626,48 @@ function drawStanding(p, t){
   px(x-9,y+4,18,1, shade(pants,-.10));                      // belt/hem line
   torsoDetail(x, y-11, 9, 16, sh, f);                       // outfit variety + sheen
   if(f.messenger){ drawEnvelope(x, y-3); }                  // courier envelope badge
-  // arms by mode: upper sleeve (shirt) + forearm/hand (skin)
-  if(p.mode==='drink' || p.mode==='idle'){
-    ro(x-14, y-7, 5, 7, sh); px(x-14, y-1, 5,4, sk);                       // left arm relaxed
-    const ay = sip?-4:0, my = sip?-6:0;                                    // raise arm + cup to sip
-    ro(x+9, y-9+ay, 5, 7, sh); px(x+9, y-3+ay, 5,3, sk);                   // right arm toward the mug
+  // ---- arms + the held item (deterministic persona) --------------------------
+  const gL = talking && (item===2||item===3 ? false : (faceDir<=0));  // lift left free hand
+  const gR = talking && (item===5||item===-1) && faceDir>0;           // hands-free can lift right
+  if(item===0){                                            // coffee mug (+ steam / sip)
+    ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
+    const ay = sip?-4:0, my = sip?-6:0;
+    ro(x+9, y-9+ay, 5, 7, sh); px(x+9, y-3+ay, 5,3, sk);
     ro(x+10, y-13+my, 7, 7, PAL.paper); px(x+11,y-12+my,5,5,PAL.mugA); px(x+17,y-12+my,2,4,PAL.paper);
-    if(!sip){ for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } } // steam (paused mid-sip)
-  } else if(p.mode==='eat'){
-    ro(x-14, y-6, 5, 7, sh); px(x-14, y+1, 5,3, sk);
-    ro(x+9, y-7, 5, 6, sh); px(x+10,y-9,5,5,PAL.orange);
-  } else {
-    ro(x-14, y-7, 5, 8, sh); px(x-14, y+1, 4,4, sk);                       // hands at sides
-    ro(x+10, y-7, 5, 8, sh); px(x+10, y+1, 4,4, sk);
+    if(!sip){ for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } }
+  } else if(item===1){                                     // pastry / muffin in the right hand
+    ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
+    ro(x+9, y-6, 5, 6, sh); px(x+9, y-1, 5,3, sk);
+    px(x+9,y-4,6,4,PAL.orange); px(x+9,y-4,6,1,shade(PAL.orange,.34)); px(x+11,y-2,2,1,shade(PAL.orange,-.3));
+    px(x+9,y-1,6,1,'#c98a52');                             // pastry base
+  } else if(item===2){                                     // phone in both hands, glancing down
+    ro(x-13, y-6, 5, 7, sh); px(x-11, y-1, 4,3, sk);
+    ro(x+9,  y-6, 5, 7, sh); px(x+7,  y-1, 4,3, sk);
+    px(x-3,y-3,7,5,'#20242c'); px(x-2,y-2,5,3,'#7fd3e0'); px(x-2,y-2,5,1,'#b8ecf3'); // phone + lit screen
+  } else if(item===3){                                     // plate of food in both hands
+    ro(x-13, y-5, 5, 6, sh); px(x-11, y-1, 4,3, sk);
+    ro(x+9,  y-5, 5, 6, sh); px(x+7,  y-1, 4,3, sk);
+    px(x-6,y-2,13,3,'#eef0f4'); px(x-6,y-2,13,1,'#ffffff'); px(x-6,y+1,13,1,'#c9ccd4'); // plate
+    px(x-3,y-3,3,2,PAL.orange); px(x+1,y-3,3,2,'#6aa72f'); // two bites of food
+  } else if(item===4){                                     // water bottle / soda in the right hand
+    ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
+    ro(x+9, y-7, 5, 7, sh); px(x+9, y-1, 5,3, sk);
+    px(x+9,y-11,5,9,PAL.mugB); px(x+9,y-11,5,1,shade(PAL.mugB,.4)); px(x+13,y-11,1,9,shade(PAL.mugB,-.3));
+    px(x+10,y-13,3,2,'#dfeefa');                           // cap
+  } else {                                                 // item 5 / courier / worker: free hands
+    ro(x-14, y-7-(gL?4:0), 5, 8, sh); px(x-14, y+1-(gL?4:0), 4,4, sk);
+    ro(x+10, y-7-(gR?4:0), 5, 8, sh); px(x+10, y+1-(gR?4:0), 4,4, sk);
   }
-  // neck + head (tips back slightly while sipping)
-  px(x-3, y-14+ht, 6, 4, sk); px(x-3, y-14+ht, 6, 1, 'rgba(0,0,0,.16)');
-  ro(x-7, y-27+ht, 14, 15, sk);
-  px(x-7,y-13+ht,14,1,'rgba(0,0,0,.10)');                   // soft jaw shade
-  drawHairAcc(x, y-25+ht, f); drawFace(x, y-25+ht, f);
-  // source plaque (Cursor vs Claude Code) floating just above the head
-  if(p.agent) drawSourceTag(x, y-34, p.agent.source);
-  // cozy heart speech bubble for settled kitchen agents (scales with the sprite)
-  if(p.kind!=='work' && p.mode==='idle'){ heartBubble(x+15, y-34); }
+  // neck + head (tips back while sipping / down on the phone; turns toward a chat neighbour)
+  px(x-3+hx, y-14+ht, 6, 4, sk); px(x-3+hx, y-14+ht, 6, 1, 'rgba(0,0,0,.16)');
+  ro(x-7+hx, y-27+ht, 14, 15, sk);
+  px(x-7+hx,y-13+ht,14,1,'rgba(0,0,0,.10)');               // soft jaw shade
+  drawHairAcc(x+hx, y-25+ht, f); drawFace(x+hx, y-25+ht, f);
+  // small-talk bubble while chatting, else the cozy heart when settled
+  if(settled){
+    if(talking){ const nd=1+((((now/700)|0)+(kh%3))%3); talkBubble(x + (faceDir<0?-15:15), y-34, nd); }
+    else heartBubble(x+15, y-34);
+  }
 }
 
 // ---- update loop ----
@@ -2474,6 +3685,16 @@ function tick(now){
       c.vy+=c.g*ds; c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.99; c.rot+=c.vr*ds;
     }
   }
+  // advance + expire whip-crack particles (streaks decelerate; the lash line just fades)
+  if(whipFx.length){
+    const ds=dt/1000;
+    for(let i=whipFx.length-1;i>=0;i--){ const c=whipFx[i]; c.age+=ds;
+      if(c.age>=c.life){ whipFx.splice(i,1); continue; }
+      if(!c.lash){ c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.90; c.vy*=0.90; }
+    }
+  }
+  // restock vending slots whose can has finished dropping + resting
+  for(const k in vendDrops){ if(now-vendDrops[k].start>3200) delete vendDrops[k]; }
   for(const p of people){
     if(p.kind==='exit'){
       // a filtered-out scheduled agent walking off the bottom of the screen
@@ -2515,16 +3736,26 @@ function tick(now){
   requestAnimationFrame(tick);
 }
 
+// is a supervisor currently delivering an instruction to this agent? while so, the boss is
+// the one "talking" -- the agent's own speech bubble is suppressed so they don't both pop one.
+function bossActive(id){ const b=bossVisits[id]; return !!(b && b.until>performance.now()); }
+
 function render(t){
   helperHits = [];                   // rebuilt each frame as dwarves are drawn
+  workflowHits = [];                 // rebuilt each frame as workflow tents are drawn
+  shellHits = [];                    // rebuilt each frame as open-shell terminals are drawn
+  bubbleAnchors = [];                // rebuilt each frame; drawn as an overlay below
+  vendSlots = [];                    // rebuilt each frame as the vending slots are drawn
   ctx.setTransform(SS,0,0,SS,0,0);   // map logical 640x576 onto the super-sampled backing
   ctx.clearRect(0,0,W,H);
   drawFloor();
   // office desks (always shown); seated worker drawn only once docked, otherwise
   // the desk is shown empty and the worker is drawn separately as a walker.
+  const bt = performance.now();
   const slots=[...deskSlots].sort((a,b)=>a.y-b.y);
   for(const s of slots){ const w=s.worker;
-    ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore(); }
+    ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore();
+    if(w && w.seated && w.bubbleUntil>bt && !bossActive(w.id)) bubbleAnchors.push({x:s.x, y:s.y-30*SC, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil, tool:w.bubbleTool}); }
   // everyone currently standing/walking (kitchen agents + workers still walking in),
   // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
   const drawList=[];
@@ -2536,9 +3767,49 @@ function render(t){
     if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
       if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t); else drawStanding(e.p,t);
-      ctx.restore(); }
+      ctx.restore();
+      // a WAITING (kitchen) agent's open background shells float above its head, so a running
+      // shell (e.g. a dev server) stays visible after the chat leaves the desk for the kitchen.
+      if(e.p.kind==='wait' && e.p.agent && e.p.agent.shells && e.p.agent.shells.length){
+        const sh=e.p.agent.shells, m=Math.min(sh.length,3);
+        const base = Math.round(e.p.x - ((m-1)*22+17)/2);   // centre the row over the head
+        ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
+        for(let i=0;i<m;i++){ const slot=m-1-i, sx=base+slot*22, sy=e.p.y-42;
+          drawShellWin(sx, sy, t, (hash(e.p.id)+i*5)%997);
+          shellHits.push({ x: e.p.x+((sx+8)-e.p.x)*SC, y: e.p.y+((sy+6)-e.p.y)*SC, r: 11*SC, shell: sh[i] }); }
+        ctx.restore();
+      }
+      if(e.p.bubbleUntil>bt && !bossActive(e.p.id)) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
+  }
+  // supervisor "boss" visits: a stern suited figure delivering a fresh user instruction.
+  // The boss ESCORTS the agent -- it appears the moment the instruction lands and walks
+  // ALONGSIDE the agent from the kitchen to the desk (trailing the direction of travel),
+  // then parks beside the desk once the agent is docked. Drawn after the people pass so it
+  // reads as in front of the agent it's walking with.
+  for(const id in bossVisits){
+    const bv=bossVisits[id]; if(bv.until<=bt) continue;
+    const p=people.find(q=>q.id===id); if(!p) continue;
+    let bx, by, moving=false;
+    if(p.kind==='work' && p.seated){
+      bx=p.deskX+46; by=p.deskY-10;                 // parked beside the docked desk (bigger + raised)
+    } else {
+      const dir=(p.vx<-0.01)?-1:1;                   // stay on the trailing side of the walk
+      bx=p.x-dir*22; by=p.y-2;
+      moving=(Math.abs(p.vx)+Math.abs(p.vy))>0.02;   // swing the legs only while actually moving
+    }
+    const bs=SC*1.25;
+    const a=Math.min(1,(bt-bv.start)/180, (bv.until-bt)/500);
+    ctx.save(); ctx.globalAlpha=Math.max(0,a); scaleAbout(bx, by, bs); drawBoss(bx, by, t, moving); ctx.restore();
+    bubbleAnchors.push({x:bx, y:by-30*bs, text:bv.text, start:bv.start, until:bv.until});
+  }
+  // ---- transient speech bubbles (desk/kitchen agents + subagent/workflow dwarves) ----
+  for(const b of bubbleAnchors){
+    const rem=b.until-bt; if(rem<=0) continue;
+    const fin=Math.min(1,(bt-b.start)/160), fout=Math.min(1, rem/BUBBLE_FADE);
+    if(b.tool) drawToolChip(b.x, b.y, b.text, Math.min(fin,fout), b.below);
+    else drawBubble(b.x, b.y, b.text, Math.min(fin,fout), b.below);
   }
   // hover ring (around the drawn sprite, scaled to match SC)
   if(hover){
@@ -2558,6 +3829,29 @@ function render(t){
     const a=Math.max(0, 1 - c.age/c.life);
     ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
     ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
+  }
+  // whip crack: a bright lash line + sharp shock streaks, above everything
+  for(const c of whipFx){
+    const a=Math.max(0, 1 - c.age/c.life);
+    if(c.lash){
+      // curved, tapering whip lash (quadratic bezier hx,hy -> control mx,my -> tip tx,ty)
+      ctx.save(); ctx.globalAlpha=a; ctx.lineCap='round'; ctx.lineJoin='round';
+      const P=10; let lx=c.hx, ly=c.hy;
+      for(let i=1;i<=P;i++){
+        const u=i/P, iu=1-u;
+        const bx=iu*iu*c.hx + 2*iu*u*c.mx + u*u*c.tx;
+        const by=iu*iu*c.hy + 2*iu*u*c.my + u*u*c.ty;
+        ctx.strokeStyle = u>0.82 ? '#ffffff' : '#f3e6c2';   // bright white at the cracking tip
+        ctx.lineWidth = 3.4*(1-u) + 0.5;                    // thick at the handle -> thin at the tip
+        ctx.beginPath(); ctx.moveTo(lx,ly); ctx.lineTo(bx,by); ctx.stroke();
+        lx=bx; ly=by;
+      }
+      ctx.fillStyle='#ffffff'; ctx.beginPath(); ctx.arc(c.tx,c.ty,1.6,0,Math.PI*2); ctx.fill(); // tip spark
+      ctx.restore();
+    } else {
+      ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
+      ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
+    }
   }
   ctx.globalAlpha=1;
 }
@@ -2583,6 +3877,27 @@ function spawnConfetti(ox, oy){
   if(confetti.length>200) confetti.splice(0, confetti.length-200);   // hard cap
 }
 
+// a whip CRACK snapping down at the strike point (ox,oy): a curved tapering lash + a short
+// sharp tip-crack (a few streaks flicking down, NOT a radial burst -- reads as a whip, not a meteor)
+function spawnWhip(ox, oy){
+  const tx=(ox!=null)?ox:W/2, ty=(oy!=null)?oy:H*0.22;
+  const dir=Math.random()<0.5?1:-1;                        // swing in from the left or the right
+  // curved lash: handle up-&-to-the-side, arcs over, snaps down to the tip (tx,ty)
+  whipFx.push({ lash:true, hx:tx-82*dir, hy:ty-72, mx:tx-24*dir, my:ty-50, tx:tx, ty:ty, life:0.20, age:0 });
+  const N=8;
+  for(let i=0;i<N;i++){
+    const a=Math.PI/2 + (dir>0?-0.55:0.55) + (Math.random()-0.5)*1.7;   // downward fan, leaning w/ the swing
+    const sp=150+Math.random()*160;
+    whipFx.push({
+      x:tx, y:ty, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp,
+      w:4+Math.random()*4, h:1+Math.random()*1.1,
+      col: Math.random()<0.5?'#ffffff':'#ffe9a8',
+      rot:a, life:0.14+Math.random()*0.10, age:0,
+    });
+  }
+  if(whipFx.length>160) whipFx.splice(0, whipFx.length-160);   // hard cap
+}
+
 // ======================================================================
 // AMBIENT RANDOM EVENTS  (dog crossing / cat nap / agent relocate)
 // Scheduled + animated entirely off the rAF clock (see tick()).
@@ -2594,6 +3909,14 @@ function scheduleNextEvent(now){
   let mn=30000, mx=60000;
   if(window.__eventInterval){ mn=window.__eventInterval[0]; mx=window.__eventInterval[1]; }
   nextEventAt = now + mn + Math.random()*(mx-mn);
+}
+
+// independent, long-gap scheduler for the occasional window fly-by (test hook:
+// window.__planeInterval=[3000,6000]; restore with delete window.__planeInterval)
+function schedulePlane(now){
+  let mn=60000, mx=150000;
+  if(window.__planeInterval){ mn=window.__planeInterval[0]; mx=window.__planeInterval[1]; }
+  nextPlaneAt = now + mn + Math.random()*(mx-mn);
 }
 
 // pick ONE event at random, avoiding an immediate repeat; if the chosen type can't
@@ -2644,6 +3967,17 @@ function startCat(now){
   };
 }
 
+// ---- a tiny airliner drifts across the WINDOW sky, above the buildings, near the clouds ----
+function startPlane(now){
+  const dir = Math.random()<0.5 ? 1 : -1;               // 1: L->R, -1: R->L
+  amb.plane = {
+    dir,
+    x: dir>0 ? WIN.x-16 : WIN.x+WIN.w+16,               // start just off the clipped glass edge
+    y: WIN.y + 6 + Math.random()*14,                    // upper sky band, near the clouds
+    spd: 22 + Math.random()*16,                         // px/s -> ~9-13s to drift across
+  };
+}
+
 // ---- 3) RELOCATE: a waiting agent strolls to a different open kitchen spot ----
 function startRelocate(now){
   const cands = people.filter(p=> p.kind==='wait' && p.mode==='idle');
@@ -2685,12 +4019,35 @@ function updateAmbient(now, dt){
       if((c.dir>0 && c.x>W+24) || (c.dir<0 && c.x<-24)) amb.cat=null;
     }
   }
+  // occasional airliner across the window sky (independent long-gap scheduler)
+  if(!nextPlaneAt) schedulePlane(now);
+  else if(now>=nextPlaneAt){ if(!amb.plane) startPlane(now); schedulePlane(now); }
+  if(amb.plane){ const pl=amb.plane; pl.x += pl.dir*pl.spd*sec;
+    if((pl.dir>0 && pl.x>WIN.x+WIN.w+24) || (pl.dir<0 && pl.x<WIN.x-24)) amb.plane=null; }
 }
 
 // ---------- pixel-art critters (drawn scaled by SC about their anchor) ----------
 
 // a single shaded leg segment
 function _leg(lx, topY, len, w, col){ px(lx,topY,w,len,col); px(lx,topY+len-1,w,1,shade(col,-.34)); }
+
+// AIRLINER: a tiny plane drifting across the window sky. Drawn in absolute window
+// coords at logical scale (no SC), mirrored to face its heading, with a faint contrail.
+function drawPlane(pl){
+  const x=Math.round(pl.x), y=Math.round(pl.y);
+  ctx.save();
+  if(pl.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }   // face left
+  const body='#eef2f6', bodyDk='#b9c2cc', porthole='#8fb7d8', tailc='#d24b4b';
+  // faint contrail streaming out behind the tail (the -x side while facing right)
+  for(let i=1;i<=6;i++){ const a=(0.18*(7-i)/6).toFixed(3);
+    px(x-9-i*3, y+2, 2, 1, 'rgba(255,255,255,'+a+')'); }
+  px(x-8, y-2, 2, 4, tailc); px(x-7, y-2, 1, 3, shade(tailc,.15));            // tail fin (back, raised)
+  px(x-7, y+1, 13, 4, body); px(x-7, y+1, 13, 1, '#ffffff'); px(x-7, y+4, 13, 1, bodyDk); // fuselage
+  px(x+6, y+2, 2, 2, body);                                                   // pointed nose (front)
+  px(x-2, y+4, 7, 2, bodyDk);                                                  // swept wing under body
+  px(x, y+2, 1, 1, porthole); px(x+2, y+2, 1, 1, porthole);                    // two cabin windows
+  ctx.restore();
+}
 
 // DOG: three visually distinct breeds, side-on, facing its walk direction.
 function drawDog(d, t){
@@ -2895,18 +4252,32 @@ function pick(mx,my){
 const nametag=document.getElementById('nametag');
 // place the hover card near the cursor, flipped/clamped to stay on-screen
 function placeNametag(m){
+  // anchor BELOW the cursor and grow downward; only pull up as much as needed and never
+  // above `pad`, so a tall card's TOP (its title) always stays on-screen (item 2).
   const sw=m.r.width, sh=m.r.height, pad=8;
   const bw=nametag.offsetWidth, bh=nametag.offsetHeight;
-  let left=m.cx+16, top=m.cy-bh-12;
+  let left=m.cx+16;
   if(left+bw+pad>sw) left=m.cx-bw-16;
   if(left<pad) left=pad;
-  if(top<pad) top=m.cy+18;
-  if(top+bh+pad>sh) top=sh-bh-pad;
+  let top=m.cy+18;
+  if(top+bh+pad>sh) top=Math.max(pad, sh-bh-pad);
   nametag.style.left=Math.round(left)+'px'; nametag.style.top=Math.round(top)+'px';
 }
 function pickHelper(mx,my){ let best=null,bd=1e9;
   for(const h of helperHits){ const d=(mx-h.x)*(mx-h.x)+(my-h.y)*(my-h.y); if(d<h.r*h.r && d<bd){bd=d;best=h;} }
   return best; }
+function pickWorkflow(mx,my){ let best=null,bd=1e9;
+  for(const w of workflowHits){ const d=(mx-w.x)*(mx-w.x)+(my-w.y)*(my-w.y); if(d<w.r*w.r && d<bd){bd=d;best=w;} }
+  return best; }
+function pickShell(mx,my){ let best=null,bd=1e9;
+  for(const s of shellHits){ const d=(mx-s.x)*(mx-s.x)+(my-s.y)*(my-s.y); if(d<s.r*s.r && d<bd){bd=d;best=s;} }
+  return best; }
+function pickVend(mx,my){
+  for(const s of vendSlots){ if(mx>=s.x0 && mx<=s.x1 && my>=s.y0 && my<=s.y1) return s; }
+  return null; }
+function dispenseDrink(s){
+  if(vendDrops[s.idx]) return;                       // already dispensing this slot
+  vendDrops[s.idx]={start:performance.now(), col:s.col, fromX:s.bxv, fromY:s.ry}; }
 cv.addEventListener('mousemove', e=>{
   const m=toCanvas(e);
   // a pettable pet under the cursor?
@@ -2914,16 +4285,74 @@ cv.addEventListener('mousemove', e=>{
   if(pet){ hover=null; cv.style.cursor='pointer';
     nametag.innerHTML='<div class="nt-hint">click to pet the '+pet+'</div>';
     nametag.style.display='block'; placeNametag(m); return; }
-  // a subagent dwarf? (they sit right by the desk) -- takes precedence over the agent
+  // a vending-machine drink? (click drops it into the tray)
+  const vs=pickVend(m.x,m.y);
+  if(vs){ hover=null; cv.style.cursor='pointer';
+    nametag.innerHTML='<div class="nt-hint">click for a cold one</div>';
+    nametag.style.display='block'; placeNametag(m); return; }
+  // a workflow tent? (takes precedence over helpers)
+  const wf=pickWorkflow(m.x,m.y);
+  if(wf){
+    hover=null; cv.style.cursor='help';
+    const runs = wf.workflow;
+    const done = runs.reduce((s,w)=>s+(w.done||0),0);
+    const total = runs.reduce((s,w)=>s+(w.total||0),0);
+    const running = runs.reduce((s,w)=>s+(w.running||0),0);
+    const title = runs.length>1 ? (runs.length+' workflows') : (runs[0].name||'workflow');
+    let html =
+      '<div class="nt-name">'+esc(title)+'<span class="nt-badge workflow">workflow</span></div>'+
+      '<div class="nt-meta">'+done+' done  ·  '+running+' running  ·  '+total+' launched</div>';
+    if(runs.length===1){
+      const w=runs[0];
+      if(w.summary) html += '<div class="nt-label">Summary</div><div class="nt-text">'+esc(w.summary)+'</div>';
+      if(w.phases && w.phases.length)
+        html += '<div class="nt-label">Phases</div><div class="nt-text wf-phases">'+
+          w.phases.map(p=>'<span class="wf-phase '+(p.state||'pending')+'">'+esc(p.title)+
+            (p.count!=null?(' '+p.done+'/'+p.count):'')+'</span>').join('<span class="wf-sep">›</span>')+
+          '</div>';
+      if(w.active && w.active.length)
+        html += '<div class="nt-label">Running now</div><div class="nt-text">'+w.active.map(a=>esc((a.detail||'a subagent').slice(0,64))).join('<br>')+'</div>';
+    } else {
+      html += '<div class="nt-label">Runs</div><div class="nt-text">'+
+        runs.map(w=>esc(w.name||'workflow')+' — '+(w.done||0)+'/'+(w.total||0)+(w.running?(' ('+w.running+' live)'):'')).join('<br>')+'</div>';
+    }
+    html += '<div class="nt-hint">a dynamic workflow (Workflow tool)</div>';
+    nametag.innerHTML = html;
+    nametag.style.display='block'; placeNametag(m);
+    return;
+  }
+  // an open-shell terminal window? (above the desk) -- takes precedence over the agent
+  const shx=pickShell(m.x,m.y);
+  if(shx){
+    hover=null; cv.style.cursor='help';
+    const s=shx.shell||{};
+    nametag.innerHTML =
+      '<div class="nt-name">shell<span class="nt-badge working">running</span></div>'+
+      '<div class="nt-label">Command</div>'+
+      '<div class="nt-text">'+esc(s.command||'(background command)')+'</div>'+
+      (s.output_tail ? ('<div class="nt-label">Latest output</div><div class="nt-text">'+esc(s.output_tail)+'</div>') : '')+
+      '<div class="nt-hint">a running background shell</div>';
+    nametag.style.display='block'; placeNametag(m);
+    return;
+  }
+  // a subagent dwarf? (they sit by the desk) -- takes precedence over the agent
   const dw=pickHelper(m.x,m.y);
   if(dw){
     hover=null; cv.style.cursor='help';
-    const s=dw.sub||{}; const ttl=(s.type&&s.type.length)?s.type:'subagent';
+    // subagent dwarf
+    const s=dw.sub||{};
+    // workflow subagents reuse the regular subagent tooltip (same structure + badge style).
+    // "general-purpose"/"workflow-subagent" (uninformative default types) tell you nothing --
+    // for those (or a missing type) show the task detail as the title, dropping the detail line.
+    const isWf = s.type==='workflow-subagent';
+    const generic = !s.type || !s.type.length || s.type==='general-purpose' || isWf;
+    const ttl = generic ? (s.detail || 'a background task') : s.type;
     nametag.innerHTML =
-      '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge scheduled">helper</span></div>'+
-      '<div class="nt-label">This dwarf is</div>'+
-      '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>'+
-      '<div class="nt-hint">a running subagent</div>';
+      '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge scheduled">'+(isWf?'workflow subagent':'helper')+'</span></div>'+
+      (generic ? '' :
+        '<div class="nt-label">This subagent is</div>'+
+        '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>')+
+      '<div class="nt-hint">a running '+(isWf?'workflow ':'')+'subagent</div>';
     nametag.style.display='block'; placeNametag(m);
     return;
   }
@@ -2934,11 +4363,14 @@ cv.addEventListener('mousemove', e=>{
     const where = a.status==='working' ? 'at a desk' : 'in the kitchen';
     const meta = [a.project, a.last_activity_rel? ('active '+a.last_activity_rel):null,
                   (a.message_count!=null? a.message_count+' msgs':null),
-                  (a.subs>0? (a.subs+' helper'+(a.subs>1?'s':'')):null)].filter(Boolean).join('  ·  ');
-    const k = a.latest_kind;
-    const label = a.status==='working'
-      ? (k==='tool' ? 'Currently running' : 'Latest activity')
-      : (k==='tool' ? 'Last action' : 'Latest message');
+                  (a.subs>0? (a.subs+' subagent'+(a.subs>1?'s':'')):null),
+                  (a.spend!=null? '$'+a.spend.toFixed(2):null),
+                  fmtTokens(a.tokens),
+                  (a.model!=null? a.model:null)].filter(Boolean).join('  ·  ');
+    // show the last tool used (with detail) and the last text message SEPARATELY. Fall back
+    // to the generic "latest" only when the split fields aren't populated (e.g. Cursor).
+    const toolLbl = a.status==='working' ? 'Currently running' : 'Last tool used';
+    const hasSplit = a.last_tool || a.last_message;
     nametag.innerHTML =
       '<div class="nt-name">'+esc(nameFor(a.id))+
         '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
@@ -2947,8 +4379,10 @@ cv.addEventListener('mousemove', e=>{
       '<div class="nt-meta">'+esc(meta)+'  ·  '+where+'</div>'+
       '<div class="nt-label">Task</div>'+
       '<div class="nt-text">'+esc(a.title||'(untitled session)')+'</div>'+
-      '<div class="nt-label">'+label+'</div>'+
-      '<div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'+
+      (a.last_instruction ? ('<div class="nt-label">Last instruction</div><div class="nt-text">'+esc(a.last_instruction)+'</div>') : '')+
+      (a.last_tool ? ('<div class="nt-label">'+toolLbl+'</div><div class="nt-text">'+esc(a.last_tool)+'</div>') : '')+
+      (a.last_message ? ('<div class="nt-label">Last message</div><div class="nt-text">'+esc(a.last_message)+'</div>') : '')+
+      (hasSplit ? '' : ('<div class="nt-label">Latest activity</div><div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'))+
       '<div class="nt-hint">click to open full session</div>';
     nametag.style.display='block'; placeNametag(m);
   } else { nametag.style.display='none'; cv.style.cursor='default'; }
@@ -2958,11 +4392,18 @@ cv.addEventListener('click', e=>{
   const m=toCanvas(e);
   const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
+  const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
+  if(slot){ dispenseDrink(slot); return; }
   const p=pick(m.x,m.y);
   if(p) openDetail(p.agent.id);
 });
 
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+// compact token count for the hover card ("1.2M tokens" / "840k tokens")
+function fmtTokens(n){ if(n==null) return null;
+  if(n>=1e6) return (n/1e6).toFixed(n>=1e7?0:1)+'M tokens';
+  if(n>=1e3) return Math.round(n/1e3)+'k tokens';
+  return n+' tokens'; }
 // which tool made this worker -- Cursor vs Claude Code
 function srcLabel(source){ return source==='claude' ? 'Claude Code' : 'Cursor'; }
 function srcBadgeHTML(source){
@@ -3003,6 +4444,21 @@ async function openDetail(id){
   html+='<section><h4>Task</h4><div class="box role-user">'+esc(d.task_full||d.title||'(none)')+'</div></section>';
   if(d.latest_tool){
     html+='<section><h4>Last action</h4><span class="tool">'+esc(d.latest_tool.name)+'</span> '+esc(d.latest_tool.detail||'')+'</section>';
+  }
+  // dynamic Workflow runs -- the easel only shows while the parent is seated, so this
+  // is the place to review a workflow after it finishes and its tent has closed.
+  if(d.workflows && d.workflows.length){
+    html+='<section><h4>Workflows</h4>';
+    for(const w of d.workflows){
+      html+='<div class="box" style="margin-bottom:8px">'+
+        '<div style="font-size:11px;color:var(--card-ink)"><b>'+esc(w.name||'workflow')+'</b> '+
+        '<span class="badge workflow">'+(w.done||0)+'/'+(w.total||0)+'</span>'+
+        (w.running?' <span class="badge working">'+w.running+' running</span>':'')+'</div>'+
+        (w.summary?('<div style="font-size:10px;color:var(--card-ink-lo);margin-top:4px">'+esc(w.summary)+'</div>'):'')+
+        (w.phases&&w.phases.length?('<div style="margin-top:5px">'+w.phases.map(p=>'<span class="tool">'+esc(p.title)+'</span>').join('')+'</div>'):'')+
+      '</div>';
+    }
+    html+='</section>';
   }
   html+='<section><h4>Latest thinking / response</h4><div class="box">'+esc(d.latest_response||'(no assistant message yet)')+'</div></section>';
   if(d.timeline && d.timeline.length){
@@ -3067,6 +4523,18 @@ document.getElementById('celebrate').addEventListener('click',()=>{
   spawnConfetti(W/2, H*0.22);
   toast('party time!');
 });
+// WHIP button: crack the whip -- everyone flinches + works harder ~3s (opposite of CELEBRATE)
+document.getElementById('whip').addEventListener('click',()=>{
+  const now=performance.now();
+  // ONLY the working (seated, at-desk) agents get whipped -- kitchen / beach folk are left alone
+  let struck=0;
+  people.forEach(p=>{ if(p.kind==='work' && p.seated){
+    p.whipUntil=now+1400;                                  // brief "work harder" burst (short)
+    spawnWhip(Math.round(p.x), Math.round(p.y)-Math.round(28*SC));  // a lash snaps over each desk
+    struck++;
+  } });
+  toast(struck ? 'back to work!' : 'nobody at their desk!');
+});
 
 let toastT=null;
 function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.style.display='block';
@@ -3079,6 +4547,8 @@ async function refresh(){
     WINDOW_HOURS=data.hours||24; document.getElementById('emh').textContent=WINDOW_HOURS;
     document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
     agents=data.agents||[]; rebuild();
+    detectMessages(agents);
+    detectInstructions(agents);
     detectFinishes(agents);
   }catch(e){/* keep last */}
 }
@@ -3170,17 +4640,84 @@ namesBtn.addEventListener('click',()=>{
 });
 updateNamesBtn();
 
+// pop a temporary bubble whenever an agent / subagent / workflow-sub authors a NEW message
+// between polls. Desk & kitchen agents key off `latest` (their latest assistant text);
+// dwarves key off each sub's stable `id` + a `ts`/`last_msg` change token.
+function detectMessages(list){
+  const now=performance.now();
+  const cur={};
+  // Track each agent's latest-content token REGARDLESS of working/waiting, so a mere
+  // waiting->working flip (which surfaces the agent's OLD last message as it sits back down)
+  // does NOT read as a "new message" and flash a stale bubble. A bubble/chip fires only when
+  // the content genuinely CHANGES on a WORKING agent, and never while a boss is delivering
+  // an instruction (only the boss talks). 'task' kind shows nothing.
+  for(const a of list)
+    cur[a.id] = (a.latest_kind==='assistant' || a.latest_kind==='tool')
+                ? (a.latest_kind+'|'+(a.latest||'')) : '';
+  if(msgSeen!==null){
+    for(const a of list){ const tok=cur[a.id];
+      if(tok && msgSeen[a.id]!==undefined && msgSeen[a.id]!==tok
+          && a.status==='working' && !bossActive(a.id)){
+        const p=people.find(q=>q.id===a.id);
+        if(p){ const isTool=a.latest_kind==='tool';
+          p.bubbleTool=isTool;
+          p.bubbleText=isTool?toolChip(a.latest):firstWords(a.latest);
+          p.bubbleStart=now; p.bubbleUntil=now+BUBBLE_MS;
+        }
+      }
+    }
+  }
+  msgSeen=cur;
+  const alive=new Set();
+  const scan=(arr)=>{ (arr||[]).forEach(s=>{ if(!s||!s.id) return; alive.add(s.id);
+    const tok=String(s.ts||'')+'|'+(s.last_msg||'');
+    if(s.last_msg && subMsgSeen[s.id]!==undefined && subMsgSeen[s.id]!==tok){
+      const isTool=s.last_kind==='tool';
+      subBubbles[s.id]={text:isTool?toolChip(s.last_msg):firstWords(s.last_msg),
+                        start:now, until:now+BUBBLE_MS, tool:isTool};
+    }
+    subMsgSeen[s.id]=tok;
+  }); };
+  for(const a of list){ scan(a.subagents); (a.workflows||[]).forEach(w=>scan(w.active)); }
+  Object.keys(subMsgSeen).forEach(id=>{ if(!alive.has(id)) delete subMsgSeen[id]; });
+  Object.keys(subBubbles).forEach(id=>{ if(subBubbles[id].until < now-BUBBLE_FADE) delete subBubbles[id]; });
+}
+
+// when a NEW user instruction lands on a working agent between polls, send a "boss" over to
+// that agent's desk to deliver it (a supervisor sprite + a speech bubble with the message).
+function detectInstructions(list){
+  const now=performance.now();
+  const cur={};
+  for(const a of list) cur[a.id] = (a.status==='working') ? (a.last_instruction||'') : '';
+  if(instrSeen!==null){
+    for(const a of list){ const tok=cur[a.id];
+      if(tok && instrSeen[a.id]!==undefined && instrSeen[a.id]!==tok)
+        bossVisits[a.id]={text:tok, start:now, until:now+BOSS_MS};
+    }
+  }
+  instrSeen=cur;
+  Object.keys(bossVisits).forEach(id=>{ if(bossVisits[id].until < now-400) delete bossVisits[id]; });
+}
+
 // fire a celebration (+ chime) when an agent transitions working -> waiting between polls
 function detectFinishes(list){
   const cur={}; list.forEach(a=>cur[a.id]=a.status);
   if(prevStatus===null){ prevStatus=cur; return; }   // first poll: seed map, no fires
   let anyFinished=false;
+  const now=performance.now();
   for(const a of list){
     if(prevStatus[a.id]==='working' && a.status==='waiting'){
       anyFinished=true;
       const p=people.find(q=>q.id===a.id);
-      if(p){ p.celebrateUntil=performance.now()+2200;
-             spawnConfetti(Math.round(p.x), Math.round(p.y)-Math.round(46*SC)); }
+      if(p){ p.celebrateUntil=now+2200;
+             spawnConfetti(Math.round(p.x), Math.round(p.y)-Math.round(46*SC));
+             // the agent's LAST message: it just stood up and left the desk, so
+             // detectMessages (working-only) never bubbled it. Pop it here as a parting
+             // speech bubble that follows the agent as it walks off to the kitchen.
+             if(a.latest_kind==='assistant' && a.latest){
+               p.bubbleTool=false; p.bubbleText=firstWords(a.latest);
+               p.bubbleStart=now; p.bubbleUntil=now+BUBBLE_MS; }
+      }
       else { spawnConfetti(W/2, H*0.2); }
     }
   }
@@ -3190,6 +4727,21 @@ function detectFinishes(list){
 function clock(){ document.getElementById('clock').textContent=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
 setInterval(clock,1000); clock();
 refresh(); setInterval(refresh, 4000);
+// ---- dev hot-reload: in --watch mode the server re-execs on file change, minting a
+// fresh token; the tab reloads itself when it notices. No-op unless --watch is on. ----
+(async function initWatch(){
+  try{
+    const v=await (await fetch('/api/version')).json();
+    if(!v.watch) return;
+    let token=v.token;
+    setInterval(async()=>{
+      try{
+        const n=await (await fetch('/api/version')).json();
+        if(n.token && n.token!==token){ location.reload(); }
+      }catch(e){/* server mid-restart; try again next tick */}
+    }, 1200);
+  }catch(e){/* no version endpoint -> old server, ignore */}
+})();
 requestAnimationFrame(tick);
 </script>
 </body>
@@ -3229,6 +4781,10 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/", "/index.html"):
                 self._send(200, PAGE, "text/html")
                 return
+            if path == "/api/version":
+                # dev hot-reload signal: the page reloads itself when this token changes
+                self._send(200, {"token": START_TOKEN, "watch": WATCH_MODE})
+                return
             if path == "/api/agents":
                 if self.demo:
                     agents = demo_agents()
@@ -3262,6 +4818,38 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
+def _start_watcher(interval=1.0):
+    """Dev hot-reload: watch this source file and re-exec the whole process when it
+    changes, so a single edit refreshes both the backend and the embedded PAGE. The
+    browser tab reloads itself off the new START_TOKEN (see /api/version)."""
+    src = os.path.abspath(__file__)
+    try:
+        last = os.stat(src).st_mtime
+    except OSError:
+        last = 0.0
+
+    def _watch():
+        nonlocal last
+        while True:
+            time.sleep(interval)
+            try:
+                m = os.stat(src).st_mtime
+            except OSError:
+                continue
+            if m != last:
+                last = m
+                print("[watch] change detected -> reloading server...", flush=True)
+                # small settle delay so a half-written file doesn't re-exec mid-save
+                time.sleep(0.3)
+                # mark the re-exec so the reloaded process skips the banner + browser re-open
+                # (execv keeps the current environment) -- the open tab reloads itself instead.
+                os.environ["AGENT_OFFICE_RELOADED"] = "1"
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_watch, daemon=True).start()
+    print(f"[watch] hot-reload on: watching {os.path.basename(src)} for changes", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Game Boy office of your Cursor + Claude Code agents.")
     ap.add_argument("--port", type=int, default=8787)
@@ -3274,6 +4862,8 @@ def main():
                     help="list the projects/roots with active sessions, then exit")
     ap.add_argument("--no-cursor", action="store_true", help="hide Cursor agents")
     ap.add_argument("--no-claude", action="store_true", help="hide Claude Code agents")
+    ap.add_argument("--no-workflows", action="store_true",
+                    help="hide dynamic workflow tents (the Workflow tool's runs)")
     ap.add_argument("--active-secs", type=float, default=120.0,
                     help="multitask subagent freshness window (seconds). A chat whose own "
                          "turn has ended still shows working (at a desk) if a background "
@@ -3282,6 +4872,9 @@ def main():
                          "not recency. Default 120.")
     ap.add_argument("--demo", action="store_true", help="show fake workers (no real data)")
     ap.add_argument("--no-open", action="store_true", help="do not auto-open the browser")
+    ap.add_argument("--watch", action="store_true",
+                    help="dev hot-reload: restart the server (and auto-reload the "
+                         "browser tab) whenever cursor_office.py is edited")
     args = ap.parse_args()
 
     sources = [name for name, _d, _p in _SOURCES
@@ -3300,8 +4893,12 @@ def main():
         print("\nUse:  python3 cursor_office.py --project <name>   to scope to one root.")
         return
 
-    global SUBAGENT_ACTIVE_SECONDS
+    global SUBAGENT_ACTIVE_SECONDS, SHOW_WORKFLOWS, WATCH_MODE
     SUBAGENT_ACTIVE_SECONDS = max(15, args.active_secs)
+    SHOW_WORKFLOWS = not args.no_workflows
+    WATCH_MODE = args.watch
+    if WATCH_MODE:
+        _start_watcher()
 
     Handler.hours = args.hours
     Handler.demo = args.demo
@@ -3323,25 +4920,31 @@ def main():
                 print(f"[!] {d} not found - is {label} installed for this user?")
             print("    You can still preview the office with:  python3 cursor_office.py --demo")
 
-    src_labels = " + ".join(s.capitalize() for s in sources)
-    data_dirs = []
-    if "cursor" in sources:
-        data_dirs.append(CURSOR_PROJECTS_DIR)
-    if "claude" in sources:
-        data_dirs.append(CLAUDE_PROJECTS_DIR)
-    print("=" * 60)
-    print("  AGENT OFFICE  (Game Boy edition)")
-    print("=" * 60)
-    print(f"  Serving at:   {url}")
-    print(f"  Window:       last {args.hours:g}h" + ("   [DEMO MODE]" if args.demo else ""))
-    print(f"  Sources:      {src_labels}")
-    print(f"  Scope:        {args.project or 'ALL projects / roots'}")
-    print(f"  Status:       turn-state (office=turn in progress; multitask subagent window {args.active_secs:g}s; stale cap {WORKING_STALE_CAP_SECONDS:g}s)")
-    print(f"  Data source:  {', '.join(data_dirs)}")
-    print("  Press Ctrl+C to stop.")
-    print("=" * 60)
+    # a --watch re-exec re-runs main(): don't reprint the full banner or reopen the browser
+    # (the already-open tab reloads itself off the new START_TOKEN). Only the FIRST launch does.
+    reloaded = os.environ.get("AGENT_OFFICE_RELOADED") == "1"
+    if reloaded:
+        print(f"[watch] reloaded -> serving at {url}", flush=True)
+    else:
+        src_labels = " + ".join(s.capitalize() for s in sources)
+        data_dirs = []
+        if "cursor" in sources:
+            data_dirs.append(CURSOR_PROJECTS_DIR)
+        if "claude" in sources:
+            data_dirs.append(CLAUDE_PROJECTS_DIR)
+        print("=" * 60)
+        print("  AGENT OFFICE  (Game Boy edition)")
+        print("=" * 60)
+        print(f"  Serving at:   {url}")
+        print(f"  Window:       last {args.hours:g}h" + ("   [DEMO MODE]" if args.demo else ""))
+        print(f"  Sources:      {src_labels}")
+        print(f"  Scope:        {args.project or 'ALL projects / roots'}")
+        print(f"  Status:       turn-state (office=turn in progress; multitask subagent window {args.active_secs:g}s; stale cap {WORKING_STALE_CAP_SECONDS:g}s)")
+        print(f"  Data source:  {', '.join(data_dirs)}")
+        print("  Press Ctrl+C to stop.")
+        print("=" * 60)
 
-    if not args.no_open:
+    if not args.no_open and not reloaded:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
     try:
