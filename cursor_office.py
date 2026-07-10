@@ -485,10 +485,13 @@ def _open_shells_claude(path, cap=6):
                         finished.add(ti.group(1))
     except Exception:
         return []
+    # PRIORITISE running shells (newest-first), then fill with the most-recent finished ones,
+    # THEN cap. Otherwise a long-lived shell (e.g. a --watch dev server) gets capped out by a
+    # burst of newer, already-finished commands and never shows -- even while still running.
+    newest = list(reversed(order))
+    ordered = [t for t in newest if t not in finished] + [t for t in newest if t in finished]
     out = []
-    for tid in reversed(order):          # newest-first
-        if len(out) >= cap:
-            break
+    for tid in ordered[:cap]:
         s = shells[tid]
         tail = ""
         try:
@@ -729,6 +732,10 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "preview": (task_full[:360].rstrip() + (" ..." if len(task_full) > 360 else "")) or title,
         "latest": latest_short or title,
         "latest_kind": latest_kind,
+        # for the hover card: the last tool used (with detail) and the last text message,
+        # kept SEPARATE (the ephemeral chip only shows the short tool name).
+        "last_tool": (("%s: %s" % (latest_tool["name"], latest_tool.get("detail", ""))).strip().rstrip(":") if latest_tool else ""),
+        "last_message": ((latest_response[:360].rstrip() + (" ..." if len(latest_response) > 360 else "")) if latest_response else ""),
         "message_count": msg_count,
         "mtime": mtime,
         "last_activity_rel": _rel_time(time.time() - mtime),
@@ -1028,6 +1035,10 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "preview": (task_full[:360].rstrip() + (" ..." if len(task_full) > 360 else "")) or title,
         "latest": latest_short or title,
         "latest_kind": latest_kind,
+        # hover card: last tool used (with detail) + last text message, kept SEPARATE
+        # (the ephemeral chip only shows the short tool name).
+        "last_tool": (("%s: %s" % (latest_tool["name"], latest_tool.get("detail", ""))).strip().rstrip(":") if latest_tool else ""),
+        "last_message": ((latest_response[:360].rstrip() + (" ..." if len(latest_response) > 360 else "")) if latest_response else ""),
         "last_instruction": last_instruction,
         "message_count": msg_count,
         "model": usage["model"],
@@ -1507,11 +1518,11 @@ def get_agents(hours, full=False, project_filter=None, sources=None):
             a["last_activity_rel"] = _rel_time(time.time() - mtime)
             a["subagents"] = _subagent_infos(_sub_files)   # running subagents -> little helpers
             a["subs"] = len(a["subagents"])
-            # open background shells (Claude only) -> little terminal windows by the desk.
-            # Only for at-desk (working) sessions: a background shell survives the turn, but
-            # showing it while working keeps the metaphor tight and avoids re-parsing every
-            # dormant transcript each poll. Only genuinely-running ones become sprites.
-            if _src == "claude" and a["status"] == "working":
+            # open background shells (Claude only) -> little terminal windows. A background
+            # shell survives the turn, so show it whether the chat is at a desk (working) or
+            # in the kitchen (waiting) -- but not for archived/beach agents. Only genuinely-
+            # running ones become sprites.
+            if _src == "claude" and a["status"] in ("working", "waiting"):
                 a["shells"] = [s for s in _open_shells_claude(path) if s["running"]][:3]
             else:
                 a["shells"] = []
@@ -1616,6 +1627,10 @@ def demo_agents():
              "output_tail": "payments-1  | Listening on :9099"},
             {"id": "sh-h2", "command": "python3 -m http.server 8080", "running": True,
              "output_tail": "Serving HTTP on 0.0.0.0 port 8080 ..."}],
+        # a WAITING (kitchen) agent with a live shell -> exercises kitchen-shell rendering
+        "demo-dddd-0004": [
+            {"id": "sh-d1", "command": "pytest -q --looponfail tests/importer", "running": True,
+             "output_tail": "watching for changes... / 12 passed in 0.42s"}],
     }
     out = []
     for idx, (uuid, status, title, ago, source, scheduled, subagents, workflows) in enumerate(samples):
@@ -1663,6 +1678,8 @@ def demo_agents():
             "preview": title,
             "latest": latest,
             "latest_kind": lkind,
+            "last_tool": ["Bash: pytest -q tests/", "Edit: service.py", "Grep: export path", "Read: config.yaml"][idx % 4],
+            "last_message": latest if lkind == "assistant" else ("Reviewing the changes about " + title.split()[0].lower()),
             "last_instruction": last_instr,
             "message_count": 12,
             "model": "Opus 4.8" if source == "claude" else None,
@@ -3446,15 +3463,9 @@ function drawToolChip(x, y, name, alpha, below){
   ctx.fillText(label, ix+icon+gap, by+h-3);
   ctx.textAlign='left'; ctx.restore();
 }
-// tool chip label: "NAME detail" -- tool name upper-cased + the file/target it acted on
-// (e.g. "EDIT service.py", "BASH npm run dev"), so file edits etc. show WHAT, not just that a
-// tool ran. Falls back to just the NAME when there's no detail.
-function toolChip(s){ s=String(s||''); const i=s.indexOf(':');
-  if(i<=0) return s.trim().toUpperCase();
-  const name=s.slice(0,i).trim().toUpperCase();
-  let detail=s.slice(i+1).trim();
-  if(detail.length>16) detail=detail.slice(0,16);
-  return detail ? (name+' '+detail) : name; }
+// tool chip label: just the short tool NAME (e.g. "BASH", "EDIT") for the compact ephemeral
+// chip. The detailed "Bash: npm run dev" lives in the hover card (last_tool), not here.
+function toolChip(s){ s=String(s||''); const i=s.indexOf(':'); return (i>0?s.slice(0,i):s).trim().toUpperCase(); }
 // a stern "boss" / supervisor in a suit + red tie, one arm pointing at the desk. Same scale as
 // a standing worker -- pops up beside a desk to deliver a fresh user instruction (see below).
 function drawBoss(x, y, t, moving){
@@ -3673,6 +3684,17 @@ function render(t){
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
       if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t); else drawStanding(e.p,t);
       ctx.restore();
+      // a WAITING (kitchen) agent's open background shells float above its head, so a running
+      // shell (e.g. a dev server) stays visible after the chat leaves the desk for the kitchen.
+      if(e.p.kind==='wait' && e.p.agent && e.p.agent.shells && e.p.agent.shells.length){
+        const sh=e.p.agent.shells, m=Math.min(sh.length,3);
+        const base = Math.round(e.p.x - ((m-1)*22+17)/2);   // centre the row over the head
+        ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
+        for(let i=0;i<m;i++){ const slot=m-1-i, sx=base+slot*22, sy=e.p.y-42;
+          drawShellWin(sx, sy, t, (hash(e.p.id)+i*5)%997);
+          shellHits.push({ x: e.p.x+((sx+8)-e.p.x)*SC, y: e.p.y+((sy+6)-e.p.y)*SC, r: 11*SC, shell: sh[i] }); }
+        ctx.restore();
+      }
       if(e.p.bubbleUntil>bt && !bossActive(e.p.id)) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
@@ -4261,10 +4283,10 @@ cv.addEventListener('mousemove', e=>{
                   (a.spend!=null? '$'+a.spend.toFixed(2):null),
                   fmtTokens(a.tokens),
                   (a.model!=null? a.model:null)].filter(Boolean).join('  ·  ');
-    const k = a.latest_kind;
-    const label = a.status==='working'
-      ? (k==='tool' ? 'Currently running' : 'Latest activity')
-      : (k==='tool' ? 'Last action' : 'Latest message');
+    // show the last tool used (with detail) and the last text message SEPARATELY. Fall back
+    // to the generic "latest" only when the split fields aren't populated (e.g. Cursor).
+    const toolLbl = a.status==='working' ? 'Currently running' : 'Last tool used';
+    const hasSplit = a.last_tool || a.last_message;
     nametag.innerHTML =
       '<div class="nt-name">'+esc(nameFor(a.id))+
         '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
@@ -4274,8 +4296,9 @@ cv.addEventListener('mousemove', e=>{
       '<div class="nt-label">Task</div>'+
       '<div class="nt-text">'+esc(a.title||'(untitled session)')+'</div>'+
       (a.last_instruction ? ('<div class="nt-label">Last instruction</div><div class="nt-text">'+esc(a.last_instruction)+'</div>') : '')+
-      '<div class="nt-label">'+label+'</div>'+
-      '<div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'+
+      (a.last_tool ? ('<div class="nt-label">'+toolLbl+'</div><div class="nt-text">'+esc(a.last_tool)+'</div>') : '')+
+      (a.last_message ? ('<div class="nt-label">Last message</div><div class="nt-text">'+esc(a.last_message)+'</div>') : '')+
+      (hasSplit ? '' : ('<div class="nt-label">Latest activity</div><div class="nt-text">'+esc(a.latest||a.preview||a.title||'')+'</div>'))+
       '<div class="nt-hint">click to open full session</div>';
     nametag.style.display='block'; placeNametag(m);
   } else { nametag.style.display='none'; cv.style.cursor='default'; }
@@ -4539,15 +4562,18 @@ updateNamesBtn();
 function detectMessages(list){
   const now=performance.now();
   const cur={};
-  // ONLY working (at-desk) agents pop an ephemeral indicator -- kitchen (waiting) and beach
-  // (archived) agents are idle. A working agent shows a white speech bubble when it writes
-  // text and a dark TOOL CHIP when it runs a tool (a.latest_kind); 'task' shows nothing.
+  // Track each agent's latest-content token REGARDLESS of working/waiting, so a mere
+  // waiting->working flip (which surfaces the agent's OLD last message as it sits back down)
+  // does NOT read as a "new message" and flash a stale bubble. A bubble/chip fires only when
+  // the content genuinely CHANGES on a WORKING agent, and never while a boss is delivering
+  // an instruction (only the boss talks). 'task' kind shows nothing.
   for(const a of list)
-    cur[a.id] = (a.status==='working' && (a.latest_kind==='assistant' || a.latest_kind==='tool'))
+    cur[a.id] = (a.latest_kind==='assistant' || a.latest_kind==='tool')
                 ? (a.latest_kind+'|'+(a.latest||'')) : '';
   if(msgSeen!==null){
     for(const a of list){ const tok=cur[a.id];
-      if(tok && msgSeen[a.id]!==undefined && msgSeen[a.id]!==tok){
+      if(tok && msgSeen[a.id]!==undefined && msgSeen[a.id]!==tok
+          && a.status==='working' && !bossActive(a.id)){
         const p=people.find(q=>q.id===a.id);
         if(p){ const isTool=a.latest_kind==='tool';
           p.bubbleTool=isTool;
