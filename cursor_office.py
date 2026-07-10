@@ -4235,17 +4235,18 @@ cv.addEventListener('mousemove', e=>{
     hover=null; cv.style.cursor='help';
     // subagent dwarf
     const s=dw.sub||{};
+    // workflow subagents reuse the regular subagent tooltip (same structure + badge style).
     // "general-purpose"/"workflow-subagent" (uninformative default types) tell you nothing --
     // for those (or a missing type) show the task detail as the title, dropping the detail line.
-    const generic = !s.type || !s.type.length || s.type==='general-purpose' || s.type==='workflow-subagent';
-    const ttl = generic ? (s.detail || 'a background task') : s.type;
     const isWf = s.type==='workflow-subagent';
+    const generic = !s.type || !s.type.length || s.type==='general-purpose' || isWf;
+    const ttl = generic ? (s.detail || 'a background task') : s.type;
     nametag.innerHTML =
-      '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge '+(isWf?'workflow':'scheduled')+'">'+(isWf?'workflow sub':'helper')+'</span></div>'+
+      '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge scheduled">'+(isWf?'workflow subagent':'helper')+'</span></div>'+
       (generic ? '' :
         '<div class="nt-label">This subagent is</div>'+
         '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>')+
-      '<div class="nt-hint">'+(isWf?'a running workflow subagent':'a running subagent')+'</div>';
+      '<div class="nt-hint">a running '+(isWf?'workflow ':'')+'subagent</div>';
     nametag.style.display='block'; placeNametag(m);
     return;
   }
