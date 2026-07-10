@@ -2286,7 +2286,8 @@ function drawFloor(){
   px(0,WALL_H-8,W,2,shade(PAL.wall,-.06)); px(0,WALL_H-5,W,3,PAL.trim); px(0,WALL_H-2,W,2,PAL.base);
   const winW = Math.round(W*0.36);   // slimmer window -> room for the wider board
   drawWindow(20, 8, winW, WALL_H-20);
-  drawWallDecor(20+winW+16, 6);
+  const wl = wallRowLayout();
+  drawWallDecor(wl.boardX, 6, wl.clkL, wl.shfL);
 
   // kitchen floor (warm tiles)
   for(let y=L.kitchenTop;y<H;y+=20){
@@ -2630,7 +2631,21 @@ function wrapText(text, maxW, font){
   return lines;
 }
 
-function drawWallDecor(x,y){
+// evenly space the clock (24w), bookshelf (50w) and DO GOOD WORK poster (54w) across the wall
+// to the RIGHT of the inspiration board -> equal gaps between the three, robust to canvas W.
+// Shared by drawWallDecor (clock + shelf) and drawOfficeProps (poster) so they stay in sync.
+function wallRowLayout(){
+  const boardX = 20 + Math.round(W*0.36) + 16, boardW = 210;
+  const clkW = 24, shfW = 50, posW = 54;
+  const boardRight = boardX + boardW;
+  const gap = ((W-9 - (boardRight+12)) - (clkW+shfW+posW)) / 2;   // 2 equal gaps between 3 items
+  const clkL = boardRight + 12;
+  const shfL = clkL + clkW + gap;
+  const posL = shfL + shfW + gap;
+  return { boardX, clkL, shfL, posL };
+}
+
+function drawWallDecor(x, y, clkL, shfL){
   // ---- inspiration board: a quote that changes every 10 minutes (whole board) ----
   const bw=210, bh=58; px(x-3,y-3,bw+6,bh+6,PAL.metalDk); px(x,y,bw,bh,PAL.paper);
   px(x,y,bw,2,'#eef0f3'); px(x,y+bh-2,bw,2,'#cfcfd6'); px(x+bw-2,y,2,bh,'#dadbe0');
@@ -2645,8 +2660,8 @@ function drawWallDecor(x,y){
   const lines=wrapText('“'+q[0]+'”', bw-18, qfont).slice(0,4);
   let qy=y+25; for(const ln of lines){ ctx.fillText(ln, x+8, qy); qy+=7; }
   ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], x+8, qy+2);
-  // ---- wall clock (live local time) ----
-  const clx=x+bw+12, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
+  // ---- wall clock (live local time) -- x-pos comes from wallRowLayout() (even spacing) ----
+  const clx=clkL+3, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
   for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
   const ccx=clx+9, ccy=cly+9, now=new Date();
   const hA=((now.getHours()%12)+now.getMinutes()/60)*Math.PI/6;    // 30 deg/hr + drift
@@ -2661,8 +2676,8 @@ function drawWallDecor(x,y){
   ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+7.5*Math.sin(sA), ccy-7.5*Math.cos(sA)); ctx.stroke();
   ctx.lineCap='butt';
   px(clx+8,cly+8,2,2,PAL.red);                                  // center hub
-  // ---- bookshelf with books + a little plant on top ----
-  const shx=clx+30, shy=y+12; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
+  // ---- bookshelf with books + a little plant on top (x-pos from wallRowLayout) ----
+  const shx=shfL+2, shy=y+12; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
   const cols=[PAL.mugA,PAL.mugB,PAL.mugC,PAL.leafDk,PAL.red,PAL.yellow,PAL.orange,'#8c5fd6'];
   for(let r=0;r<3;r++){ const ry=shy+5+r*16;
     for(let b=0;b<5;b++){ const bbh=11-((b+r)%2)*2; px(shx+4+b*8,ry+(11-bbh),6,bbh,cols[(b+r*3)%cols.length]); }
@@ -2675,8 +2690,8 @@ function drawOfficeProps(){
   const L=layout(), top=WALL_H;
   // plants flanking the window
   bigPlant(14, top+10); bigPlant(W-30, top+10);
-  // "DO GOOD WORK" poster on the office back wall (far right, above the desks)
-  drawDoGoodWork(W-60, 6);
+  // "DO GOOD WORK" poster on the office back wall -- evenly spaced with the clock + bookshelf
+  drawDoGoodWork(wallRowLayout().posL+3, 6);
 
   const lastDeskY = deskSlots.length ? Math.max.apply(null, deskSlots.map(s=>s.y)) : top+120;
   // soft rug spanning the desk area
