@@ -341,6 +341,41 @@ def _first_user_text(path):
     return ""
 
 
+def _last_assistant_text(path):
+    """Latest assistant-authored text from a transcript (Cursor or Claude line format),
+    scanned from the end. Used to bubble what a subagent just said."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return ""
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or '"assistant"' not in line:   # cheap pre-filter
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        role = o.get("role") or ((o.get("message") or {}).get("role"))
+        if role != "assistant":
+            continue
+        c = (o.get("message") or {}).get("content")
+        if c is None:
+            c = o.get("content")
+        if isinstance(c, str):
+            txt = _clean_text(c)
+            if txt:
+                return txt
+        elif isinstance(c, list):
+            parts = [b.get("text", "") for b in c
+                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+            txt = _clean_text("\n".join(parts))
+            if txt:
+                return txt
+    return ""
+
+
 def _subagent_infos(sub_files):
     """For the *currently running* subagents, return [{type, detail}] describing what
     each is doing. Claude subagents carry a sibling ``<name>.meta.json`` with an
@@ -365,7 +400,9 @@ def _subagent_infos(sub_files):
             pass
         if not detail:
             detail = _first_user_text(path)
-        infos.append({"type": typ, "detail": detail[:140]})
+        sub_id = os.path.splitext(os.path.basename(path))[0]
+        infos.append({"type": typ, "detail": detail[:140],
+                      "id": sub_id, "last_msg": _last_assistant_text(path)[:160], "ts": m})
     return infos
 
 
@@ -1172,7 +1209,8 @@ def _workflow_progress(run_dir):
         running_fresh += 1
         if len(active) < 6:
             ap = os.path.join(run_dir, "agent-%s.jsonl" % best_aid)
-            active.append({"type": "workflow-subagent", "detail": _first_user_text(ap)[:140]})
+            active.append({"type": "workflow-subagent", "detail": _first_user_text(ap)[:140],
+                           "id": best_aid, "last_msg": _last_assistant_text(ap)[:160], "ts": best_am})
     return {
         "total": base["total"],
         "done": base["done"],
@@ -1383,11 +1421,17 @@ def get_agent_detail(uuid):
 
 def demo_agents():
     now = time.time()
-    subs_a = [{"type": "code-reviewer", "detail": "Review the working diff for bugs"},
-              {"type": "test-runner", "detail": "Run the unit test suite"}]
-    subs_e = [{"type": "explorer", "detail": "Map the ORM query paths"},
-              {"type": "db-analyst", "detail": "EXPLAIN the slow orders query"},
-              {"type": "doc-writer", "detail": "Draft the fix summary"}]
+    blip = int(now // 6)   # rotates demo messages every 6s so speech bubbles pop in --demo
+    subs_a = [{"type": "code-reviewer", "detail": "Review the working diff for bugs",
+               "id": "demoA-0", "last_msg": "found a bug in the export path (%d)" % blip, "ts": now},
+              {"type": "test-runner", "detail": "Run the unit test suite",
+               "id": "demoA-1", "last_msg": "unit suite running, pass %d" % blip, "ts": now}]
+    subs_e = [{"type": "explorer", "detail": "Map the ORM query paths",
+               "id": "demoE-0", "last_msg": "tracing ORM path #%d" % blip, "ts": now},
+              {"type": "db-analyst", "detail": "EXPLAIN the slow orders query",
+               "id": "demoE-1", "last_msg": "EXPLAIN pass %d" % blip, "ts": now},
+              {"type": "doc-writer", "detail": "Draft the fix summary",
+               "id": "demoE-2", "last_msg": "drafting summary v%d" % blip, "ts": now}]
     wf_demo = [{
         "runId": "wf_demo01",
         "name": "exhaustive-security-audit",
@@ -1396,9 +1440,12 @@ def demo_agents():
                    {"title": "Synthesize", "state": "pending"}],
         "phase_trusted": False,
         "total": 21, "done": 14, "running": 3,
-        "active": [{"type": "workflow-subagent", "detail": "Verify the auth-bypass finding"},
-                   {"type": "workflow-subagent", "detail": "Refute the SSRF candidate"},
-                   {"type": "workflow-subagent", "detail": "Check the deserialization sink"}],
+        "active": [{"type": "workflow-subagent", "detail": "Verify the auth-bypass finding",
+                    "id": "demoW-0", "last_msg": "auth-bypass looks real (%d)" % blip, "ts": now},
+                   {"type": "workflow-subagent", "detail": "Refute the SSRF candidate",
+                    "id": "demoW-1", "last_msg": "SSRF refuted, pass %d" % blip, "ts": now},
+                   {"type": "workflow-subagent", "detail": "Check the deserialization sink",
+                    "id": "demoW-2", "last_msg": "checking sink %d" % blip, "ts": now}],
     }]
     samples = [
         ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a, []),
@@ -1429,7 +1476,7 @@ def demo_agents():
             "status": status,
             "title": title,
             "preview": title,
-            "latest": ("Reviewing the latest changes and preparing a response about: " + title),
+            "latest": ("Reviewing the latest changes and preparing a response about: " + title + (" [%d]" % blip)),
             "latest_kind": "assistant",
             "last_instruction": ("Please " + title[0].lower() + title[1:]),
             "message_count": 12,
@@ -1494,11 +1541,11 @@ PAGE = r"""<!DOCTYPE html>
     font-size:11px;color:#5a564d;letter-spacing:1px;}
   #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
     box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
-  #brand #celebrate,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+  #brand #celebrate,#brand #whip,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
     background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
-  #brand #celebrate:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
-  #brand #celebrate:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
-  #brand #sound,#brand #filter,#brand #names{margin-left:8px;}
+  #brand #celebrate:hover,#brand #whip:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active,#brand #whip:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
+  #brand #sound,#brand #filter,#brand #names,#brand #whip{margin-left:8px;}
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
@@ -1581,7 +1628,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button><span id="clock"></span></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="whip" title="crack the whip &mdash; everyone works harder">WHIP</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button><span id="clock"></span></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
@@ -1642,6 +1689,8 @@ ctx.imageSmoothingEnabled = false;
 // global art scale: characters + desks are drawn larger (about their anchor) so
 // the rooms feel filled. ALL hitbox / hover-ring / pick() math multiplies by SC.
 const SC = 1.5;
+const BUBBLE_MS = 6200;    // speech-bubble lifetime (ms)
+const BUBBLE_FADE = 900;   // fade-out tail (ms)
 // the bottom band is split: KITCHEN (waiting) on the left, BEACH (finished, resting)
 // on the right. BEACH_X is the divider; everything to its right is sand + water.
 const BEACH_X = Math.round(W*0.60);
@@ -1736,6 +1785,9 @@ let people = [];      // live sprites with positions
 let deskSlots = [];   // fixed office desks (always drawn; some hold a worker)
 let helperHits = [];  // per-frame hover regions for the subagent dwarves
 let workflowHits = []; // per-frame hover regions for the workflow tents
+let bubbleAnchors = []; // per-frame: bubbles to draw as a screen-space overlay
+let vendSlots = [];   // per-frame click rects for the vending-machine drink slots
+let vendDrops = {};   // slot idx -> {start,col,fromX,fromY} while a can is dropping/resting
 let deskAssign = {};  // agent id -> stable desk slot index (kept across refreshes)
 let seatAssign = {};  // agent id -> stable kitchen seat index
 let beachAssign = {}; // agent id -> stable beach spot index (finished agents)
@@ -1743,7 +1795,11 @@ let hover = null;
 let detailCache = {};
 let WINDOW_HOURS = 24;
 let confetti = [];          // celebration particles (capped, auto-expire)
+let whipFx = [];            // whip-crack particles: one lash line + shock streaks (capped, auto-expire)
 let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
+let msgSeen = null;   // id -> last assistant `latest` seen (desk agents); null until first poll
+let subMsgSeen = {};  // subId -> last change-token (subagents + workflow subs)
+let subBubbles = {};  // subId -> {text,start,until} active dwarf bubbles
 let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // filter couriers (default off)
 // agents the user has marked "finished" -- they go rest on the beach until unmarked.
 // User-controlled and sticky (persisted), independent of the working/waiting status.
@@ -1754,9 +1810,10 @@ function saveFinished(){ localStorage.setItem('office_finished', JSON.stringify(
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
 // the same rAF clock so it can't drift like a stray setInterval. These critters live
 // ONLY in the animation layer: pick(), hover, confetti and polling never see them.
-let amb = { dog:null, cat:null };   // at most one of each on screen
+let amb = { dog:null, cat:null, plane:null };   // at most one of each on screen
 let nextEventAt = 0;                // performance.now() ms of the next event
 let lastEventType = null;           // avoid firing the same type twice in a row
+let nextPlaneAt = 0;                // performance.now() ms of the next window fly-by
 
 // stable kitchen floor spots (hand-placed, ≥~44px apart, CLEAR of the fridge/counter,
 // the lounge table+poufs, the couch, the REFRESH! machine and the wall signs). Used
@@ -1885,6 +1942,18 @@ function rebuild(){
     }));
   });
 
+  // pair each waiting agent with its nearest kitchen neighbour (by anchor) so they can
+  // occasionally turn and chat. Recomputed every poll, so it tracks relocations.
+  const waitList = next.filter(p=>p.kind==='wait');
+  for(const p of waitList){
+    let bx=null, bd=80;                       // only pair within ~80px
+    for(const q of waitList){ if(q===p) continue;
+      const d=Math.hypot(p.home.x-q.home.x, p.home.y-q.home.y);
+      if(d<bd){ bd=d; bx=q.home.x; }
+    }
+    p.talkX = bx;   // x of the neighbour to face while chatting (null = nobody near)
+  }
+
   // beach: finished agents walk over to the sand and chill until you unmark them.
   beachers.forEach(a=>{
     const old = prevById[a.id];
@@ -1981,8 +2050,17 @@ function heartBubble(x,y){
   px(x-3,y-4,3,3,PAL.pink); px(x+1,y-4,3,3,PAL.pink);        // heart lobes
   px(x-4,y-2,9,2,PAL.pink); px(x-2,y,5,2,PAL.pink); px(x,y+2,1,1,PAL.pink);
 }
+// a small speech bubble with 1-3 chat dots (kitchen small-talk)
+function talkBubble(x,y,n){
+  px(x-8,y-7,18,11,PAL.paper); px(x-8,y-7,18,1,'#ececf2'); px(x-8,y+3,18,1,'#d6d6de');
+  px(x-9,y-5,1,7,PAL.paper); px(x+10,y-5,1,7,PAL.paper);
+  px(x-3,y+4,3,3,PAL.paper); px(x-2,y+7,2,2,PAL.paper);     // little tail
+  const dk='#8a8f9c';
+  for(let i=0;i<n;i++) px(x-5+i*5,y-2,3,3,dk);              // 1..3 talk dots
+}
 
 const WALL_H = 78;
+const WIN = { x:20, y:8, w:Math.round(W*0.36), h:WALL_H-20 };  // sky-window glass rect (drawWindow args)
 
 function drawFloor(){
   const L=layout(), oh=L.office.h;
@@ -2140,6 +2218,8 @@ function drawWindow(x,y,w,h){
     cloud(x+w*0.16, y+h*0.20); cloud(x+w*0.44, y+h*0.12); cloud(x+w*0.70, y+h*0.26);
     drawSkyline(x,y,w,h, PAL.bldg1, 0.62, 11, false);
   }
+  // occasional airliner drifting across the sky (clipped to the glass, behind the mullions)
+  if(amb.plane){ ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip(); drawPlane(amb.plane); ctx.restore(); }
   // chunky mullions: vertical panes + one horizontal transom (dark core + light edge)
   const panes=4, pw=w/panes;
   for(let i=1;i<panes;i++){ px(x+Math.round(i*pw)-1,y,3,h,PAL.woodDk); px(x+Math.round(i*pw)-1,y,1,h,PAL.wood); }
@@ -2337,14 +2417,24 @@ function drawWallDecor(x,y){
   const lines=wrapText('“'+q[0]+'”', bw-18, qfont).slice(0,4);
   let qy=y+25; for(const ln of lines){ ctx.fillText(ln, x+8, qy); qy+=7; }
   ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], x+8, qy+2);
-  // ---- clean wall clock ----
+  // ---- wall clock (live local time) ----
   const clx=x+bw+12, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
   for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
-  ctx.strokeStyle=PAL.ink; ctx.lineWidth=1.4; ctx.beginPath();
-  ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+9,cly+4); ctx.moveTo(clx+9,cly+9); ctx.lineTo(clx+13,cly+11); ctx.stroke();
+  const ccx=clx+9, ccy=cly+9, now=new Date();
+  const hA=((now.getHours()%12)+now.getMinutes()/60)*Math.PI/6;    // 30 deg/hr + drift
+  const mA=(now.getMinutes()+now.getSeconds()/60)*Math.PI/30;      // 6 deg/min
+  const sA=now.getSeconds()*Math.PI/30;                            // 6 deg/sec
+  ctx.lineCap='round';
+  ctx.strokeStyle=PAL.ink; ctx.lineWidth=1.5; ctx.beginPath();     // hour hand (short, thick)
+  ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+4.5*Math.sin(hA), ccy-4.5*Math.cos(hA)); ctx.stroke();
+  ctx.lineWidth=1.1; ctx.beginPath();                              // minute hand (long)
+  ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+7*Math.sin(mA), ccy-7*Math.cos(mA)); ctx.stroke();
+  ctx.strokeStyle=PAL.red; ctx.lineWidth=0.7; ctx.beginPath();     // thin red second hand
+  ctx.moveTo(ccx,ccy); ctx.lineTo(ccx+7.5*Math.sin(sA), ccy-7.5*Math.cos(sA)); ctx.stroke();
+  ctx.lineCap='butt';
   px(clx+8,cly+8,2,2,PAL.red);                                  // center hub
   // ---- bookshelf with books + a little plant on top ----
-  const shx=clx+30, shy=y-2; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
+  const shx=clx+30, shy=y+12; px(shx-2,shy-2,50,56,PAL.woodDk); px(shx,shy,46,52,PAL.wood); px(shx,shy,46,2,PAL.woodHi);
   const cols=[PAL.mugA,PAL.mugB,PAL.mugC,PAL.leafDk,PAL.red,PAL.yellow,PAL.orange,'#8c5fd6'];
   for(let r=0;r<3;r++){ const ry=shy+5+r*16;
     for(let b=0;b<5;b++){ const bbh=11-((b+r)%2)*2; px(shx+4+b*8,ry+(11-bbh),6,bbh,cols[(b+r*3)%cols.length]); }
@@ -2483,8 +2573,10 @@ function drawKitchenProps(){
   const drinks=[PAL.red,PAL.mugB,PAL.yellow,PAL.leaf,PAL.orange,PAL.pink,PAL.mugC,'#8c5fd6','#22b9b9','#e673a8','#5bc05b','#3f74d6'];
   for(let r=0;r<3;r++){ const ry=gy+4+r*17;
     px(gx+1,ry+14,gw-2,2,'#243a6a');                                                                  // shelf
-    for(let c=0;c<4;c++){ const bxv=gx+3+c*10, col=drinks[r*4+c];
-      px(bxv,ry+2,6,12,col); px(bxv,ry+2,6,2,shade(col,.32)); px(bxv+1,ry,3,3,col); } }              // bottle + cap
+    for(let c=0;c<4;c++){ const idx=r*4+c, bxv=gx+3+c*10, col=drinks[idx];
+      vendSlots.push({idx, bxv, ry, x0:bxv-1, y0:ry-1, x1:bxv+7, y1:ry+15, col});                     // click target
+      if(vendDrops[idx]) continue;                                                                    // slot empty while its can is out
+      px(bxv,ry+2,6,12,col); px(bxv,ry+2,6,2,shade(col,.32)); px(bxv+1,ry,3,3,col); } }               // bottle + cap
   px(gx+3,gy+2,2,gh-6,'rgba(255,255,255,.12)'); px(gx+8,gy+2,1,gh-6,'rgba(255,255,255,.06)');         // glass reflection
   // side panel: keypad + card reader + coin slot
   const spx=vx+48, spw=vw-(spx-vx)-4; px(spx,vy+19,spw,54,'#24407e'); px(spx,vy+19,spw,1,shade('#24407e',.3));
@@ -2493,6 +2585,14 @@ function drawKitchenProps(){
   px(spx+2,vy+55,spw-4,3,'#0a1024');                                                                  // coin slot
   // dispense slot / tray at the bottom
   px(vx+5,vy+vh-13,vw-10,9,'#0e1c44'); px(vx+7,vy+vh-11,vw-14,5,'#0a1024');
+  // clicked drinks fall from their slot into the tray, rest a few seconds, then restock (see tick())
+  const _vnow=performance.now(), trayCX=vx+vw/2-3, trayTopY=vy+vh-22;   // rest: centered, poking out of the tray
+  for(const k in vendDrops){ const dp=vendDrops[k], el=_vnow-dp.start;
+    const pf=Math.min(1, el/620), ease=pf*pf;                            // accelerate downward (gravity)
+    const cx0=dp.fromX+(trayCX-dp.fromX)*pf;                             // slide toward tray x
+    let   cy0=dp.fromY+(trayTopY-dp.fromY)*ease;                         // fall with easing
+    if(pf>=1){ const bt=Math.max(0,1-(el-620)/240); cy0-=Math.abs(Math.sin((el-620)*0.03))*4*bt; }    // small settle bounce
+    px(cx0,cy0+2,6,12,dp.col); px(cx0,cy0+2,6,2,shade(dp.col,.32)); px(cx0+1,cy0,3,3,dp.col); }        // the dispensed can
 
   // ---- lounge: BIG wood table w/ fruit bowl + two white mugs, flanked by round
   // pink poufs (bottom-left). Sized to fill the corner; agents kept clear. ----
@@ -2564,15 +2664,29 @@ function beachUmbrella(x,y){
   px(cx-27,y+22,54,1,PAL.outline);                                     // canopy rim
   px(cx-2,y+2,4,4,'#ffd34d');                                          // finial
 }
+let _sandGrains=null;                                                   // grain built once -> no per-frame flicker & no per-frame hashing
 function drawBeachFloor(){
-  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H;
-  px(x0-1,y0,2,y1-y0,shade(PAL.base,-.10));                            // divider edge
-  for(let y=y0;y<y1;y+=8) for(let x=x0;x<W;x+=8)                       // speckled sand
-    px(x,y,8,8, ((x/8+y/8)&1) ? '#efdca6' : '#e7d199');
-  for(let i=0;i<44;i++){ const sx=x0+((i*57)%(W-x0)), sy=y0+((i*89)%(y1-y0)); px(sx,sy,1,1,'rgba(150,120,60,.22)'); }
-  // water strip + foam shoreline along the far-right edge
-  const wx=W-22;
-  px(wx-3,y0,3,y1-y0,'#dcc891');                                       // damp sand
+  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H, wx=W-22;
+  const base='#e7d3a0', sandW=wx-x0, hgt=y1-y0;
+  px(x0-1,y0,2,hgt,shade(PAL.base,-.10));                              // divider edge
+  // --- dry sand: warm base + soft vertical gradient (paler/drier up near the wall) ---
+  px(x0,y0,sandW,hgt,base);
+  px(x0,y0,sandW,Math.round(hgt*0.30),shade(base,.05));               // dry top strip
+  const _by=y0+Math.round(hgt*0.74); px(x0,_by,sandW,y1-_by,shade(base,-.05)); // warmer front
+  // --- damp sand graduating toward the waterline on the right ---
+  px(wx-11,y0,11,hgt,shade(base,-.06)); px(wx-5,y0,5,hgt,shade(base,-.13)); px(wx-2,y0,2,hgt,'#cfb77c');
+  // --- fine grain: deterministic stipple, computed once from hash() (stable, no flicker) ---
+  if(!_sandGrains){
+    _sandGrains=[];
+    for(let y=y0;y<y1;y+=4) for(let x=x0;x<wx-2;x+=4){
+      const h=hash(x+'_'+y), r=h%11;
+      if(r===0)      _sandGrains.push([x,y,1,1,'rgba(120,96,52,.22)']);         // dark grain
+      else if(r===1) _sandGrains.push([x,y,1,1,'rgba(255,247,216,.30)']);       // light fleck
+      else if(r===2 && (h>>>4)%5===0) _sandGrains.push([x,y,2,1,'rgba(150,122,64,.16)']); // pebble
+    }
+  }
+  for(const g of _sandGrains) px(g[0],g[1],g[2],g[3],g[4]);
+  // --- water strip + foam shoreline along the far-right edge (unchanged) ---
   for(let y=y0;y<y1;y+=6) px(wx,y,W-wx,6, ((y/6)&1)?'#49b0c8':'#57c2d8');
   px(wx,y0,W-wx,2,'rgba(255,255,255,.40)');                            // foam
   for(let y=y0+5;y<y1;y+=14) px(wx+3,y,6,1,'rgba(255,255,255,.5)');    // ripples
@@ -2779,6 +2893,7 @@ function drawDeskPod(x, y, p, t){
   // turn is active; when it is merely working because a subagent / workflow is live it sits
   // still with a dimmed standby screen, so only the helper dwarves animate (item 8).
   const selfActive = !p || !p.agent || p.agent.self_active !== false;
+  const whipped = !!(p && p.whipUntil && performance.now()<p.whipUntil);   // "work harder": faster typing/scroll + a shudder
   // --- soft contact shadow on the floor under the whole workstation ---
   ctx.fillStyle='rgba(0,0,0,.14)'; ctx.beginPath(); ctx.ellipse(x, y+26, 35, 6, 0, 0, Math.PI*2); ctx.fill();
   // --- rolling office chair: gas post + 5-star wheel base (peeks below the desk) ---
@@ -2798,7 +2913,8 @@ function drawDeskPod(x, y, p, t){
     // hitbox uses deskX/deskY, so a transient offset is safe)
     const hop=(p.celebrateUntil && performance.now()<p.celebrateUntil)
       ? -Math.abs(Math.sin(performance.now()*0.018))*4 : 0;
-    const y=Math.round(arguments[1]+hop);   // shadow the desk y for the worker body only
+    const flin=whipped ? Math.sin(performance.now()*0.06)*1.6 : 0;   // whip: a brief startled shudder
+    const x=Math.round(arguments[0]+flin), y=Math.round(arguments[1]+hop); // shadow desk x/y for the worker BODY only
     // torso (soft shaded shirt + collar)  -- anchors UNCHANGED (hitbox-critical)
     ro(x-11, y-12, 22, 16, sh);
     px(x-11,y-12,22,2, shade(sh,.30)); px(x+7,y-11,3,14, shade(sh,-.20)); px(x-11,y+2,22,2, shade(sh,-.16));
@@ -2806,7 +2922,7 @@ function drawDeskPod(x, y, p, t){
     torsoDetail(x, y-12, 11, 16, sh, f);                                // outfit variety + sheen
     if(f.messenger){ drawEnvelope(x, y-5); }                            // courier envelope badge
     // typing arms -- frozen when the parent is idle-waiting on a subagent (selfActive above)
-    const tap = selfActive ? (Math.floor(t*0.4)&1) : 0;
+    const tap = selfActive ? (Math.floor(t*(whipped?1.1:0.4))&1) : 0;
     ro(x-15, y-2+tap, 6, 8, sh); ro(x+9, y-2+(1-tap), 6, 8, sh);
     px(x-14, y+5+tap, 5,3, sk); px(x+10, y+5+(1-tap), 5,3, sk);
     // neck + head  -- anchors UNCHANGED (hitbox-critical)
@@ -2831,7 +2947,7 @@ function drawDeskPod(x, y, p, t){
   px(x-11,y-1,4,3,PAL.monitorLip); px(x-15,y+2,12,2,PAL.monitorLip);       // stand + base
   ro(mx, my, mw, 16, PAL.monitor); px(mx,my,mw,2, shade(PAL.monitor,.5));
   if(p){ const tints=['#7fd3e0','#9fe0c0','#7fb0e0','#cfe9a0'];
-    const fr = selfActive ? Math.floor((t*0.12+p.seed)%4) : 0;            // freeze frame when idle
+    const fr = selfActive ? Math.floor((t*(whipped?0.34:0.12)+p.seed)%4) : 0;            // freeze frame when idle
     px(mx+2,my+2,mw-4,12, selfActive ? tints[fr] : '#586a72');           // bright code vs dim standby
     px(mx+3,my+4,16,2,PAL.ink); px(mx+3,my+7,10,2,PAL.ink); px(mx+3,my+10,19,2,PAL.ink);
     px(mx+2,my+2,mw-4,1,'rgba(255,255,255,.22)');                         // screen gloss
@@ -2870,6 +2986,8 @@ function drawDeskPod(x, y, p, t){
       drawHelper(cx, cy, t, (hash(p.id)+i*7)%997);
       // pod is drawn scaled by SC about (x,y); convert the dwarf centre to mouse-logical coords
       helperHits.push({ x: x+(cx-x)*SC, y: y+((cy-6)-y)*SC, r: 15*SC, sub: subs[i]||null });
+      const sb0 = subs[i] && subs[i].id ? subBubbles[subs[i].id] : null;
+      if(sb0) bubbleAnchors.push({ x: x+(cx-x)*SC, y: y+((cy-15)-y)*SC, text:sb0.text, start:sb0.start, until:sb0.until });
     }
   }
   // dynamic-workflow easel (drawn beside the desk; returns its hover hit centre)
@@ -2951,9 +3069,12 @@ function drawWorkflowTent(x, y, workflows, t){
   ctx.textAlign='left';
   // tiny helper dwarves at the easel base (one per running agent, capped 3, 0.7 scale)
   const n=Math.min(3, running);
+  const acts=workflows.reduce((L,w)=>L.concat(w.active||[]),[]);   // flatten running-sub infos
   for(let i=0;i<n;i++){
     const hx=cxT - (n-1)*8 + i*16, hy=y+18;
     ctx.save(); scaleAbout(hx, hy, 0.7); drawHelper(hx, hy, t, (hash(wname)+i*7)%997); ctx.restore();
+    const sbw = acts[i] && acts[i].id ? subBubbles[acts[i].id] : null;
+    if(sbw) bubbleAnchors.push({ x: x+(hx-x)*SC, y: y+((hy-12)-y)*SC, text:sbw.text, start:sbw.start, until:sbw.until });
   }
   return { x: cxT, y: y-14, r: 36 };
 }
@@ -3009,6 +3130,32 @@ function wrapChars(text, maxW, maxLines, ell){
   return lines;
 }
 
+// first ~90 chars, whitespace-collapsed (drawBubble wraps + ellipsizes the rest)
+function firstWords(s){ s=String(s||'').replace(/\s+/g,' ').trim(); return s.length>90?s.slice(0,90):s; }
+// small white speech bubble with a downward tail, centred above (x,y) in SCREEN coords.
+function drawBubble(x, y, text, alpha){
+  if(!text || alpha<=0) return;
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.font = '4px "Press Start 2P", monospace';
+  const lines = wrapTextMid(text, 78, 3, '…');       // reuse existing word-wrap + ellipsis
+  let tw=0; for(const ln of lines) tw=Math.max(tw, ctx.measureText(ln).width);
+  const padX=4, padY=3, lh=6;
+  const bw=Math.max(14, Math.ceil(tw)+padX*2), bh=lh*lines.length+padY*2-1;
+  const bx=Math.round(x-bw/2), by=Math.round(y-bh);
+  ro(bx, by, bw, bh, PAL.paper);                     // white box + 1px dark outline
+  px(bx+1, by+1, bw-2, 1, shade(PAL.paper,-.06));    // faint header shade
+  const tx=Math.round(x);                            // downward pixel tail
+  px(tx-2, by+bh, 4,1, PAL.paper); px(tx-1, by+bh+1, 2,1, PAL.paper); px(tx, by+bh+2, 1,1, PAL.paper);
+  px(tx-3, by+bh, 1,1, PAL.outline); px(tx+2, by+bh, 1,1, PAL.outline);
+  px(tx-2, by+bh+1, 1,1, PAL.outline); px(tx+1, by+bh+1, 1,1, PAL.outline);
+  px(tx-1, by+bh+2, 1,1, PAL.outline); px(tx+1, by+bh+2, 1,1, PAL.outline);
+  px(tx-1, by+bh+3, 2,1, PAL.outline);
+  ctx.fillStyle=PAL.ink; ctx.textAlign='center';
+  let ty=by+padY+4; for(const ln of lines){ ctx.fillText(ln, x, ty); ty+=lh; }
+  ctx.textAlign='left'; ctx.restore();
+}
+
 // a standing person (kitchen / lounge), facing us
 function drawStanding(p, t){
   // celebration dance: little hops + side-to-side wiggle while the flag is live
@@ -3017,16 +3164,28 @@ function drawStanding(p, t){
     const tt=performance.now();
     dy0 = -Math.abs(Math.sin(tt*0.018))*5;     // quick hops
     dx0 = Math.sin(tt*0.013)*3;                // wiggle
+  } else if(p.whipUntil && performance.now()<p.whipUntil){
+    dx0 = Math.sin(performance.now()*0.06)*2;  // whip: startled shudder (no hop)
   }
   const x=Math.round(p.x+dx0), y=Math.round(p.y+dy0);
   const f=p.feat||featuresFor(p.id||'x');
   const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
   const walking=(Math.abs(p.vx)+Math.abs(p.vy))>0.05;
   const step=walking?(Math.floor(t*0.16)&1):0;
-  // every few seconds a settled kitchen agent takes a coffee sip (staggered per sprite)
-  const canSip = p.kind!=='work' && !walking && (p.mode==='idle'||p.mode==='drink');
-  const sip = canSip && ((performance.now() + ((x*197)&2047)*3) % 5200) < 700;
-  const ht = sip ? -1 : 0;   // head tips back a touch mid-sip
+  // deterministic kitchen "persona": a held item, stable per agent id (salted so it
+  // doesn't merely echo the appearance bits featuresFor() already used).
+  const kh = hash((p.id||'x')+'|kit');
+  const item = (f.messenger || p.kind==='work') ? -1 : (kh % 6);
+  //  -1 courier/worker(none)  0 mug  1 pastry  2 phone  3 plate  4 bottle  5 hands-free
+  const settled = p.kind!=='work' && !walking && p.mode==='idle';
+  const now = performance.now();
+  const canSip = settled && item===0;                       // only the mug persona sips
+  const sip = canSip && ((now + ((x*197)&2047)*3) % 5200) < 700;
+  // occasional small-talk: face the paired neighbour on a staggered ~4.2s-in-12s window
+  const talking = settled && p.talkX!=null && ((now + (kh%9000)) % 12000) < 4200;
+  const faceDir = talking ? (Math.sign(p.talkX - x)||0) : 0; // -1 look left, +1 look right
+  const ht = sip ? -1 : (item===2 ? 1 : 0);                  // sip: tip back; phone: glance down
+  const hx = faceDir*2;                                      // subtle head turn toward neighbour
   // shadow
   ctx.fillStyle='rgba(0,0,0,.20)'; ctx.beginPath(); ctx.ellipse(x,y+16,11,3,0,0,Math.PI*2); ctx.fill();
   // legs + rounded shoes (feet stay at ~y+16 to match the hitbox)
@@ -3043,27 +3202,48 @@ function drawStanding(p, t){
   px(x-9,y+4,18,1, shade(pants,-.10));                      // belt/hem line
   torsoDetail(x, y-11, 9, 16, sh, f);                       // outfit variety + sheen
   if(f.messenger){ drawEnvelope(x, y-3); }                  // courier envelope badge
-  // arms by mode: upper sleeve (shirt) + forearm/hand (skin)
-  if(p.mode==='drink' || p.mode==='idle'){
-    ro(x-14, y-7, 5, 7, sh); px(x-14, y-1, 5,4, sk);                       // left arm relaxed
-    const ay = sip?-4:0, my = sip?-6:0;                                    // raise arm + cup to sip
-    ro(x+9, y-9+ay, 5, 7, sh); px(x+9, y-3+ay, 5,3, sk);                   // right arm toward the mug
+  // ---- arms + the held item (deterministic persona) --------------------------
+  const gL = talking && (item===2||item===3 ? false : (faceDir<=0));  // lift left free hand
+  const gR = talking && (item===5||item===-1) && faceDir>0;           // hands-free can lift right
+  if(item===0){                                            // coffee mug (+ steam / sip)
+    ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
+    const ay = sip?-4:0, my = sip?-6:0;
+    ro(x+9, y-9+ay, 5, 7, sh); px(x+9, y-3+ay, 5,3, sk);
     ro(x+10, y-13+my, 7, 7, PAL.paper); px(x+11,y-12+my,5,5,PAL.mugA); px(x+17,y-12+my,2,4,PAL.paper);
-    if(!sip){ for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } } // steam (paused mid-sip)
-  } else if(p.mode==='eat'){
-    ro(x-14, y-6, 5, 7, sh); px(x-14, y+1, 5,3, sk);
-    ro(x+9, y-7, 5, 6, sh); px(x+10,y-9,5,5,PAL.orange);
-  } else {
-    ro(x-14, y-7, 5, 8, sh); px(x-14, y+1, 4,4, sk);                       // hands at sides
-    ro(x+10, y-7, 5, 8, sh); px(x+10, y+1, 4,4, sk);
+    if(!sip){ for(let i=0;i<3;i++){ const yy=y-15-((t*1.1+i*5)%8); px(x+13,yy,1,2,'rgba(255,255,255,.5)'); } }
+  } else if(item===1){                                     // pastry / muffin in the right hand
+    ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
+    ro(x+9, y-6, 5, 6, sh); px(x+9, y-1, 5,3, sk);
+    px(x+9,y-4,6,4,PAL.orange); px(x+9,y-4,6,1,shade(PAL.orange,.34)); px(x+11,y-2,2,1,shade(PAL.orange,-.3));
+    px(x+9,y-1,6,1,'#c98a52');                             // pastry base
+  } else if(item===2){                                     // phone in both hands, glancing down
+    ro(x-13, y-6, 5, 7, sh); px(x-11, y-1, 4,3, sk);
+    ro(x+9,  y-6, 5, 7, sh); px(x+7,  y-1, 4,3, sk);
+    px(x-3,y-3,7,5,'#20242c'); px(x-2,y-2,5,3,'#7fd3e0'); px(x-2,y-2,5,1,'#b8ecf3'); // phone + lit screen
+  } else if(item===3){                                     // plate of food in both hands
+    ro(x-13, y-5, 5, 6, sh); px(x-11, y-1, 4,3, sk);
+    ro(x+9,  y-5, 5, 6, sh); px(x+7,  y-1, 4,3, sk);
+    px(x-6,y-2,13,3,'#eef0f4'); px(x-6,y-2,13,1,'#ffffff'); px(x-6,y+1,13,1,'#c9ccd4'); // plate
+    px(x-3,y-3,3,2,PAL.orange); px(x+1,y-3,3,2,'#6aa72f'); // two bites of food
+  } else if(item===4){                                     // water bottle / soda in the right hand
+    ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
+    ro(x+9, y-7, 5, 7, sh); px(x+9, y-1, 5,3, sk);
+    px(x+9,y-11,5,9,PAL.mugB); px(x+9,y-11,5,1,shade(PAL.mugB,.4)); px(x+13,y-11,1,9,shade(PAL.mugB,-.3));
+    px(x+10,y-13,3,2,'#dfeefa');                           // cap
+  } else {                                                 // item 5 / courier / worker: free hands
+    ro(x-14, y-7-(gL?4:0), 5, 8, sh); px(x-14, y+1-(gL?4:0), 4,4, sk);
+    ro(x+10, y-7-(gR?4:0), 5, 8, sh); px(x+10, y+1-(gR?4:0), 4,4, sk);
   }
-  // neck + head (tips back slightly while sipping)
-  px(x-3, y-14+ht, 6, 4, sk); px(x-3, y-14+ht, 6, 1, 'rgba(0,0,0,.16)');
-  ro(x-7, y-27+ht, 14, 15, sk);
-  px(x-7,y-13+ht,14,1,'rgba(0,0,0,.10)');                   // soft jaw shade
-  drawHairAcc(x, y-25+ht, f); drawFace(x, y-25+ht, f);
-  // cozy heart speech bubble for settled kitchen agents (scales with the sprite)
-  if(p.kind!=='work' && p.mode==='idle'){ heartBubble(x+15, y-34); }
+  // neck + head (tips back while sipping / down on the phone; turns toward a chat neighbour)
+  px(x-3+hx, y-14+ht, 6, 4, sk); px(x-3+hx, y-14+ht, 6, 1, 'rgba(0,0,0,.16)');
+  ro(x-7+hx, y-27+ht, 14, 15, sk);
+  px(x-7+hx,y-13+ht,14,1,'rgba(0,0,0,.10)');               // soft jaw shade
+  drawHairAcc(x+hx, y-25+ht, f); drawFace(x+hx, y-25+ht, f);
+  // small-talk bubble while chatting, else the cozy heart when settled
+  if(settled){
+    if(talking){ const nd=1+((((now/700)|0)+(kh%3))%3); talkBubble(x + (faceDir<0?-15:15), y-34, nd); }
+    else heartBubble(x+15, y-34);
+  }
 }
 
 // ---- update loop ----
@@ -3081,6 +3261,16 @@ function tick(now){
       c.vy+=c.g*ds; c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.99; c.rot+=c.vr*ds;
     }
   }
+  // advance + expire whip-crack particles (streaks decelerate; the lash line just fades)
+  if(whipFx.length){
+    const ds=dt/1000;
+    for(let i=whipFx.length-1;i>=0;i--){ const c=whipFx[i]; c.age+=ds;
+      if(c.age>=c.life){ whipFx.splice(i,1); continue; }
+      if(!c.lash){ c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.90; c.vy*=0.90; }
+    }
+  }
+  // restock vending slots whose can has finished dropping + resting
+  for(const k in vendDrops){ if(now-vendDrops[k].start>3200) delete vendDrops[k]; }
   for(const p of people){
     if(p.kind==='exit'){
       // a filtered-out scheduled agent walking off the bottom of the screen
@@ -3125,14 +3315,18 @@ function tick(now){
 function render(t){
   helperHits = [];                   // rebuilt each frame as dwarves are drawn
   workflowHits = [];                 // rebuilt each frame as workflow tents are drawn
+  bubbleAnchors = [];                // rebuilt each frame; drawn as an overlay below
+  vendSlots = [];                    // rebuilt each frame as the vending slots are drawn
   ctx.setTransform(SS,0,0,SS,0,0);   // map logical 640x576 onto the super-sampled backing
   ctx.clearRect(0,0,W,H);
   drawFloor();
   // office desks (always shown); seated worker drawn only once docked, otherwise
   // the desk is shown empty and the worker is drawn separately as a walker.
+  const bt = performance.now();
   const slots=[...deskSlots].sort((a,b)=>a.y-b.y);
   for(const s of slots){ const w=s.worker;
-    ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore(); }
+    ctx.save(); scaleAbout(s.x, s.y, SC); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t); ctx.restore();
+    if(w && w.seated && w.bubbleUntil>bt) bubbleAnchors.push({x:s.x, y:s.y-30*SC, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil}); }
   // everyone currently standing/walking (kitchen agents + workers still walking in),
   // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
   const drawList=[];
@@ -3144,9 +3338,16 @@ function render(t){
     if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
       if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t); else drawStanding(e.p,t);
-      ctx.restore(); }
+      ctx.restore();
+      if(e.p.bubbleUntil>bt) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
+  }
+  // ---- transient speech bubbles (desk/kitchen agents + subagent/workflow dwarves) ----
+  for(const b of bubbleAnchors){
+    const rem=b.until-bt; if(rem<=0) continue;
+    const fin=Math.min(1,(bt-b.start)/160), fout=Math.min(1, rem/BUBBLE_FADE);
+    drawBubble(b.x, b.y, b.text, Math.min(fin,fout));
   }
   // hover ring (around the drawn sprite, scaled to match SC)
   if(hover){
@@ -3166,6 +3367,29 @@ function render(t){
     const a=Math.max(0, 1 - c.age/c.life);
     ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
     ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
+  }
+  // whip crack: a bright lash line + sharp shock streaks, above everything
+  for(const c of whipFx){
+    const a=Math.max(0, 1 - c.age/c.life);
+    if(c.lash){
+      // curved, tapering whip lash (quadratic bezier hx,hy -> control mx,my -> tip tx,ty)
+      ctx.save(); ctx.globalAlpha=a; ctx.lineCap='round'; ctx.lineJoin='round';
+      const P=10; let lx=c.hx, ly=c.hy;
+      for(let i=1;i<=P;i++){
+        const u=i/P, iu=1-u;
+        const bx=iu*iu*c.hx + 2*iu*u*c.mx + u*u*c.tx;
+        const by=iu*iu*c.hy + 2*iu*u*c.my + u*u*c.ty;
+        ctx.strokeStyle = u>0.82 ? '#ffffff' : '#f3e6c2';   // bright white at the cracking tip
+        ctx.lineWidth = 3.4*(1-u) + 0.5;                    // thick at the handle -> thin at the tip
+        ctx.beginPath(); ctx.moveTo(lx,ly); ctx.lineTo(bx,by); ctx.stroke();
+        lx=bx; ly=by;
+      }
+      ctx.fillStyle='#ffffff'; ctx.beginPath(); ctx.arc(c.tx,c.ty,1.6,0,Math.PI*2); ctx.fill(); // tip spark
+      ctx.restore();
+    } else {
+      ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
+      ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
+    }
   }
   ctx.globalAlpha=1;
 }
@@ -3191,6 +3415,27 @@ function spawnConfetti(ox, oy){
   if(confetti.length>200) confetti.splice(0, confetti.length-200);   // hard cap
 }
 
+// a whip CRACK snapping down at the strike point (ox,oy): a curved tapering lash + a short
+// sharp tip-crack (a few streaks flicking down, NOT a radial burst -- reads as a whip, not a meteor)
+function spawnWhip(ox, oy){
+  const tx=(ox!=null)?ox:W/2, ty=(oy!=null)?oy:H*0.22;
+  const dir=Math.random()<0.5?1:-1;                        // swing in from the left or the right
+  // curved lash: handle up-&-to-the-side, arcs over, snaps down to the tip (tx,ty)
+  whipFx.push({ lash:true, hx:tx-82*dir, hy:ty-72, mx:tx-24*dir, my:ty-50, tx:tx, ty:ty, life:0.20, age:0 });
+  const N=8;
+  for(let i=0;i<N;i++){
+    const a=Math.PI/2 + (dir>0?-0.55:0.55) + (Math.random()-0.5)*1.7;   // downward fan, leaning w/ the swing
+    const sp=150+Math.random()*160;
+    whipFx.push({
+      x:tx, y:ty, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp,
+      w:4+Math.random()*4, h:1+Math.random()*1.1,
+      col: Math.random()<0.5?'#ffffff':'#ffe9a8',
+      rot:a, life:0.14+Math.random()*0.10, age:0,
+    });
+  }
+  if(whipFx.length>160) whipFx.splice(0, whipFx.length-160);   // hard cap
+}
+
 // ======================================================================
 // AMBIENT RANDOM EVENTS  (dog crossing / cat nap / agent relocate)
 // Scheduled + animated entirely off the rAF clock (see tick()).
@@ -3202,6 +3447,14 @@ function scheduleNextEvent(now){
   let mn=30000, mx=60000;
   if(window.__eventInterval){ mn=window.__eventInterval[0]; mx=window.__eventInterval[1]; }
   nextEventAt = now + mn + Math.random()*(mx-mn);
+}
+
+// independent, long-gap scheduler for the occasional window fly-by (test hook:
+// window.__planeInterval=[3000,6000]; restore with delete window.__planeInterval)
+function schedulePlane(now){
+  let mn=60000, mx=150000;
+  if(window.__planeInterval){ mn=window.__planeInterval[0]; mx=window.__planeInterval[1]; }
+  nextPlaneAt = now + mn + Math.random()*(mx-mn);
 }
 
 // pick ONE event at random, avoiding an immediate repeat; if the chosen type can't
@@ -3252,6 +3505,17 @@ function startCat(now){
   };
 }
 
+// ---- a tiny airliner drifts across the WINDOW sky, above the buildings, near the clouds ----
+function startPlane(now){
+  const dir = Math.random()<0.5 ? 1 : -1;               // 1: L->R, -1: R->L
+  amb.plane = {
+    dir,
+    x: dir>0 ? WIN.x-16 : WIN.x+WIN.w+16,               // start just off the clipped glass edge
+    y: WIN.y + 6 + Math.random()*14,                    // upper sky band, near the clouds
+    spd: 22 + Math.random()*16,                         // px/s -> ~9-13s to drift across
+  };
+}
+
 // ---- 3) RELOCATE: a waiting agent strolls to a different open kitchen spot ----
 function startRelocate(now){
   const cands = people.filter(p=> p.kind==='wait' && p.mode==='idle');
@@ -3293,12 +3557,35 @@ function updateAmbient(now, dt){
       if((c.dir>0 && c.x>W+24) || (c.dir<0 && c.x<-24)) amb.cat=null;
     }
   }
+  // occasional airliner across the window sky (independent long-gap scheduler)
+  if(!nextPlaneAt) schedulePlane(now);
+  else if(now>=nextPlaneAt){ if(!amb.plane) startPlane(now); schedulePlane(now); }
+  if(amb.plane){ const pl=amb.plane; pl.x += pl.dir*pl.spd*sec;
+    if((pl.dir>0 && pl.x>WIN.x+WIN.w+24) || (pl.dir<0 && pl.x<WIN.x-24)) amb.plane=null; }
 }
 
 // ---------- pixel-art critters (drawn scaled by SC about their anchor) ----------
 
 // a single shaded leg segment
 function _leg(lx, topY, len, w, col){ px(lx,topY,w,len,col); px(lx,topY+len-1,w,1,shade(col,-.34)); }
+
+// AIRLINER: a tiny plane drifting across the window sky. Drawn in absolute window
+// coords at logical scale (no SC), mirrored to face its heading, with a faint contrail.
+function drawPlane(pl){
+  const x=Math.round(pl.x), y=Math.round(pl.y);
+  ctx.save();
+  if(pl.dir<0){ ctx.translate(x,0); ctx.scale(-1,1); ctx.translate(-x,0); }   // face left
+  const body='#eef2f6', bodyDk='#b9c2cc', porthole='#8fb7d8', tailc='#d24b4b';
+  // faint contrail streaming out behind the tail (the -x side while facing right)
+  for(let i=1;i<=6;i++){ const a=(0.18*(7-i)/6).toFixed(3);
+    px(x-9-i*3, y+2, 2, 1, 'rgba(255,255,255,'+a+')'); }
+  px(x-8, y-2, 2, 4, tailc); px(x-7, y-2, 1, 3, shade(tailc,.15));            // tail fin (back, raised)
+  px(x-7, y+1, 13, 4, body); px(x-7, y+1, 13, 1, '#ffffff'); px(x-7, y+4, 13, 1, bodyDk); // fuselage
+  px(x+6, y+2, 2, 2, body);                                                   // pointed nose (front)
+  px(x-2, y+4, 7, 2, bodyDk);                                                  // swept wing under body
+  px(x, y+2, 1, 1, porthole); px(x+2, y+2, 1, 1, porthole);                    // two cabin windows
+  ctx.restore();
+}
 
 // DOG: three visually distinct breeds, side-on, facing its walk direction.
 function drawDog(d, t){
@@ -3520,12 +3807,23 @@ function pickHelper(mx,my){ let best=null,bd=1e9;
 function pickWorkflow(mx,my){ let best=null,bd=1e9;
   for(const w of workflowHits){ const d=(mx-w.x)*(mx-w.x)+(my-w.y)*(my-w.y); if(d<w.r*w.r && d<bd){bd=d;best=w;} }
   return best; }
+function pickVend(mx,my){
+  for(const s of vendSlots){ if(mx>=s.x0 && mx<=s.x1 && my>=s.y0 && my<=s.y1) return s; }
+  return null; }
+function dispenseDrink(s){
+  if(vendDrops[s.idx]) return;                       // already dispensing this slot
+  vendDrops[s.idx]={start:performance.now(), col:s.col, fromX:s.bxv, fromY:s.ry}; }
 cv.addEventListener('mousemove', e=>{
   const m=toCanvas(e);
   // a pettable pet under the cursor?
   const pet=pickPet(m.x,m.y);
   if(pet){ hover=null; cv.style.cursor='pointer';
     nametag.innerHTML='<div class="nt-hint">click to pet the '+pet+'</div>';
+    nametag.style.display='block'; placeNametag(m); return; }
+  // a vending-machine drink? (click drops it into the tray)
+  const vs=pickVend(m.x,m.y);
+  if(vs){ hover=null; cv.style.cursor='pointer';
+    nametag.innerHTML='<div class="nt-hint">click for a cold one</div>';
     nametag.style.display='block'; placeNametag(m); return; }
   // a workflow tent? (takes precedence over helpers)
   const wf=pickWorkflow(m.x,m.y);
@@ -3607,6 +3905,8 @@ cv.addEventListener('click', e=>{
   const m=toCanvas(e);
   const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
+  const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
+  if(slot){ dispenseDrink(slot); return; }
   const p=pick(m.x,m.y);
   if(p) openDetail(p.agent.id);
 });
@@ -3736,6 +4036,18 @@ document.getElementById('celebrate').addEventListener('click',()=>{
   spawnConfetti(W/2, H*0.22);
   toast('party time!');
 });
+// WHIP button: crack the whip -- everyone flinches + works harder ~3s (opposite of CELEBRATE)
+document.getElementById('whip').addEventListener('click',()=>{
+  const now=performance.now();
+  // ONLY the working (seated, at-desk) agents get whipped -- kitchen / beach folk are left alone
+  let struck=0;
+  people.forEach(p=>{ if(p.kind==='work' && p.seated){
+    p.whipUntil=now+1400;                                  // brief "work harder" burst (short)
+    spawnWhip(Math.round(p.x), Math.round(p.y)-Math.round(28*SC));  // a lash snaps over each desk
+    struck++;
+  } });
+  toast(struck ? 'back to work!' : 'nobody at their desk!');
+});
 
 let toastT=null;
 function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.style.display='block';
@@ -3748,6 +4060,7 @@ async function refresh(){
     WINDOW_HOURS=data.hours||24; document.getElementById('emh').textContent=WINDOW_HOURS;
     document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
     agents=data.agents||[]; rebuild();
+    detectMessages(agents);
     detectFinishes(agents);
   }catch(e){/* keep last */}
 }
@@ -3838,6 +4151,34 @@ namesBtn.addEventListener('click',()=>{
   toast('names: '+NAME_SETS[nameStyle].label.toLowerCase());
 });
 updateNamesBtn();
+
+// pop a temporary bubble whenever an agent / subagent / workflow-sub authors a NEW message
+// between polls. Desk & kitchen agents key off `latest` (their latest assistant text);
+// dwarves key off each sub's stable `id` + a `ts`/`last_msg` change token.
+function detectMessages(list){
+  const now=performance.now();
+  const cur={};
+  for(const a of list) cur[a.id] = (a.latest_kind==='assistant') ? (a.latest||'') : '';
+  if(msgSeen!==null){
+    for(const a of list){ const tok=cur[a.id];
+      if(tok && msgSeen[a.id]!==undefined && msgSeen[a.id]!==tok){
+        const p=people.find(q=>q.id===a.id);
+        if(p){ p.bubbleText=firstWords(tok); p.bubbleStart=now; p.bubbleUntil=now+BUBBLE_MS; }
+      }
+    }
+  }
+  msgSeen=cur;
+  const alive=new Set();
+  const scan=(arr)=>{ (arr||[]).forEach(s=>{ if(!s||!s.id) return; alive.add(s.id);
+    const tok=String(s.ts||'')+'|'+(s.last_msg||'');
+    if(s.last_msg && subMsgSeen[s.id]!==undefined && subMsgSeen[s.id]!==tok)
+      subBubbles[s.id]={text:firstWords(s.last_msg), start:now, until:now+BUBBLE_MS};
+    subMsgSeen[s.id]=tok;
+  }); };
+  for(const a of list){ scan(a.subagents); (a.workflows||[]).forEach(w=>scan(w.active)); }
+  Object.keys(subMsgSeen).forEach(id=>{ if(!alive.has(id)) delete subMsgSeen[id]; });
+  Object.keys(subBubbles).forEach(id=>{ if(subBubbles[id].until < now-BUBBLE_FADE) delete subBubbles[id]; });
+}
 
 // fire a celebration (+ chime) when an agent transitions working -> waiting between polls
 function detectFinishes(list){
