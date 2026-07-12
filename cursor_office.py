@@ -1853,7 +1853,7 @@ PAGE = r"""<!DOCTYPE html>
      corners of the screen -- faint until hovered; you have to try them to learn what they do. */
   #screen .zonebtn{position:absolute;bottom:7px;width:24px;height:24px;padding:0;border:0;
     border-radius:50%;background:rgba(0,0,0,.16);font-size:13px;line-height:24px;text-align:center;
-    cursor:pointer;opacity:.28;z-index:6;transition:opacity .15s ease,transform .08s ease,background .15s ease;
+    cursor:pointer;opacity:.6;z-index:6;transition:opacity .15s ease,transform .08s ease,background .15s ease;
     -webkit-user-select:none;user-select:none;}
   #screen .zonebtn:hover{opacity:1;background:rgba(0,0,0,.34);}
   #screen .zonebtn:active{transform:translateY(1px) scale(.92);}
@@ -1954,8 +1954,8 @@ PAGE = r"""<!DOCTYPE html>
           <span class="pill" id="hud-wf" style="display:none">workflows: 0</span>
         </div>
         <div id="tip">click a worker</div>
-        <button id="sweep-kitchen" class="zonebtn" aria-label="kitchen">&#127958;</button>
-        <button id="drown-beach" class="zonebtn" aria-label="beach">&#127754;</button>
+        <button id="sweep-kitchen" class="zonebtn" aria-label="kitchen" title="send everyone in the kitchen to the beach">&#127958;</button>
+        <button id="drown-beach" class="zonebtn" aria-label="beach" title="&#128520;">&#127754;</button>
         <div id="nametag"></div>
         <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
           Start a chat in Cursor or Claude Code, or run with <b>--demo</b> to populate the office.</div>
