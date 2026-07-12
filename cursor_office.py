@@ -1858,7 +1858,7 @@ PAGE = r"""<!DOCTYPE html>
   #screen .zonebtn:hover{opacity:1;background:rgba(0,0,0,.34);}
   #screen .zonebtn:active{transform:translateY(1px) scale(.92);}
   #screen #sweep-kitchen{left:7px;}
-  #screen #drown-beach{right:30px;}   /* clear of the far-right water strip -- sits on the sand */
+  #screen #drown-beach{right:22px;}   /* floats on the ocean band in the beach's bottom-right corner */
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
@@ -2222,8 +2222,8 @@ function rebuild(){
     const y = top + r*rowH;
     deskSlots.push({x, y, worker:null});
   }
-  // where a just-un-drowned agent climbs back out of the sea (far-right water strip, mid-beach)
-  const SEA = { x: W-14, y: L.kitchenTop + Math.round((H-L.kitchenTop)*0.45) };
+  // where a just-un-drowned agent climbs back out of the sea: mid-ocean band, mid-beach height
+  const SEA = { x: SHORE_X + Math.round(WATER_W*0.5), y: L.kitchenTop + Math.round((H-L.kitchenTop)*0.45) };
   workers.forEach(a=>{
     const old = prevById[a.id];
     const slot = deskSlots[deskAssign[a.id]];
@@ -4802,7 +4802,7 @@ document.getElementById('drown-beach').addEventListener('click',()=>{
   beach.sort((a,b)=>a.x-b.x).forEach((p,i)=>{
     p.mode='drown'; p.sinking=false; p.dead=false; p.seated=false;
     p.drownStart = now + i*180;                 // a little cascade, left to right
-    p.drownTo = { x: W-12, y: p.y };            // march straight out into the surf
+    p.drownTo = { x: SHORE_X + Math.round(WATER_W*0.5), y: p.y };   // wade out into the ocean band
   });
   toast('🌊 glug glug...');
 });
