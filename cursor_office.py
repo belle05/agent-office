@@ -2128,6 +2128,14 @@ let detailCache = {};
 let WINDOW_HOURS = 24;
 let confetti = [];          // celebration particles (capped, auto-expire)
 let whipFx = [];            // whip-crack particles: one lash line + shock streaks (capped, auto-expire)
+// --- water cooler: click the office cooler and it squirts an arc of water ---
+let waterFx = [];           // water droplet particles from the cooler spout (capped, auto-expire)
+let coolerHit = null;       // {x0,y0,x1,y1,sx,sy} cooler click rect + spout origin (set each frame)
+// --- Godzilla: stomps across the window every round hour (or on a wall-clock click) ---
+let clockHit = null;        // {x0,y0,x1,y1} wall-clock click rect (set each frame)
+let godzilla = { active:false, t:0 };   // t = 0..1 progress walking across the window
+let godzillaHourKey = null; // local "date#hour" stamp; a change = a new round hour -> trigger
+const GODZILLA_MS = 6000;   // time to cross the window
 // --- WHIP-abuse easter egg: overwork the "WIP" button and the office revolts ---
 let poop = [];              // poop projectiles hurled toward the viewer (capped, auto-expire)
 let poopSplats = [];        // brown splat decals stuck on the "glass" (screen space; fade out, capped)
@@ -2644,7 +2652,11 @@ function drawWindow(x,y,w,h){
     drawSkyline(x,y,w,h, PAL.bldgN1, 0.64, 11, true);
   } else {
     let top=PAL.skyTop, bot=PAL.sky;
-    if(mode==='dusk'){ top=lerpCol(PAL.skyTop,'#eaa86e',.30); bot=lerpCol(PAL.sky,'#f6c79a',.45); } // soft dawn/dusk tint
+    // golden hour: dusty-blue upper sky warming to a bright gold horizon. HEX literals on
+    // purpose -- the gradient loop below feeds top/bot back into lerpCol(), and lerpCol only
+    // parses '#hex' (rgb() results from a nested lerpCol/shade come out NaN -> black). See the
+    // shade(shade()) gotcha in CLAUDE.md.
+    if(mode==='dusk'){ top='#9fb8d4'; bot='#f4c07a'; }
     for(let i=0;i<bands;i++) px(x, y+Math.round(i*h/bands), w, bh, lerpCol(top, bot, i/(bands-1)));
     drawSkyline(x,y,w,h, PAL.bldg2, 0.40, 7, false);
     cloud(x+w*0.16, y+h*0.20); cloud(x+w*0.44, y+h*0.12); cloud(x+w*0.70, y+h*0.26);
@@ -2652,6 +2664,8 @@ function drawWindow(x,y,w,h){
   }
   // occasional airliner drifting across the sky (clipped to the glass, behind the mullions)
   if(amb.plane){ ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip(); drawPlane(amb.plane); ctx.restore(); }
+  // Godzilla stomping past the skyline (clipped to the glass, behind the mullions)
+  if(godzilla.active){ ctx.save(); ctx.beginPath(); ctx.rect(x,y,w,h); ctx.clip(); drawGodzilla(x,y,w,h,night); ctx.restore(); }
   // chunky mullions: vertical panes + one horizontal transom (dark core + light edge)
   const panes=4, pw=w/panes;
   for(let i=1;i<panes;i++){ px(x+Math.round(i*pw)-1,y,3,h,PAL.woodDk); px(x+Math.round(i*pw)-1,y,1,h,PAL.wood); }
@@ -2659,6 +2673,92 @@ function drawWindow(x,y,w,h){
   px(x,y,w,1,'rgba(0,0,0,.22)'); px(x,y+h-1,w,1,'rgba(0,0,0,.22)');
   // glass sheen on the top-left pane
   px(x+2,y+2,Math.round(pw)-5,2, night?'rgba(255,255,255,.07)':'rgba(255,255,255,.20)');
+}
+
+// a hunched Godzilla silhouette lumbering across the window (drawn clipped to the glass).
+// godzilla.t (0..1) drives it from off the left edge to off the right edge.
+function drawGodzilla(wx,wy,ww,wh,night){
+  const t=godzilla.t, now=performance.now();
+  const gh=Math.round(wh*0.9);
+  const footY=wy+wh-1;
+  const span=ww+gh*2;
+  const cx=Math.round(wx - gh + t*span);              // body-center x (enters left, exits right)
+  const gait=Math.sin(now*0.008);                     // slow lumbering walk
+  const bob=Math.round(Math.abs(Math.sin(now*0.008))*1.4);
+  const body='#2c4a1c', dk='#1a2d11', belly='#4a7630', plate='#c9dc9a', plateDk='#82ae57', eye='#ffe14a';
+  const bw=Math.round(gh*0.30);
+  const hipY=footY-Math.round(gh*0.30)-bob;
+  const chestY=footY-Math.round(gh*0.62)-bob;          // top of the torso / shoulders
+  const headY=footY-gh+bob;                            // top of the head
+  // a filled triangular back-plate. baseY is the ridge point; the plate is drawn STARTING 2px
+  // below it (into the body) so it always looks rooted, never floating.
+  const fin=(fx,baseY,h,w)=>{ for(let i=-2;i<h;i++){ const g=Math.max(0,i), wd=Math.max(1,Math.round(w*(1-g/h)));
+    const rx=fx-((wd/2)|0)-((g*0.3)|0); px(rx, baseY-i, wd, 1, plate); px(rx, baseY-i, 1, 1, plateDk); } };
+
+  // ---- tail spine: one array of points reused for BOTH the tail body and its plates ----
+  const tail=[];
+  for(let i=0;i<=14;i++){ const f=i/14;
+    const tx=cx-bw+5-Math.round(f*40);
+    const ty=hipY+3+Math.round(f*f*15)-Math.round(Math.sin(f*Math.PI)*3);   // slight arch, then droops
+    const tw=Math.max(2, Math.round(12*(1-f*0.92)));
+    tail.push([tx,ty,tw]); }
+  for(const [tx,ty,tw] of tail) px(tx-((tw/2)|0)-1, ty-((tw/2)|0)-1, tw+2, tw+2, dk);   // dark outline
+  for(const [tx,ty,tw] of tail) px(tx-((tw/2)|0),   ty-((tw/2)|0),   tw,   tw,   body);  // body
+
+  // ---- far (back) leg first so it reads as depth ----
+  const legH=footY-hipY+2, bl=cx-Math.round(bw*0.5)-Math.round(gait*3);
+  ro(bl, hipY-2, 8, legH, dk); px(bl-2, footY-3, 12, 3, dk);          // back thigh + foot (shadowed)
+  // ---- torso: bulky, leaning forward, with a pale belly ----
+  ro(cx-bw, chestY, bw*2, hipY-chestY+10, dk);                        // dark underlay = crisp outline
+  ro(cx-bw+1, chestY+1, bw*2-2, hipY-chestY+8, body);
+  ro(cx+2, chestY+6, bw-2, hipY-chestY+2, belly);                     // belly on the forward (right) side
+  // ---- near (front) leg with three claws ----
+  const fl=cx+Math.round(bw*0.35)+Math.round(gait*3);
+  ro(fl, hipY-2, 9, legH, body); px(fl-1, hipY-2, 2, legH, dk);       // thigh + shadow seam
+  px(fl-2, footY-3, 13, 3, body);                                     // foot pad
+  px(fl-2, footY, 3, 2, dk); px(fl+3, footY, 3, 2, dk); px(fl+8, footY, 3, 2, dk);   // toe claws
+  // ---- stubby forelimb hanging off the chest ----
+  px(cx+bw-3, chestY+9, 6, 3, body); px(cx+bw+1, chestY+11, 3, 4, body); px(cx+bw+1, chestY+15, 4, 1, dk);
+  // ---- neck + head leaning forward-right ----
+  ro(cx+bw-6, headY+6, 10, chestY-headY+3, dk);                       // neck outline
+  ro(cx+bw-5, headY+6, 8, chestY-headY+2, body);
+  ro(cx+bw-4, headY-1, 15, 11, dk);                                   // head outline
+  ro(cx+bw-3, headY,   14, 9, body);
+  px(cx+bw+9, headY+2, 8, 6, body); px(cx+bw+9, headY+2, 8, 1, dk);   // snout (with top edge)
+  px(cx+bw+16, headY+5, 3, 3, body);                                  // snout tip
+  px(cx+bw+7, headY+8, 9, 2, dk);                                     // mouth line / lower jaw
+  px(cx+bw+2, headY+1, 3, 1, dk);                                     // brow ridge over the eye
+  px(cx+bw+3, headY+2, 2, 2, eye);                                    // glowing eye
+
+  // ---- dorsal plates, rooted on the ACTUAL silhouette so they can't detach ----
+  // 1) plates riding the back: from the hip corner up over the shoulder to the neck base.
+  const bn=6;
+  for(let i=0;i<=bn;i++){ const f=i/bn;                               // 0 = hip, 1 = shoulder/neck
+    const rx=Math.round((cx-bw+6) + f*(bw*2-12));
+    const ry=Math.round(hipY - f*(hipY-chestY) - Math.sin(f*Math.PI)*3);   // rise to chest with a little arch
+    const sz=Math.max(3, Math.round(5 + 6*Math.sin((0.35+f*0.6)*Math.PI)));
+    fin(rx, ry+1, sz, Math.max(2,Math.round(sz*0.85))); }
+  // 2) plates riding the tail: on each tail segment's top edge (skip the tip), shrinking outward.
+  for(let i=1;i<tail.length-2;i+=2){ const [tx,ty,tw]=tail[i];
+    fin(tx, ty-((tw/2)|0)+1, Math.max(2,Math.round(tw*0.7)), Math.max(2,Math.round(tw*0.6))); }
+  // faint back-lit rim so the silhouette reads against a dark night sky
+  if(night){ px(cx+bw-3, headY, 14, 1, 'rgba(160,210,140,.5)'); px(cx-bw+1, chestY+1, bw*2-2, 1, 'rgba(160,210,140,.32)'); }
+}
+function triggerGodzilla(){ godzilla.active=true; godzilla.t=0; }
+// the office water cooler spits a fanned arc of droplets from its spout toward the room
+function squirtCooler(){
+  if(!coolerHit) return;
+  const sx=coolerHit.sx, sy=coolerHit.sy;
+  for(let i=0;i<34;i++){
+    const ang=(138 + Math.random()*84) * Math.PI/180;   // 138..222deg -> leftward fan (up-left..down-left)
+    const spd=58 + Math.random()*78;                     // varied speeds -> the jet spreads out
+    waterFx.push({ x:sx, y:sy,
+      vx: Math.cos(ang)*spd,
+      vy: Math.sin(ang)*spd,                             // canvas y is down: sin<0 = arcs up first
+      g: 320, r: 1 + Math.random()*1.8,
+      life: 0.6 + Math.random()*0.6, age:0 });
+  }
+  if(waterFx.length>260) waterFx.splice(0, waterFx.length-260);
 }
 
 // real, positive quotes (motivation / happiness / health) with attribution.
@@ -2887,6 +2987,7 @@ function drawWallDecor(x, y, clkL, shfL){
   ctx.fillStyle=PAL.leafDk; ctx.fillText('- '+q[1], x+8, qy+2);
   // ---- wall clock (live local time) -- x-pos comes from wallRowLayout() (even spacing) ----
   const clx=clkL+3, cly=y+6; px(clx-3,cly-3,24,24,PAL.woodDk); px(clx-1,cly-1,20,20,PAL.metalDk); px(clx,cly,18,18,PAL.paper);
+  clockHit = { x0:clx-4, y0:cly-4, x1:clx+22, y1:cly+22 };                 // click the clock -> summon Godzilla (test hook)
   for(let a=0;a<12;a++){ const ang=a*Math.PI/6; px(clx+9+Math.round(7*Math.sin(ang)), cly+9-Math.round(7*Math.cos(ang)), 1,1, PAL.ink); }
   const ccx=clx+9, ccy=cly+9, now=new Date();
   const hA=((now.getHours()%12)+now.getMinutes()/60)*Math.PI/6;    // 30 deg/hr + drift
@@ -2925,6 +3026,7 @@ function drawOfficeProps(){
 
   // ---- water cooler (far right) + floor plant (left) ----
   const wcx=W-56, wcy=lastDeskY+48; ro(wcx,wcy,18,30,PAL.steel); px(wcx+2,wcy-15,14,15,'#9fd9f0'); px(wcx+5,wcy+14,8,5,PAL.cabinet);
+  coolerHit = { x0:wcx-3, y0:wcy-16, x1:wcx+19, y1:wcy+31, sx:wcx+5, sy:wcy+18 };   // click rect + spout origin
   bigPlant(34, lastDeskY+44);
 }
 
@@ -3972,6 +4074,19 @@ function tick(now){
       c.vy+=c.g*ds; c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.99; c.rot+=c.vr*ds;
     }
   }
+  // advance + expire water-cooler droplets (simple gravity arc)
+  if(waterFx.length){
+    const ds=dt/1000;
+    for(let i=waterFx.length-1;i>=0;i--){ const d=waterFx[i]; d.age+=ds;
+      if(d.age>=d.life){ waterFx.splice(i,1); continue; }
+      d.vy+=d.g*ds; d.x+=d.vx*ds; d.y+=d.vy*ds;
+    }
+  }
+  // Godzilla: advance the walk, and auto-summon once when the local clock rolls to a new hour
+  if(godzilla.active){ godzilla.t += dt/GODZILLA_MS; if(godzilla.t>=1){ godzilla.active=false; godzilla.t=0; } }
+  { const d=new Date(), key=d.toDateString()+'#'+d.getHours();
+    if(godzillaHourKey===null) godzillaHourKey=key;
+    else if(key!==godzillaHourKey){ godzillaHourKey=key; triggerGodzilla(); } }
   // THANK AGENTS: keep a steady curtain of petals falling from the top for the rain window
   // (~10s), on top of the initial burst -- spawn a small batch a few times a second (capped).
   if(now<flowerRainUntil && now-lastFlowerAt>140){ lastFlowerAt=now; spawnFlowers(null,null,14); }
@@ -4191,6 +4306,13 @@ function render(t){
     ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
     ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
   }
+  // water-cooler squirt droplets (light-blue teardrops that fade as they fall)
+  for(const d of waterFx){
+    const a=Math.max(0, 1 - d.age/d.life);
+    ctx.globalAlpha=a; ctx.fillStyle='#8fd3ef';
+    ctx.beginPath(); ctx.ellipse(d.x, d.y, d.r, d.r*1.4, 0, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
   // THANK AGENTS: pastel flower confetti (petals drift + sway), also above everything
   for(const fl of flowers){
     const a=Math.max(0, 1 - fl.age/fl.life);
@@ -4821,9 +4943,9 @@ cv.addEventListener('mousemove', e=>{
     nametag.style.display='block'; placeNametag(m); return; }
   // a vending-machine drink? (click drops it into the tray)
   const vs=pickVend(m.x,m.y);
-  if(vs){ hover=null; cv.style.cursor='pointer';
-    nametag.innerHTML='<div class="nt-hint">click for a cold one</div>';
-    nametag.style.display='block'; placeNametag(m); return; }
+  if(vs){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
+  // clickable props -- pointer cursor only, no tooltip (discover them by clicking)
+  if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
   // a workflow tent? (takes precedence over helpers)
   const wf=pickWorkflow(m.x,m.y);
   if(wf){
@@ -4924,8 +5046,11 @@ cv.addEventListener('mousemove', e=>{
   } else { nametag.style.display='none'; cv.style.cursor='default'; }
 });
 cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';});
+function inHit(h,mx,my){ return h && mx>=h.x0 && mx<=h.x1 && my>=h.y0 && my<=h.y1; }
 cv.addEventListener('click', e=>{
   const m=toCanvas(e);
+  if(inHit(clockHit,m.x,m.y)){ triggerGodzilla(); toast('🦖'); return; }   // clock -> summon Godzilla (test hook)
+  if(inHit(coolerHit,m.x,m.y)){ squirtCooler(); return; }                  // cooler -> squirt water
   const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray

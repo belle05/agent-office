@@ -123,6 +123,18 @@ The name-plate spans `anchor±28` local (`±42px` screen); the shell terminals s
 above it; the workflow easel sits to the desk's **right** and must keep its left edge past
 `anchor+42px` screen or it butts into the upper desk's name-plate.
 
+## Color gotcha — never nest `shade()` / `lerpCol()`
+
+Both `shade(hex,f)` and `lerpCol(a,b,t)` **take `#hex` in but return an `rgb(...)` string**.
+Feeding a returned `rgb(...)` back into either (`shade(shade(...))`, or
+`lerpCol(top,bot,…)` where `top`/`bot` are themselves `lerpCol` results) makes the parser do
+`parseInt('gb(…',16)` → `NaN` → an invalid `fillStyle` that paints **black**. This has bitten
+twice: the kitchen/beach sand fringe (fixed by deriving tip colors from the hex `base`), and
+the **dusk window sky**, which rendered pure black for exactly this reason (the gradient loop
+re-`lerpCol`s `top`/`bot`) until the dusk endpoints were made **hex literals** (`drawWindow`).
+Rule: only ever pass `#hex` literals/`PAL.*` into `shade`/`lerpCol`; if you need a computed
+color as an input, compute it as hex, don't nest.
+
 ## Conventions
 
 - **Persistent knowledge lives in Markdown + the memory system.** Keep in-repo notes and
