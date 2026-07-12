@@ -1857,6 +1857,16 @@ PAGE = r"""<!DOCTYPE html>
     -webkit-user-select:none;user-select:none;}
   #screen .zonebtn:hover{opacity:1;background:rgba(0,0,0,.34);}
   #screen .zonebtn:active{transform:translateY(1px) scale(.92);}
+  /* custom hover tooltip (native title didn't surface reliably). Sits ABOVE the button and
+     is anchored toward the room so it never clips against #screen's overflow:hidden. */
+  #screen .zonebtn[data-tip]::after{content:attr(data-tip);position:absolute;bottom:calc(100% + 7px);
+    background:rgba(15,17,20,.92);color:#fff;font-size:9px;line-height:1.35;letter-spacing:.5px;
+    padding:4px 7px;border-radius:5px;white-space:nowrap;pointer-events:none;
+    opacity:0;transform:translateY(3px);transition:opacity .12s ease,transform .12s ease;
+    z-index:20;box-shadow:0 4px 12px rgba(0,0,0,.4);}
+  #screen .zonebtn[data-tip]:hover::after{opacity:1;transform:translateY(0);}
+  #screen #sweep-kitchen[data-tip]::after{left:0;}                          /* extend right from the left corner */
+  #screen #drown-beach[data-tip]::after{right:0;font-size:16px;padding:2px 8px;}  /* extend left; big devil */
   #screen #sweep-kitchen{left:7px;}
   #screen #drown-beach{right:22px;}   /* floats on the ocean band in the beach's bottom-right corner */
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
@@ -1954,8 +1964,8 @@ PAGE = r"""<!DOCTYPE html>
           <span class="pill" id="hud-wf" style="display:none">workflows: 0</span>
         </div>
         <div id="tip">click a worker</div>
-        <button id="sweep-kitchen" class="zonebtn" aria-label="kitchen" title="send everyone in the kitchen to the beach">&#127958;</button>
-        <button id="drown-beach" class="zonebtn" aria-label="beach" title="&#128520;">&#127754;</button>
+        <button id="sweep-kitchen" class="zonebtn" aria-label="send everyone in the kitchen to the beach" data-tip="send everyone in the kitchen to the beach">&#127958;</button>
+        <button id="drown-beach" class="zonebtn" aria-label="beach" data-tip="&#128520;">&#127754;</button>
         <div id="nametag"></div>
         <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
           Start a chat in Cursor or Claude Code, or run with <b>--demo</b> to populate the office.</div>
@@ -3129,7 +3139,7 @@ let _sandGrains=null;                                                   // grain
 function drawBeachFloor(){
   const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H;
   const shoreX=SHORE_X, base='#e7d3a0', sandW=shoreX-x0, hgt=y1-y0;
-  px(x0-1,y0,2,hgt,shade(PAL.base,-.10));                              // divider edge
+  // (the old ruler-straight divider line is gone -- an organic sand fringe is drawn below)
   // --- dry sand: warm base + soft vertical gradient (paler/drier up near the wall) ---
   px(x0,y0,sandW,hgt,base);
   px(x0,y0,sandW,Math.round(hgt*0.30),shade(base,.05));               // dry top strip
@@ -3145,6 +3155,25 @@ function drawBeachFloor(){
     }
   }
   for(const g of _sandGrains) px(g[0],g[1],g[2],g[3],g[4]);
+
+  // --- organic sand/floor boundary: instead of a ruler-straight divider, the sand spills
+  //     LEFT of BEACH_X in a soft wavy fringe, with loose grains tracked onto the tiles ---
+  const sandTop=shade(base,.05), sandFront=shade(base,-.05), tipCol=shade(base,-.14);  // shade() takes #hex, returns rgb() -> never nest it
+  for(let y=y0; y<y1; y+=2){
+    // smooth deterministic wobble (two slow sine waves + a little hashed jitter) -> 0..~16px
+    const w = 8 + 5*Math.sin(y*0.10) + 3*Math.sin(y*0.31+1.7) + (hash('f'+y)%3);
+    const b = Math.max(0, Math.round(w));
+    const rowCol = (y < y0+Math.round(hgt*0.30)) ? sandTop : (y>=_by ? sandFront : base);
+    if(b>0){
+      px(x0-b, y, b, 2, rowCol);                    // sand tongue over the kitchen tiles
+      px(x0-b, y, 1, 2, tipCol);                    // damp tip -> soft, defined edge
+    }
+    // a few loose grains scattered a bit further onto the floor, thinning to the left
+    if((hash('g'+y)%2)===0){
+      const gx = x0 - b - 2 - (hash('x'+y)%13);
+      px(gx, y, 1, 1, 'rgba(150,122,64,.30)');
+    }
+  }
 
   // ===================== OCEAN (right-hand band) =====================
   // A calming, gently animated sea. All motion is tiny and slow and is driven off the
