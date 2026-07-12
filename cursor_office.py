@@ -1844,11 +1844,11 @@ PAGE = r"""<!DOCTYPE html>
     font-size:11px;color:#5a564d;letter-spacing:1px;}
   #brand .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#7a1717;
     box-shadow:0 0 6px #d33;margin-right:8px;vertical-align:middle;}
-  #brand #celebrate,#brand #whip,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
+  #brand #celebrate,#brand #whip,#brand #thank,#brand #sound,#brand #filter,#brand #names{font-family:inherit;font-size:9px;letter-spacing:1px;color:#e8e8ea;
     background:#3a3a40;border:1px solid #54545c;border-radius:5px;padding:5px 11px;cursor:pointer;}
-  #brand #celebrate:hover,#brand #whip:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
-  #brand #celebrate:active,#brand #whip:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
-  #brand #sound,#brand #filter,#brand #names,#brand #whip{margin-left:8px;}
+  #brand #celebrate:hover,#brand #whip:hover,#brand #thank:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
+  #brand #celebrate:active,#brand #whip:active,#brand #thank:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
+  #brand #sound,#brand #filter,#brand #names,#brand #whip,#brand #thank{margin-left:8px;}
   /* tiny label-less "easter egg" buttons tucked into the kitchen (left) & beach (right)
      corners of the screen -- faint until hovered; you have to try them to learn what they do. */
   #screen .zonebtn{position:absolute;bottom:7px;width:24px;height:24px;padding:0;border:0;
@@ -1941,7 +1941,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="whip" title="crack the whip &mdash; everyone works harder">WHIP</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="whip" title="crack the whip &mdash; everyone works harder">WHIP</button><button id="thank" title="thank the agents &mdash; ends a revolt, or a wholesome flower celebration">THANK AGENTS</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
@@ -2124,6 +2124,13 @@ let poopSplats = [];        // brown splat decals stuck on the "glass" (screen s
 let whipClicks = [];        // wall-clock ms of recent WHIP clicks (rolling 60-min window)
 let angryUntil = 0;         // performance.now() deadline: agents are ANGRY while now<angryUntil
 let lastPoopAt = 0;         // throttle: last poop-spawn time (performance.now-based)
+// --- THANK AGENTS: wholesome celebration state (flower confetti + ~1min blissful mood) ---
+let flowers = [];           // pastel flower/petal confetti particles (capped, auto-expire)
+let thankMsgs = [];         // rotating floating gratitude-about-life messages (screen space, capped)
+let blissUntil = 0;         // performance.now() deadline: agents are BLISSFUL while now<blissUntil
+let flowerRainUntil = 0;    // performance.now() deadline: keep raining fresh flowers while now<this
+let lastFlowerAt = 0;       // throttle: last flower-rain spawn time (performance.now-based)
+let lastThankMsgAt = 0;     // throttle: last gratitude-message spawn time (performance.now-based)
 let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
 let msgSeen = null;   // id -> last assistant `latest` seen (desk agents); null until first poll
 let subMsgSeen = {};  // subId -> last change-token (subagents + workflow subs)
@@ -3451,7 +3458,9 @@ function drawDeskPod(x, y, p, t){
     // celebration: a little seated bounce while the flag is live (visual only;
     // hitbox uses deskX/deskY, so a transient offset is safe)
     const hop=(p.celebrateUntil && performance.now()<p.celebrateUntil)
-      ? -Math.abs(Math.sin(performance.now()*0.018))*4 : 0;
+      ? -Math.abs(Math.sin(performance.now()*0.018))*4
+      : (p.blissUntil && performance.now()<p.blissUntil)
+      ? -Math.abs(Math.sin(performance.now()*0.004))*1.6 : 0;   // THANK AGENTS: soft contented bob
     const flin=whipped ? Math.sin(performance.now()*0.06)*1.6 : 0;   // whip: a brief startled shudder
     const angry=performance.now()<angryUntil;                        // ANGRY MODE (WHIP-abuse revolt)
     const shake=angry ? Math.sin(performance.now()*0.05 + arguments[0])*1.8 : 0;  // seething jitter
@@ -3827,6 +3836,10 @@ function drawStanding(p, t){
     dx0 = Math.sin(tt*0.013)*3;                // wiggle
   } else if(p.whipUntil && performance.now()<p.whipUntil){
     dx0 = Math.sin(performance.now()*0.06)*2;  // whip: startled shudder (no hop)
+  } else if(p.blissUntil && performance.now()<p.blissUntil){
+    const tt=performance.now();
+    dx0 = Math.sin(tt*0.003 + (p.x||0))*2.2;    // THANK AGENTS: slow, gentle side-to-side sway
+    dy0 = -Math.abs(Math.sin(tt*0.004))*1.6;    // soft contented float
   }
   if(performance.now()<angryUntil){ dx0 += Math.sin(performance.now()*0.05 + p.x)*1.6; }  // ANGRY MODE jitter
   const x=Math.round(p.x+dx0), y=Math.round(p.y+dy0);
@@ -3923,6 +3936,25 @@ function tick(now){
       if(c.age>=c.life){ confetti.splice(i,1); continue; }
       c.vy+=c.g*ds; c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.99; c.rot+=c.vr*ds;
     }
+  }
+  // THANK AGENTS: keep a steady curtain of petals falling from the top for the rain window
+  // (~10s), on top of the initial burst -- spawn a small batch a few times a second (capped).
+  if(now<flowerRainUntil && now-lastFlowerAt>140){ lastFlowerAt=now; spawnFlowers(null,null,14); }
+  // THANK AGENTS: advance + expire flower confetti (soft gravity + a slow horizontal sway)
+  if(flowers.length){
+    const ds=dt/1000;
+    for(let i=flowers.length-1;i>=0;i--){ const fl=flowers[i]; fl.age+=ds;
+      if(fl.age>=fl.life){ flowers.splice(i,1); continue; }
+      fl.vy+=fl.g*ds; fl.x+=fl.vx*ds; fl.y+=fl.vy*ds; fl.vx*=0.99; fl.rot+=fl.vr*ds;
+    }
+  }
+  // THANK AGENTS: while blissful, drip in a new gratitude message every few seconds (capped),
+  // and advance/expire the floating ones (they drift up and fade out on their own).
+  if(now<blissUntil && now-lastThankMsgAt>3500){ lastThankMsgAt=now; spawnThankMsg(); }
+  if(thankMsgs.length){
+    const ds=dt/1000;
+    for(let i=thankMsgs.length-1;i>=0;i--){ const m=thankMsgs[i]; m.age+=ds; m.y+=m.vy*ds;
+      if(m.age>=m.life) thankMsgs.splice(i,1); }
   }
   // advance + expire whip-crack particles (streaks decelerate; the lash line just fades)
   if(whipFx.length){
@@ -4124,6 +4156,42 @@ function render(t){
     ctx.save(); ctx.globalAlpha=a; ctx.translate(c.x,c.y); ctx.rotate(c.rot);
     ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
   }
+  // THANK AGENTS: pastel flower confetti (petals drift + sway), also above everything
+  for(const fl of flowers){
+    const a=Math.max(0, 1 - fl.age/fl.life);
+    const sx=fl.x + Math.sin(fl.age*fl.sway + fl.swayPh)*6;    // gentle horizontal sway
+    drawFlower(sx, fl.y, fl.size, fl.rot, fl.col, a);
+  }
+  // THANK AGENTS: soft hearts floating up over each blissful agent (screen space, one loop/agent)
+  {
+    const bnow=performance.now();
+    for(const p of people){
+      if(!(p.blissUntil && bnow<p.blissUntil)) continue;
+      if(p.x==null || p.kind==='beach' || p.mode==='drown') continue;
+      const seated=(p.kind==='work' && p.seated);
+      const hx=seated ? p.deskX : p.x;
+      const hy=(seated ? p.deskY-30*SC : p.y-34*SC);
+      const seed=((p.deskX||p.x||0)*7)|0;
+      for(let k=0;k<2;k++){
+        const ph=((bnow*0.0006 + k*0.5 + seed*0.013)%1 + 1)%1;  // 0->1 rising loop
+        const a=Math.sin(ph*Math.PI);                            // fade in then out
+        drawMiniHeart(hx + Math.sin(ph*6+seed)*6, hy - ph*22, a*0.9);
+      }
+    }
+  }
+  // THANK AGENTS: rotating floating gratitude messages (screen space, readable, capped)
+  if(thankMsgs.length){
+    ctx.save(); ctx.textAlign='center'; ctx.font='14px "Press Start 2P", monospace';
+    for(const m of thankMsgs){
+      const fin=Math.min(1, m.age/0.4), fout=Math.min(1, (m.life-m.age)/1.0);
+      const a=Math.max(0, Math.min(fin,fout));
+      if(a<=0) continue;
+      ctx.globalAlpha=a;
+      ctx.fillStyle='rgba(50,35,55,.55)'; ctx.fillText(m.text, m.x+2, m.y+2);   // soft shadow
+      ctx.fillStyle=m.col; ctx.fillText(m.text, m.x, m.y);
+    }
+    ctx.restore(); ctx.textAlign='left'; ctx.globalAlpha=1;
+  }
   // whip crack: a bright lash line + sharp shock streaks, above everything
   for(const c of whipFx){
     const a=Math.max(0, 1 - c.age/c.life);
@@ -4191,6 +4259,81 @@ function spawnConfetti(ox, oy){
     });
   }
   if(confetti.length>200) confetti.splice(0, confetti.length-200);   // hard cap
+}
+
+// short, wholesome life-gratitude lines shown on screen during a THANK AGENTS celebration
+const THANK_LINES = [
+  'thank you for being here',
+  'we are grateful for today',
+  'every small step matters',
+  'kindness makes us stronger',
+  'we grow together',
+  'you are appreciated',
+  'good work, good people',
+  'grateful for this team',
+  'take a breath, you did great',
+  'the little moments count',
+  'we appreciate you',
+  'life is better shared',
+  'gratitude turns days into gifts',
+  'thankful for another good day',
+];
+
+// FLOWER confetti (petal-shaped, soft pastel palette) modelled on spawnConfetti but gentler:
+// lighter gravity + a slow horizontal sway so petals drift down softly instead of raining hard.
+function spawnFlowers(ox, oy, n){
+  const cols=['#ffd1dc','#ffe08a','#ffffff','#e6ccff','#ffc0d9','#fff0b3','#d9c2ff'];
+  const N=(n!=null)?n:90;
+  for(let i=0;i<N;i++){
+    const fromOrigin = (ox!=null) && (i<45);
+    flowers.push({
+      x: fromOrigin? ox : Math.random()*W,
+      y: fromOrigin? oy : -10 - Math.random()*H*0.3,
+      vx: fromOrigin? (Math.random()-0.5)*130 : (Math.random()-0.5)*30,
+      vy: fromOrigin? (-90 - Math.random()*90) : (14 + Math.random()*36),
+      g: 70 + Math.random()*50,                    // gentle gravity -> slow, soft drift
+      sway: 0.6 + Math.random()*1.2, swayPh: Math.random()*Math.PI*2,
+      size: 4 + Math.random()*4,
+      col: cols[(Math.random()*cols.length)|0],
+      rot: Math.random()*Math.PI, vr:(Math.random()-0.5)*4,
+      life: 14.0 + Math.random()*2.0, age:0,
+    });
+  }
+  if(flowers.length>200) flowers.splice(0, flowers.length-200);   // hard cap (like confetti)
+}
+
+// a little five-petal flower centred at (x,y): pastal petals around a sunny yellow center
+function drawFlower(x, y, s, rot, col, a){
+  ctx.save(); ctx.globalAlpha=Math.max(0,a); ctx.translate(x,y); ctx.rotate(rot);
+  ctx.fillStyle=col;
+  for(let k=0;k<5;k++){
+    ctx.save(); ctx.rotate(k*Math.PI*2/5);
+    ctx.beginPath(); ctx.ellipse(0, -s*0.7, s*0.42, s*0.72, 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  ctx.fillStyle='#ffe98a'; ctx.beginPath(); ctx.arc(0, 0, s*0.34, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// spawn one floating gratitude message (screen space) if we're under the concurrent cap
+function spawnThankMsg(){
+  if(thankMsgs.length>=5) return;                  // hard cap -> never spammy
+  thankMsgs.push({
+    text: THANK_LINES[(Math.random()*THANK_LINES.length)|0],
+    x: W*0.5 + (Math.random()-0.5)*W*0.16,
+    y: H*0.34 + Math.random()*H*0.34,
+    vy: -9 - Math.random()*7,                       // drift gently upward
+    col: ['#e46ea0','#c08adf','#e0a94a','#5aa0d0'][(Math.random()*4)|0],
+    age:0, life: 4.5 + Math.random()*1.5,
+  });
+}
+
+// a tiny pixel heart (screen space) used for the blissful agents' floating hearts
+function drawMiniHeart(x, y, a){
+  ctx.save(); ctx.globalAlpha=Math.max(0,a);
+  px(x-2, y-1, 2, 2, PAL.pink); px(x+1, y-1, 2, 2, PAL.pink);      // two lobes
+  px(x-3, y+1, 7, 2, PAL.pink); px(x-2, y+3, 5, 1, PAL.pink); px(x-1, y+4, 3, 1, PAL.pink); // body -> point
+  ctx.restore();
 }
 
 // a whip CRACK snapping down at the strike point (ox,oy): a curved tapering lash + a short
@@ -4881,6 +5024,34 @@ document.getElementById('celebrate').addEventListener('click',()=>{
   spawnConfetti(W/2, H*0.22);
   toast('party time!');
 });
+// THANK AGENTS button: two behaviours depending on state.
+//  * If the office is mid-revolt (ANGRY MODE): apologise -> the tantrum ends immediately.
+//    Anger is cleared, in-flight poop is removed, splats begin fading, and the WHIP click
+//    counter is reset so the revolt can't instantly re-trigger. (No flower celebration here.)
+//  * Otherwise: a wholesome celebration -> pastel FLOWER confetti, every on-screen agent goes
+//    blissful/happy for ~1 minute (gentle sway + floating hearts, keeping the always-happy face),
+//    and rotating gratitude-about-life messages float across the screen for that minute.
+const BLISS_MS=60000;   // ~1 minute of blissful happiness, tracked via the performance.now() clock
+document.getElementById('thank').addEventListener('click',()=>{
+  const now=performance.now();
+  if(now<angryUntil){                                     // --- mid-revolt: make peace ---
+    angryUntil=0;                                         // end the fury right now
+    lastPoopAt=0;                                         // stop the throttled poop-spawner
+    whipClicks=[];                                        // reset the counter so it won't re-trigger
+    poop.length=0;                                        // clear in-flight projectiles (clean exit)
+    poopSplats.forEach(s=>{ if(s.life-s.age>2.6) s.age=s.life-2.6; });  // begin fading existing splats now
+    people.forEach(p=>{ p.whipUntil=0; });                // drop any lingering flinch
+    toast('apology accepted 🙏 the agents forgive you', {big:true, ms:7000});
+    return;
+  }
+  // --- no tantrum: wholesome flower celebration + ~1min of bliss ---
+  blissUntil=now+BLISS_MS;
+  people.forEach(p=>{ p.blissUntil=now+BLISS_MS; });
+  spawnFlowers(W/2, H*0.22);                              // opening burst from the top-center
+  flowerRainUntil=now+10000; lastFlowerAt=0;              // then a steady 10s curtain of falling petals
+  spawnThankMsg(); lastThankMsgAt=now;                    // show a gratitude line promptly, then throttle
+  toast('the agents are grateful 🌸 thank you!');
+});
 // WHIP button: crack the whip -- everyone flinches + works harder ~3s (opposite of CELEBRATE).
 // EASTER EGG: crack it MORE THAN TWICE within a rolling 60-min window and the crackdown
 // backfires -- the office revolts into ANGRY MODE for exactly 3 minutes, flinging poop at
@@ -4899,7 +5070,7 @@ document.getElementById('whip').addEventListener('click',()=>{
     angryUntil=now+ANGRY_MS;                                // (re)arm the 3-minute fury
     people.forEach(p=>{ p.whipUntil=0; });                  // cancel any in-flight flinch
     lastPoopAt=0;                                           // let poop start flying immediately
-    toast(wasAngry ? 'the agents are furious! 💢' : 'you pushed them too far -- they revolt! 💩');
+    toast(wasAngry ? 'the agents are furious! 💢' : 'you pushed them too far -- they revolt! 💩', {big:true, ms:7000});
     return;                                                 // crackdown backfires: no "work harder"
   }
   // ONLY the working (seated, at-desk) agents get whipped -- kitchen / beach folk are left alone
@@ -4941,8 +5112,12 @@ document.getElementById('drown-beach').addEventListener('click',()=>{
 });
 
 let toastT=null;
-function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.style.display='block';
-  clearTimeout(toastT); toastT=setTimeout(()=>el.style.display='none',1800); }
+function toast(msg, opts){ const el=document.getElementById('toast'); el.textContent=msg;
+  const big=opts&&opts.big, ms=(opts&&opts.ms)||1800;
+  el.style.fontSize = big ? '15px' : '';          // '' falls back to the default 8px in CSS
+  el.style.padding  = big ? '12px 20px' : '';
+  el.style.display='block';
+  clearTimeout(toastT); toastT=setTimeout(()=>el.style.display='none',ms); }
 
 // ---- data polling ----
 async function refresh(){
