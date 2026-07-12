@@ -3195,12 +3195,18 @@ function drawBeachFloor(){
     const rx = wtrX + 4 + (((y*7)>>>0) % span) + rd;
     px(rx, y, 5, 1, 'rgba(255,255,255,.28)');
   }
-  // --- wet-sand shoreline: damp band on the sand side, translucent so grain shows ---
-  px(wtrX-9, y0, 9, hgt, 'rgba(112,146,146,.26)');
-  px(wtrX-4, y0, 4, hgt, 'rgba(84,132,142,.40)');
-  // --- foamy waterline where the sea meets the sand (breathes with the surge) ---
-  px(wtrX-1, y0, 3, hgt, 'rgba(255,255,255,.72)');
-  for(let y=y0; y<y1; y+=8){ const f=((y+surge)&8)?1:0; px(wtrX-2+f, y+ (f?2:0), 2, 3, 'rgba(255,255,255,.5)'); } // foam bubbles
+  // --- wavy shoreline: the sea meets the sand in a gentle organic curve, not a straight line.
+  //     lap(y) = how far the shallows reach LEFT of wtrX this row (a static wavy shape; the whole
+  //     line still breathes in/out via `surge`). Kept modest so agents' rest spots stay dry. ---
+  const lap = (y)=> Math.max(0, Math.round(4 + 4*Math.sin(y*0.085) + 2.4*Math.sin(y*0.23+1.1) + (hash('s'+y)%2)));
+  for(let y=y0; y<y1; y+=2){ const l=lap(y); if(l>0) px(wtrX-l, y, l, 2, '#5cc4da'); }   // shallows lapping onto the sand
+  for(let y=y0; y<y1; y+=2){
+    const ex = wtrX - lap(y);                                            // this row's actual waterline
+    px(ex-8, y, 8, 2, 'rgba(112,146,146,.26)');                          // damp wet-sand band
+    px(ex-4, y, 4, 2, 'rgba(84,132,142,.40)');
+    px(ex-1, y, 3, 2, 'rgba(255,255,255,.72)');                          // foam line hugging the curve
+  }
+  for(let y=y0; y<y1; y+=8){ const ex=wtrX-lap(y), f=((y+surge)&8)?1:0; px(ex-2+f, y+(f?2:0), 2, 3, 'rgba(255,255,255,.5)'); } // foam flecks
 }
 function drawBeachProps(){
   const T=layout().kitchenTop, y1=H, x0=BEACH_X;
