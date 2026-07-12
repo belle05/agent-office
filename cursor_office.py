@@ -1849,6 +1849,16 @@ PAGE = r"""<!DOCTYPE html>
   #brand #celebrate:hover,#brand #whip:hover,#brand #sound:hover,#brand #filter:hover,#brand #names:hover{background:#4a4a52;color:#fff;}
   #brand #celebrate:active,#brand #whip:active,#brand #sound:active,#brand #filter:active,#brand #names:active{transform:translateY(1px);}
   #brand #sound,#brand #filter,#brand #names,#brand #whip{margin-left:8px;}
+  /* tiny label-less "easter egg" buttons tucked into the kitchen (left) & beach (right)
+     corners of the screen -- faint until hovered; you have to try them to learn what they do. */
+  #screen .zonebtn{position:absolute;bottom:7px;width:24px;height:24px;padding:0;border:0;
+    border-radius:50%;background:rgba(0,0,0,.16);font-size:13px;line-height:24px;text-align:center;
+    cursor:pointer;opacity:.28;z-index:6;transition:opacity .15s ease,transform .08s ease,background .15s ease;
+    -webkit-user-select:none;user-select:none;}
+  #screen .zonebtn:hover{opacity:1;background:rgba(0,0,0,.34);}
+  #screen .zonebtn:active{transform:translateY(1px) scale(.92);}
+  #screen #sweep-kitchen{left:7px;}
+  #screen #drown-beach{right:30px;}   /* clear of the far-right water strip -- sits on the sand */
   #brand #sound.off,#brand #filter.off{color:#8a8a90;}
   #brand #filter.on{background:#2f5fb0;border-color:#3f6fc0;color:#fff;}
   #screenwrap{background:#22281a;border-radius:10px;padding:12px;
@@ -1864,7 +1874,7 @@ PAGE = r"""<!DOCTYPE html>
   #hud{position:absolute;left:0;top:0;display:flex;flex-direction:column;align-items:flex-start;
     gap:4px;padding:6px 8px;font-size:8px;color:#fff;pointer-events:none;}
   #hud .pill{background:rgba(0,0,0,.42);padding:4px 7px;border-radius:4px;}
-  #tip{position:absolute;left:8px;bottom:8px;font-size:7px;color:#fff;
+  #tip{position:absolute;left:40px;bottom:8px;font-size:7px;color:#fff;
     background:rgba(0,0,0,.32);padding:3px 6px;border-radius:4px;pointer-events:none;}
   #nametag{position:absolute;background:var(--panel);
     color:var(--ink-hi);font-size:11px;line-height:1.55;padding:11px 13px;border-radius:7px;
@@ -1931,7 +1941,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
   <div id="shell">
-    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="whip" title="crack the whip &mdash; everyone works harder">WHIP</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button><span id="clock"></span></div>
+    <div id="brand"><span><span class="dot"></span>AGENT OFFICE</span><span id="scope"></span><button id="celebrate" title="confetti + everyone dances">CELEBRATE</button><button id="whip" title="crack the whip &mdash; everyone works harder">WHIP</button><button id="sound" title="chime when an agent finishes">&#9834; ON</button><button id="filter" title="hide scheduled / courier agents">&#9993; HIDE</button><button id="names" title="agent name style">NAMES</button></div>
     <div id="screenwrap">
       <div id="matrix"><span class="ln l1"></span>DOT MATRIX WITH STEREO SOUND<span class="ln l2"></span></div>
       <div id="screen">
@@ -1944,6 +1954,8 @@ PAGE = r"""<!DOCTYPE html>
           <span class="pill" id="hud-wf" style="display:none">workflows: 0</span>
         </div>
         <div id="tip">click a worker</div>
+        <button id="sweep-kitchen" class="zonebtn" aria-label="kitchen">&#127958;</button>
+        <button id="drown-beach" class="zonebtn" aria-label="beach">&#127754;</button>
         <div id="nametag"></div>
         <div id="empty">No agents active in the last <b id="emh">24</b>h.<br/><br/>
           Start a chat in Cursor or Claude Code, or run with <b>--demo</b> to populate the office.</div>
@@ -2117,6 +2129,11 @@ let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // 
 // User-controlled and sticky (persisted), independent of the working/waiting status.
 let finishedIds = new Set(JSON.parse(localStorage.getItem('office_finished')||'[]'));
 function saveFinished(){ localStorage.setItem('office_finished', JSON.stringify([...finishedIds])); }
+// agents "drowned" via the beach easter-egg -- washed out to sea and hidden for good.
+// Persisted + filtered out of every poll so they never wade back in.
+let drownedIds = new Set(JSON.parse(localStorage.getItem('office_drowned')||'[]'));
+function saveDrowned(){ localStorage.setItem('office_drowned', JSON.stringify([...drownedIds])); }
+const DROWN_SINK_MS = 1500;   // how long an agent takes to slip under once it reaches the sea
 
 // ---- ambient random events (pure scenery; never clickable / never hit-tested) ----
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
@@ -3333,6 +3350,48 @@ function drawBeachSitter(p, t){
   drawHairAcc(x, y-24, f); drawFace(x, y-24, f, true);        // sunglasses ON (beach only)
 }
 
+// the beach easter egg's demise: an agent slipping under the waves. st = 0..1 sink
+// progress. Drawn inside the same scaleAbout(p.x,p.y,SC) transform as the other sprites,
+// so we build around (p.x,p.y) exactly like drawBeachSitter. X_X eyes, a last flail of
+// the arms, a translucent waterline creeping up the body, and bubbles trailing up.
+function drawDrowning(p, st){
+  st=Math.max(0, Math.min(1, st||0));           // defensive: a negative ellipse radius throws & freezes everything
+  const now=performance.now();
+  const x=Math.round(p.x);
+  const surf=Math.round(p.y-2);                 // the water surface -- stays put as they sink
+  const f=p.feat||featuresFor(p.id||'x');
+  const sk=f.skin, sh=f.shirt;
+  const sink=Math.round(st*22);                 // body descends into the sea
+  const y=Math.round(p.y+sink);
+  const a=Math.max(0, 1-st);                    // fade fully out just as they vanish
+  ctx.save();
+  ctx.globalAlpha=a;
+  const swing=Math.sin(now*0.02+(p.seed||0))*2;         // frantic flailing
+  const armUp=Math.round((1-st)*6);                     // arms high early, drop as they go under
+  px(x-9, y-15-armUp+swing, 3, 8+armUp, sk);            // left arm (help!)
+  px(x+6, y-15-armUp-swing, 3, 8+armUp, sk);            // right arm
+  ro(x-6, y-8, 12, 12, sh); px(x-6,y-8,12,2,shade(sh,.28));   // torso
+  ro(x-6, y-20, 12, 12, sk);                            // head
+  const xeye=(ex,ey)=>{ for(const [dx,dy] of [[0,0],[2,0],[1,1],[0,2],[2,2]]) px(ex+dx,ey+dy,1,1,'#25201c'); };
+  xeye(x-4, y-16); xeye(x+2, y-16);                     // X_X dead eyes
+  ctx.restore();
+  // translucent water creeping up over the submerged part + a foam ripple ring at the surface
+  ctx.globalAlpha=1;
+  ctx.fillStyle='rgba(87,194,216,.5)';
+  if(y-surf+6>0) ctx.fillRect(x-10, surf, 20, y-surf+6);
+  const rr=4+st*11;
+  ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.ellipse(x, surf, rr, rr*0.42, 0, 0, Math.PI*2); ctx.stroke();
+  // three bubbles trailing upward
+  for(let i=0;i<3;i++){
+    const bt=(now*0.03 + i*40 + (p.seed||0)*7) % 60;
+    const by=surf - bt*0.5, bx=x + Math.sin(now*0.01 + i*2)*3 + (i-1)*3, br=1.5-i*0.3;
+    ctx.globalAlpha=Math.max(0, 1-bt/60); ctx.fillStyle='rgba(255,255,255,.8)';
+    ctx.beginPath(); ctx.ellipse(bx, by, br, br, 0, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+}
+
 // a full workstation: office chair + desk + monitor + filing cabinet + plant,
 // with (optionally) a worker seated behind it, facing us. Even empty it looks furnished.
 function drawDeskPod(x, y, p, t){
@@ -3839,6 +3898,23 @@ function tick(now){
   // restock vending slots whose can has finished dropping + resting
   for(const k in vendDrops){ if(now-vendDrops[k].start>3200) delete vendDrops[k]; }
   for(const p of people){
+    if(p.mode==='drown'){
+      // beach easter egg: after a small staggered delay, march straight into the sea,
+      // then sink (handled visually in drawDrowning). p.dead -> reaped after the loop.
+      if(now>=p.drownStart){
+        if(!p.sinking){
+          const dx=p.drownTo.x-p.x, dy=p.drownTo.y-p.y, dist=Math.hypot(dx,dy);
+          if(dist<=step+0.5){ p.x=p.drownTo.x; p.y=p.drownTo.y; p.sinking=true; p.sinkStart=now; p.sinkT=0; }
+          else { p.vx=dx/dist; p.vy=dy/dist; p.x+=p.vx*step; p.y+=p.vy*step; }
+        } else {
+          // progress computed once here (single clock) so the draw side never sees a stray
+          // negative -> a negative ellipse radius would throw and kill the whole rAF loop.
+          p.sinkT = Math.min(1, (now-p.sinkStart)/DROWN_SINK_MS);
+          if(p.sinkT>=1){ p.dead=true; }
+        }
+      }
+      continue;
+    }
     if(p.kind==='exit'){
       // a filtered-out scheduled agent walking off the bottom of the screen
       const dx=p.exitX-p.x, dy=p.exitY-p.y, dist=Math.hypot(dx,dy);
@@ -3873,6 +3949,13 @@ function tick(now){
         p.y=Math.max(L.kitchenTop+44,Math.min(H-20,p.y));
       }
     }
+  }
+  // reap agents that have finished going under: hide them for good and clear the beach flag.
+  if(people.some(p=>p.dead)){
+    let n=0;
+    for(const p of people){ if(p.dead){ drownedIds.add(p.id); finishedIds.delete(p.id); n++; } }
+    people = people.filter(p=>!p.dead);
+    if(n){ saveDrowned(); saveFinished(); }
   }
   updateAmbient(now, dt);
   render(tCount);
@@ -3909,7 +3992,9 @@ function render(t){
   for(const e of drawList){
     if(e.p){ ctx.save(); scaleAbout(e.p.x, e.p.y, SC);
       // beach agents sit (with shades + cocktail) once settled; still walk in standing
-      if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t); else drawStanding(e.p,t);
+      if(e.p.mode==='drown' && e.p.sinking) drawDrowning(e.p, e.p.sinkT||0);
+      else if(e.p.kind==='beach' && e.p.mode==='idle') drawBeachSitter(e.p,t);
+      else drawStanding(e.p,t);
       ctx.restore();
       // a WAITING (kitchen) agent's open background shells float above its head, so a running
       // shell (e.g. a dev server) stays visible after the chat leaves the desk for the kitchen.
@@ -4680,6 +4765,34 @@ document.getElementById('whip').addEventListener('click',()=>{
   } });
   toast(struck ? 'back to work!' : 'nobody at their desk!');
 });
+// Easter-egg #1 -- the little 🏖️ tucked in the kitchen corner: send everyone currently
+// waiting in the kitchen off to the beach at once (mirrors the per-agent "SEND TO BEACH").
+// Kitchen == the SAME set rebuild() places on the floor: active (respecting the scheduled
+// filter), not already on the beach, and not seated/working.
+document.getElementById('sweep-kitchen').addEventListener('click',()=>{
+  const active = hideScheduled ? agents.filter(a=>!a.scheduled) : agents;
+  const kitchen = active.filter(a=>!finishedIds.has(a.id) && a.status!=='working');
+  if(!kitchen.length){ toast('kitchen is empty'); return; }
+  kitchen.forEach(a=>finishedIds.add(a.id));
+  saveFinished();
+  if(currentDetail) updateFinishBtn(currentDetail.id);   // keep the open detail card in sync
+  rebuild();
+  toast(kitchen.length+' off to the beach 🏖️');
+});
+// Easter-egg #2 -- the little 🌊 tucked in the beach corner: every agent lounging on the
+// sand gets up, wades into the sea and slips under (a staggered cascade), then is cleared
+// for good (drownedIds, filtered out of every future poll). It's just the clear animation.
+document.getElementById('drown-beach').addEventListener('click',()=>{
+  const beach = people.filter(p=>p.kind==='beach' && p.mode!=='drown');
+  if(!beach.length){ toast('the beach is empty'); return; }
+  const now=performance.now();
+  beach.sort((a,b)=>a.x-b.x).forEach((p,i)=>{
+    p.mode='drown'; p.sinking=false; p.dead=false; p.seated=false;
+    p.drownStart = now + i*180;                 // a little cascade, left to right
+    p.drownTo = { x: W-12, y: p.y };            // march straight out into the surf
+  });
+  toast('🌊 glug glug...');
+});
 
 let toastT=null;
 function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.style.display='block';
@@ -4691,7 +4804,7 @@ async function refresh(){
     const res=await fetch('/api/agents'); const data=await res.json();
     WINDOW_HOURS=data.hours||24; document.getElementById('emh').textContent=WINDOW_HOURS;
     document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
-    agents=data.agents||[]; rebuild();
+    agents=(data.agents||[]).filter(a=>!drownedIds.has(a.id)); rebuild();
     detectMessages(agents);
     detectInstructions(agents);
     detectFinishes(agents);
@@ -4869,8 +4982,6 @@ function detectFinishes(list){
   if(anyFinished) playFinishChime();   // once per poll, even if several finished at once
   prevStatus=cur;
 }
-function clock(){ document.getElementById('clock').textContent=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
-setInterval(clock,1000); clock();
 refresh(); setInterval(refresh, 4000);
 // ---- dev hot-reload: in --watch mode the server re-execs on file change, minting a
 // fresh token; the tab reloads itself when it notices. No-op unless --watch is on. ----

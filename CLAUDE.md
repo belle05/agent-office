@@ -68,8 +68,21 @@ python3 cursor_office.py --watch --demo --port 9100 --no-open   # dev: hot-reloa
   — this matters for geometry (see gotcha below). Sprites: `drawHelper` (subagent dwarf),
   `drawStanding` (kitchen/beach), `drawCourier` (scheduled jobs), `drawWorkflowTent`
   (the whiteboard easel), `drawShellWin` (open-shell terminal), `drawBoss` (supervisor
-  escorting a new instruction). `render()`/`tick()` are the frame loop; `refresh()` polls
+  escorting a new instruction), `drawDrowning` (a beach agent slipping under — see the
+  easter eggs below). `render()`/`tick()` are the frame loop; `refresh()` polls
   `/api/agents` every 4s. `NAME_SETS`/`nameStyle` = the NAMES button (default `israeli`).
+- **Bottom-corner emoji easter eggs** (label-less HTML buttons overlaid on `#screen`, faint
+  until hover; no tooltip on purpose): `#sweep-kitchen` (🏖️, kitchen/left corner) sends every
+  waiting agent to the beach at once; `#drown-beach` (🌊, beach/right corner) makes every beach
+  agent wade into the sea and sink (`drawDrowning`), then clears them for good via a persisted
+  `drownedIds` set (filtered out of every `refresh()` poll). Sink progress (`p.sinkT`) is
+  computed **once in `tick()`** and read in `render()` — never recompute it from
+  `performance.now()` on the draw side; a stale/negative value makes `drawDrowning`'s ripple
+  radius negative and **`ctx.ellipse` throws `IndexSizeError`, which kills the rAF loop and
+  freezes the ENTIRE office**. `drawDrowning` also clamps `st` to `[0,1]` defensively for the
+  same reason. QA gotcha: a **backgrounded/unfocused tab pauses `requestAnimationFrame`**, so
+  animations look frozen in automated screenshots even when the code is fine — pump `tick(ts)`
+  manually with advancing timestamps (each call renders) or foreground the tab to verify motion.
 - Ephemeral change-detection (between 4s polls): `detectMessages` (speech bubbles + tool
   chips — `toolChip()` keeps the file/target, e.g. `EDIT service.py`), `detectInstructions`
   (boss visits, suppress the agent's own bubble while a boss is talking), `detectFinishes`
