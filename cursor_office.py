@@ -346,16 +346,22 @@ def _first_user_text(path):
     return ""
 
 
-def _last_activity(path):
-    """Latest assistant activity from a transcript (Cursor or Claude line format), scanned
-    from the end. Returns (text, kind): kind is 'tool' when the model just called a tool
-    (text = "Tool: detail"), else 'assistant' (text = what it wrote). Drives the ephemeral
-    speech bubble / tool chip over a subagent dwarf. ("", "") when nothing is found."""
+def _sub_activity(path):
+    """Read a subagent transcript ONCE (scanned from the end) and return four fields --
+    (bubble_text, bubble_kind, last_tool, last_message):
+      - bubble_text/bubble_kind drive the ephemeral dwarf bubble/chip: the newest assistant
+        message's headline, tool winning within that message (kind 'tool'|'assistant'|'').
+      - last_tool = "Name: detail" of the most-recent tool_use (may be an earlier message).
+      - last_message = the most-recent assistant TEXT ([:360], + " ..." when longer).
+    The last two mirror the desk hover-card's independent last_tool / last_message so a
+    helper dwarf's tooltip can show BOTH what it last ran and what it last wrote. All ""
+    when nothing is found."""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
     except Exception:
-        return ("", "")
+        return ("", "", "", "")
+    bub_txt, bub_kind, last_tool, last_message = "", "", "", ""
     for line in reversed(lines):
         line = line.strip()
         if not line or '"assistant"' not in line:   # cheap pre-filter
@@ -370,29 +376,37 @@ def _last_activity(path):
         c = (o.get("message") or {}).get("content")
         if c is None:
             c = o.get("content")
+        m_tool_first, m_tool_last, m_text = "", "", ""
         if isinstance(c, str):
-            txt = _clean_text(c)
-            if txt:
-                return (txt, "assistant")
-            continue
-        if isinstance(c, list):
-            tool = None
-            parts = []
+            m_text = _clean_text(c)
+        elif isinstance(c, list):
+            tools, parts = [], []
             for b in c:
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
-                if bt == "tool_use" and tool is None:
-                    tool = ("%s: %s" % (b.get("name", "tool"),
-                                        _tool_detail(b.get("name", ""), b.get("input")))).strip().rstrip(":")
+                if bt == "tool_use":
+                    tools.append(("%s: %s" % (b.get("name", "tool"),
+                                  _tool_detail(b.get("name", ""), b.get("input")))).strip().rstrip(":"))
                 elif bt == "text" and b.get("text"):
                     parts.append(b["text"])
-            if tool:                              # ran a tool -> show the action
-                return (tool, "tool")
-            txt = _clean_text("\n".join(parts))
-            if txt:
-                return (txt, "assistant")
-    return ("", "")
+            if tools:
+                m_tool_first, m_tool_last = tools[0], tools[-1]
+            m_text = _clean_text("\n".join(parts))
+        # ephemeral bubble: newest content-bearing message, tool wins (first tool in the msg)
+        if not bub_kind:
+            if m_tool_first:
+                bub_txt, bub_kind = m_tool_first, "tool"
+            elif m_text:
+                bub_txt, bub_kind = m_text, "assistant"
+        # hover fields: most-recent tool and most-recent text, found INDEPENDENTLY
+        if not last_tool and m_tool_last:
+            last_tool = m_tool_last
+        if not last_message and m_text:
+            last_message = m_text[:360].rstrip() + (" ..." if len(m_text) > 360 else "")
+        if bub_kind and last_tool and last_message:
+            break
+    return (bub_txt, bub_kind, last_tool, last_message)
 
 
 def _subagent_infos(sub_files):
@@ -420,9 +434,10 @@ def _subagent_infos(sub_files):
         if not detail:
             detail = _first_user_text(path)
         sub_id = os.path.splitext(os.path.basename(path))[0]
-        act_txt, act_kind = _last_activity(path)
+        bub_txt, bub_kind, last_tool, last_message = _sub_activity(path)
         infos.append({"type": typ, "detail": detail[:140], "id": sub_id,
-                      "last_msg": act_txt[:160], "last_kind": act_kind, "ts": m})
+                      "last_msg": bub_txt[:160], "last_kind": bub_kind,
+                      "last_tool": last_tool, "last_message": last_message, "ts": m})
     return infos
 
 
@@ -1276,6 +1291,53 @@ def _workflow_identities(uuid, jsonl_path, mtime):
     return out
 
 
+# STRONG markers are unambiguous per-agent task headings -> jump to them wherever they appear
+# (a shared preamble can be arbitrarily long). WEAK ones are common words -> only near the top.
+_TASK_MARKERS_STRONG = ("YOUR AREA", "YOUR TASK", "YOUR JOB", "YOUR FOCUS", "YOUR SLICE",
+                        "YOUR MISSION", "YOUR GOAL", "YOUR PIECE", "YOUR ROLE")
+_TASK_MARKERS_WEAK = ("TASK:", "GOAL:", "OBJECTIVE:", "FOCUS:", "AREA:", "ROLE:")
+_MARKER_HEAD_RE = re.compile(r"^(YOUR\s+[A-Za-z]+|TASK|GOAL|OBJECTIVE|FOCUS|AREA|ROLE|MISSION)"
+                             r"\s*[:\-–—]+\s*", re.I)
+
+
+def _distinctive_details(prompts, cap=140):
+    """Per-agent SHORT label capturing what *that* subagent does. Sibling workflow agents
+    almost always share a large identical preamble (the same context/instructions block) with
+    only a small distinctive slice -- e.g. ``YOUR AREA -- ...`` -- differing, so the naive
+    first-N-chars makes every helper-dwarf read identically. We strip the prefix common to all
+    siblings in the run and/or jump to a task-marker heading, then collapse to one short line.
+    Robust across arbitrary scripts (no dependency on the workflow source or agent() labels)."""
+    nonempty = [p for p in prompts if p]
+    cut = 0
+    if len(nonempty) >= 2:                       # longest prefix shared by every sibling prompt
+        s0, m = nonempty[0], len(nonempty[0])
+        for p in nonempty[1:]:
+            i, lim = 0, min(m, len(p))
+            while i < lim and s0[i] == p[i]:
+                i += 1
+            m = i
+            if not m:
+                break
+        if 0 < m < len(s0):                      # back up to a word/newline boundary
+            b = max(s0.rfind("\n", 0, m), s0.rfind(" ", 0, m))
+            cut = b if b > 0 else m
+    out = []
+    for p in prompts:
+        if not p:
+            out.append("")
+            continue
+        rest = p[cut:] if 0 < cut < len(p) else p
+        up = rest.upper()
+        hits =  [j for j in (up.find(mk) for mk in _TASK_MARKERS_STRONG) if j >= 0]
+        hits += [j for j in (up.find(mk) for mk in _TASK_MARKERS_WEAK) if 0 <= j <= 240]
+        if hits:
+            rest = rest[min(hits):]              # jump to the per-agent "YOUR AREA / TASK:" heading
+        rest = _MARKER_HEAD_RE.sub("", rest)     # drop the heading word itself
+        rest = re.sub(r"\s+", " ", rest.lstrip(" \t\n-–—*:>#")).strip()
+        out.append(rest[:cap].strip())
+    return out
+
+
 def _workflow_progress(run_dir):
     """Parse a run's journal.jsonl into {total, done, running, active[], latest_mtime,
     had_retries}. Logical tasks are keyed by the journal ``key`` (not agentId) so a retried
@@ -1283,7 +1345,8 @@ def _workflow_progress(run_dir):
     result, AND its freshest agent-<id>.jsonl was written within SUBAGENT_ACTIVE_SECONDS --
     a started-with-no-result whose transcript went cold long ago died/finished silently and
     must not show as running. Journal parse cached by (mtime, size); freshness refreshed
-    cheaply each call."""
+    cheaply each call. Each active subagent's ``detail`` is de-boilerplated by
+    ``_distinctive_details`` so sibling dwarves read distinctly."""
     journal = os.path.join(run_dir, "journal.jsonl")
     try:
         st = os.stat(journal)
@@ -1328,7 +1391,7 @@ def _workflow_progress(run_dir):
     now = time.time()
     latest = st.st_mtime
     running_fresh = 0
-    active = []
+    pending = []
     for k in base["open_keys"]:
         best_am, best_aid = None, None
         for aid in base["key_agents"].get(k, []):
@@ -1344,11 +1407,18 @@ def _workflow_progress(run_dir):
         if best_am is None or (now - best_am) > SUBAGENT_ACTIVE_SECONDS:
             continue   # never written, or went cold -> died/finished without a result
         running_fresh += 1
-        if len(active) < 6:
+        if len(pending) < 6:
             ap = os.path.join(run_dir, "agent-%s.jsonl" % best_aid)
-            act_txt, act_kind = _last_activity(ap)
-            active.append({"type": "workflow-subagent", "detail": _first_user_text(ap)[:140],
-                           "id": best_aid, "last_msg": act_txt[:160], "last_kind": act_kind, "ts": best_am})
+            bub_txt, bub_kind, last_tool, last_message = _sub_activity(ap)
+            pending.append({"type": "workflow-subagent", "_prompt": _first_user_text(ap),
+                            "id": best_aid, "last_msg": bub_txt[:160], "last_kind": bub_kind,
+                            "last_tool": last_tool, "last_message": last_message, "ts": best_am})
+    # de-boilerplate the sibling prompts together so each dwarf reads distinctly
+    details = _distinctive_details([p.pop("_prompt") for p in pending])
+    active = []
+    for p, d in zip(pending, details):
+        p["detail"] = d or "workflow subagent"
+        active.append(p)
     return {
         "total": base["total"],
         "done": base["done"],
@@ -1574,15 +1644,20 @@ def demo_agents():
     def _blip(off, period=15):
         return int((now + off) // period)
     subs_a = [{"type": "general-purpose", "detail": "Review the working diff for bugs",
-               "id": "demoA-0", "last_msg": "Grep: export path (%d)" % _blip(0), "last_kind": "tool", "ts": now},
+               "id": "demoA-0", "last_msg": "Grep: export path (%d)" % _blip(0), "last_kind": "tool",
+               "last_tool": "Grep: export path", "last_message": "scanning for the config loader", "ts": now},
               {"type": "test-runner", "detail": "Run the unit test suite",
-               "id": "demoA-1", "last_msg": "unit suite green, pass %d" % _blip(5), "last_kind": "assistant", "ts": now}]
+               "id": "demoA-1", "last_msg": "unit suite green, pass %d" % _blip(5), "last_kind": "assistant",
+               "last_tool": "Bash: pytest -q", "last_message": "unit suite green, all 42 pass", "ts": now}]
     subs_e = [{"type": "explorer", "detail": "Map the ORM query paths",
-               "id": "demoE-0", "last_msg": "Read: orders.py (%d)" % _blip(2), "last_kind": "tool", "ts": now},
+               "id": "demoE-0", "last_msg": "Read: orders.py (%d)" % _blip(2), "last_kind": "tool",
+               "last_tool": "Read: orders.py", "last_message": "tracing the pagination query", "ts": now},
               {"type": "db-analyst", "detail": "EXPLAIN the slow orders query",
-               "id": "demoE-1", "last_msg": "Bash: EXPLAIN ANALYZE (%d)" % _blip(8), "last_kind": "tool", "ts": now},
+               "id": "demoE-1", "last_msg": "Bash: EXPLAIN ANALYZE (%d)" % _blip(8), "last_kind": "tool",
+               "last_tool": "Bash: EXPLAIN ANALYZE orders", "last_message": "the seq scan is the bottleneck", "ts": now},
               {"type": "doc-writer", "detail": "Draft the fix summary",
-               "id": "demoE-2", "last_msg": "drafting summary v%d" % _blip(12), "last_kind": "assistant", "ts": now}]
+               "id": "demoE-2", "last_msg": "drafting summary v%d" % _blip(12), "last_kind": "assistant",
+               "last_tool": "Edit: report.md", "last_message": "drafting the fix summary", "ts": now}]
     wf_demo = [{
         "runId": "wf_demo01",
         "name": "exhaustive-security-audit",
@@ -1592,11 +1667,14 @@ def demo_agents():
         "phase_trusted": False,
         "total": 21, "done": 14, "running": 3,
         "active": [{"type": "workflow-subagent", "detail": "Verify the auth-bypass finding",
-                    "id": "demoW-0", "last_msg": "auth-bypass looks real (%d)" % _blip(3), "last_kind": "assistant", "ts": now},
+                    "id": "demoW-0", "last_msg": "auth-bypass looks real (%d)" % _blip(3), "last_kind": "assistant",
+                    "last_tool": "Read: auth/middleware.py", "last_message": "auth-bypass looks real -- no token check on the admin route", "ts": now},
                    {"type": "workflow-subagent", "detail": "Refute the SSRF candidate",
-                    "id": "demoW-1", "last_msg": "Edit: sanitizer.py (%d)" % _blip(9), "last_kind": "tool", "ts": now},
+                    "id": "demoW-1", "last_msg": "Edit: sanitizer.py (%d)" % _blip(9), "last_kind": "tool",
+                    "last_tool": "Edit: sanitizer.py", "last_message": "the SSRF filter is actually sound", "ts": now},
                    {"type": "workflow-subagent", "detail": "Check the deserialization sink",
-                    "id": "demoW-2", "last_msg": "WebFetch: cve database (%d)" % _blip(14), "last_kind": "tool", "ts": now}],
+                    "id": "demoW-2", "last_msg": "WebFetch: cve database (%d)" % _blip(14), "last_kind": "tool",
+                    "last_tool": "WebFetch: nvd.nist.gov", "last_message": "cross-checking against the CVE list", "ts": now}],
     }]
     samples = [
         ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a, []),
@@ -3373,6 +3451,13 @@ function drawHelper(cx, cy, t, seed){
 // workflow name (wrapped, mid-word if a token is too long), a big WHITE done/total
 // count, and 1-3 tiny helper dwarves at its base (one per running agent). Only drawn
 // while something is running. Returns the hover hit centre (local coords) or null.
+// slug -> human title: "f2-deterministic-noat-trigger" -> "F2 Deterministic Noat Trigger".
+// Keeps ALL-CAPS tokens as-is (API, MCP, CI); the full summary still lives in the hover card.
+function humanizeWf(s){
+  s = String(s||'').replace(/[_\-]+/g,' ').replace(/\s+/g,' ').trim();
+  if(!s) return 'Workflow';
+  return s.split(' ').map(w => (w===w.toUpperCase() ? w : (w[0].toUpperCase()+w.slice(1)))).join(' ');
+}
 function drawWorkflowTent(x, y, workflows, t){
   if(!workflows || !workflows.length) return null;   // backend already gates to genuinely-live runs
   // a WHITE whiteboard (like the wall inspiration board), floating a few px above the desk
@@ -3394,7 +3479,7 @@ function drawWorkflowTent(x, y, workflows, t){
   ctx.fillText(workflows.length>1?'WORKFLOWS':'WORKFLOW', cxT, byT+6);
   // workflow name (or "N runs" when several share a desk), wrapped mid-word, max 3 lines.
   // small font (matches the desk name-plate), tight side inset, no trailing ellipsis.
-  const wname = workflows.length>1 ? (workflows.length+' runs') : (workflows[0].name||'workflow');
+  const wname = workflows.length>1 ? (workflows.length+' runs') : humanizeWf(workflows[0].name);
   ctx.fillStyle=PAL.ink; ctx.font='4px "Press Start 2P", monospace';
   const nameLines = wrapTextMid(wname, bw-4, 3, '');
   // vertically centre the name in the band between the header strip and the count
@@ -4298,7 +4383,7 @@ cv.addEventListener('mousemove', e=>{
     const done = runs.reduce((s,w)=>s+(w.done||0),0);
     const total = runs.reduce((s,w)=>s+(w.total||0),0);
     const running = runs.reduce((s,w)=>s+(w.running||0),0);
-    const title = runs.length>1 ? (runs.length+' workflows') : (runs[0].name||'workflow');
+    const title = runs.length>1 ? (runs.length+' workflows') : humanizeWf(runs[0].name);
     let html =
       '<div class="nt-name">'+esc(title)+'<span class="nt-badge workflow">workflow</span></div>'+
       '<div class="nt-meta">'+done+' done  ·  '+running+' running  ·  '+total+' launched</div>';
@@ -4352,6 +4437,8 @@ cv.addEventListener('mousemove', e=>{
       (generic ? '' :
         '<div class="nt-label">This subagent is</div>'+
         '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>')+
+      (s.last_tool ? ('<div class="nt-label">Last tool used</div><div class="nt-text">'+esc(s.last_tool)+'</div>') : '')+
+      (s.last_message ? ('<div class="nt-label">Last message</div><div class="nt-text">'+esc(s.last_message)+'</div>') : '')+
       '<div class="nt-hint">a running '+(isWf?'workflow ':'')+'subagent</div>';
     nametag.style.display='block'; placeNametag(m);
     return;
