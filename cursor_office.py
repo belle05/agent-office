@@ -2118,6 +2118,12 @@ let detailCache = {};
 let WINDOW_HOURS = 24;
 let confetti = [];          // celebration particles (capped, auto-expire)
 let whipFx = [];            // whip-crack particles: one lash line + shock streaks (capped, auto-expire)
+// --- WHIP-abuse easter egg: overwork the "WIP" button and the office revolts ---
+let poop = [];              // poop projectiles hurled toward the viewer (capped, auto-expire)
+let poopSplats = [];        // brown splat decals stuck on the "glass" (screen space; fade out, capped)
+let whipClicks = [];        // wall-clock ms of recent WHIP clicks (rolling 60-min window)
+let angryUntil = 0;         // performance.now() deadline: agents are ANGRY while now<angryUntil
+let lastPoopAt = 0;         // throttle: last poop-spawn time (performance.now-based)
 let prevStatus = null;      // id -> last status; null until the first poll (no false fires)
 let msgSeen = null;   // id -> last assistant `latest` seen (desk agents); null until first poll
 let subMsgSeen = {};  // subId -> last change-token (subagents + workflow subs)
@@ -3318,6 +3324,23 @@ function drawFace(x, hy, f, beach){
   px(x-6,hy+8,2,2,'rgba(232,120,120,.55)'); px(x+5,hy+8,2,2,'rgba(232,120,120,.55)');
 }
 
+// a 💢-style anger vein: a little four-armed cross-hatch pop, drawn beside/above the head
+function drawAngerVein(x, y){
+  const r='#e23b3b';
+  px(x-3,y-3,2,2,r); px(x+1,y-3,2,2,r); px(x-3,y+1,2,2,r); px(x+1,y+1,2,2,r);
+  px(x-1,y-1,2,2,shade(r,.25));
+}
+
+// ANGRY overlay drawn ON TOP of the (always-happy) drawFace: a red flush, furious
+// down-angled brows, a gritted frown + an anger vein. Coords match drawFace's (x,hy).
+function drawAngryFace(x, hy, f){
+  px(x-7,hy,14,12,'rgba(214,50,40,.22)');                                  // red flush over the face
+  px(x-6,hy+2,3,1,'#3a1414'); px(x-4,hy+3,3,1,'#3a1414');                  // left brow angling down-in
+  px(x+3,hy+2,3,1,'#3a1414'); px(x+1,hy+3,3,1,'#3a1414');                  // right brow angling down-in
+  px(x-3,hy+11,7,1,'#5a1e1e'); px(x-3,hy+10,1,1,'#5a1e1e'); px(x+3,hy+10,1,1,'#5a1e1e'); // gritted frown
+  drawAngerVein(x+8, hy-3);
+}
+
 // a little tropical cocktail (glass + drink + straw + paper umbrella); cy = glass base
 function drawCocktail(cx, cy){
   const glass='#d5edf5', drink='#f39a3a';
@@ -3430,7 +3453,9 @@ function drawDeskPod(x, y, p, t){
     const hop=(p.celebrateUntil && performance.now()<p.celebrateUntil)
       ? -Math.abs(Math.sin(performance.now()*0.018))*4 : 0;
     const flin=whipped ? Math.sin(performance.now()*0.06)*1.6 : 0;   // whip: a brief startled shudder
-    const x=Math.round(arguments[0]+flin), y=Math.round(arguments[1]+hop); // shadow desk x/y for the worker BODY only
+    const angry=performance.now()<angryUntil;                        // ANGRY MODE (WHIP-abuse revolt)
+    const shake=angry ? Math.sin(performance.now()*0.05 + arguments[0])*1.8 : 0;  // seething jitter
+    const x=Math.round(arguments[0]+flin+shake), y=Math.round(arguments[1]+hop); // shadow desk x/y for the worker BODY only
     // torso (soft shaded shirt + collar)  -- anchors UNCHANGED (hitbox-critical)
     ro(x-11, y-12, 22, 16, sh);
     px(x-11,y-12,22,2, shade(sh,.30)); px(x+7,y-11,3,14, shade(sh,-.20)); px(x-11,y+2,22,2, shade(sh,-.16));
@@ -3446,6 +3471,7 @@ function drawDeskPod(x, y, p, t){
     ro(x-7, y-28, 14, 15, sk);
     px(x-7,y-14,14,1,'rgba(0,0,0,.10)');                                // soft jaw shade
     drawHairAcc(x, y-26, f); drawFace(x, y-26, f);
+    if(angry) drawAngryFace(x, y-26, f);
   }
   // --- wood desk top: bright surface + grain hint + shaded front edge ---
   px(x-26,y+1,52,4,PAL.woodHi);                                         // bright top surface
@@ -3802,6 +3828,7 @@ function drawStanding(p, t){
   } else if(p.whipUntil && performance.now()<p.whipUntil){
     dx0 = Math.sin(performance.now()*0.06)*2;  // whip: startled shudder (no hop)
   }
+  if(performance.now()<angryUntil){ dx0 += Math.sin(performance.now()*0.05 + p.x)*1.6; }  // ANGRY MODE jitter
   const x=Math.round(p.x+dx0), y=Math.round(p.y+dy0);
   const f=p.feat||featuresFor(p.id||'x');
   const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
@@ -3874,6 +3901,7 @@ function drawStanding(p, t){
   ro(x-7+hx, y-27+ht, 14, 15, sk);
   px(x-7+hx,y-13+ht,14,1,'rgba(0,0,0,.10)');               // soft jaw shade
   drawHairAcc(x+hx, y-25+ht, f); drawFace(x+hx, y-25+ht, f);
+  if(performance.now()<angryUntil) drawAngryFace(x+hx, y-25+ht, f);
   // small-talk bubble while chatting, else the cozy heart when settled
   if(settled){
     if(talking){ const nd=1+((((now/700)|0)+(kh%3))%3); talkBubble(x + (faceDir<0?-15:15), y-34, nd); }
@@ -3903,6 +3931,31 @@ function tick(now){
       if(c.age>=c.life){ whipFx.splice(i,1); continue; }
       if(!c.lash){ c.x+=c.vx*ds; c.y+=c.vy*ds; c.vx*=0.90; c.vy*=0.90; }
     }
+  }
+  // ANGRY MODE: while furious, agents hurl poop toward the viewer at a steady, throttled
+  // cadence. Projectiles fly + grow (advanced in render from their eased progress); when
+  // one lands it becomes a splat decal. Nothing new spawns once the 3-min deadline passes.
+  if(now<angryUntil && now-lastPoopAt>240){
+    lastPoopAt=now;
+    const throwers=people.filter(p=>p.kind!=='beach' && p.mode!=='drown' && !p.dead && p.x!=null);
+    const nThrow=throwers.length ? (1 + (Math.random()<0.55?1:0)) : 0;   // a few per second total
+    for(let k=0;k<nThrow;k++){
+      const p=throwers[(Math.random()*throwers.length)|0];
+      spawnPoop(Math.round(p.x), Math.round(p.y)-Math.round(34*SC));
+    }
+  }
+  // advance + expire poop projectiles (progress eases in -> accelerate toward the glass; splat on land)
+  if(poop.length){
+    const ds=dt/1000;
+    for(let i=poop.length-1;i>=0;i--){ const q=poop[i]; q.t+=ds/q.dur; q.rot+=q.vr*ds;
+      if(q.t>=1){ spawnPoopSplat(q.tx, q.ty, q.size1, q.rot); poop.splice(i,1); }
+    }
+  }
+  // advance + expire poop splats (screen-space decals that linger, then fade out)
+  if(poopSplats.length){
+    const ds=dt/1000;
+    for(let i=poopSplats.length-1;i>=0;i--){ const s=poopSplats[i]; s.age+=ds;
+      if(s.age>=s.life) poopSplats.splice(i,1); }
   }
   // restock vending slots whose can has finished dropping + resting
   for(const k in vendDrops){ if(now-vendDrops[k].start>3200) delete vendDrops[k]; }
@@ -4094,6 +4147,28 @@ function render(t){
       ctx.fillStyle=c.col; ctx.fillRect(-c.w/2,-c.h/2,c.w,c.h); ctx.restore();
     }
   }
+  // ANGRY MODE: brown splat decals smeared on the glass (drawn first, then the flying poop
+  // on top so incoming shots read as landing over the older smears)
+  for(const s of poopSplats){
+    const fin=Math.min(1, s.age/0.14);                       // quick fade-in on impact
+    const fout=Math.min(1, (s.life-s.age)/2.6);              // slow fade-out at the end
+    const a=Math.max(0, Math.min(fin,fout));
+    if(a<=0) continue;
+    ctx.save(); ctx.globalAlpha=a*0.82; ctx.translate(s.x,s.y); ctx.rotate(s.rot);
+    ctx.fillStyle='#5a3a1e';
+    for(const b of s.blobs){ ctx.save(); ctx.rotate(b.rot); ctx.beginPath(); ctx.ellipse(b.x,b.y,b.rx,b.ry,0,0,Math.PI*2); ctx.fill(); ctx.restore(); }
+    for(const d of s.drips){ ctx.fillRect(d.x-d.w/2, 0, d.w, d.len); ctx.beginPath(); ctx.ellipse(d.x, d.len, d.w*0.6, d.w*0.6, 0,0,Math.PI*2); ctx.fill(); }
+    ctx.fillStyle='rgba(122,82,48,.6)'; ctx.beginPath(); ctx.ellipse(-s.blobs[0].rx*0.3, -s.blobs[0].ry*0.3, s.blobs[0].rx*0.4, s.blobs[0].ry*0.35, 0,0,Math.PI*2); ctx.fill(); // wet highlight
+    ctx.restore();
+  }
+  // flying poop projectiles: eased progress -> accelerate + grow toward the foreground
+  for(const q of poop){
+    const u=q.t*q.t;                                         // ease-in (accelerate at the viewer)
+    const x=q.ox+(q.tx-q.ox)*u;
+    const y=q.oy+(q.ty-q.oy)*u - Math.sin(q.t*Math.PI)*46;   // a slight lob mid-flight
+    const sz=q.size0+(q.size1-q.size0)*u;
+    drawPoop(x, y, sz, q.rot, 1);
+  }
   ctx.globalAlpha=1;
 }
 
@@ -4137,6 +4212,46 @@ function spawnWhip(ox, oy){
     });
   }
   if(whipFx.length>160) whipFx.splice(0, whipFx.length-160);   // hard cap
+}
+
+// ANGRY MODE poop projectile: hurled from an agent's head (ox,oy) toward a point in the
+// lower-centre foreground, so it reads as flying OUT of the screen at the developer. It
+// eases in (accelerates), grows small->large, lobs a touch, then SPLATs against the glass.
+function spawnPoop(ox, oy){
+  const tx=W*0.5 + (Math.random()-0.5)*W*0.62;          // impact clustered around lower-centre
+  const ty=H*0.70 + Math.random()*H*0.22;
+  poop.push({
+    ox, oy, tx, ty,
+    t:0, dur:0.62 + Math.random()*0.42,                 // ~0.6-1.0s flight
+    rot:Math.random()*Math.PI, vr:(Math.random()-0.5)*16,
+    size0:3, size1:14 + Math.random()*10,               // near the viewer it's big
+  });
+  if(poop.length>200) poop.splice(0, poop.length-200);  // hard cap (like confetti)
+}
+
+// a brown poop SPLAT smear stuck on the "glass": a central blob + a few satellite blobs +
+// drips, frozen in screen space with a stable irregular shape, that lingers then fades.
+function spawnPoopSplat(x, y, sz, rot){
+  const r=Math.max(6, sz*1.1);
+  const blobs=[{x:0, y:0, rx:r, ry:r*0.82, rot:0}];
+  const n=3 + ((Math.random()*3)|0);
+  for(let i=0;i<n;i++){ const a=Math.random()*Math.PI*2, d=r*(0.5+Math.random()*0.75);
+    blobs.push({ x:Math.cos(a)*d, y:Math.sin(a)*d, rx:r*(0.2+Math.random()*0.34), ry:r*(0.18+Math.random()*0.3), rot:Math.random()*Math.PI }); }
+  const drips=[];
+  const dn=1 + ((Math.random()*2)|0);
+  for(let i=0;i<dn;i++){ drips.push({ x:(Math.random()-0.5)*r*1.2, len:r*(0.6+Math.random()*0.9), w:Math.max(2,r*0.22) }); }
+  poopSplats.push({ x, y, rot:rot*0.25, blobs, drips, age:0, life:7 + Math.random()*5 });
+  if(poopSplats.length>40) poopSplats.splice(0, poopSplats.length-40);  // hard cap
+}
+
+// a cartoon poop pile (three stacked swirl blobs, brown), drawn centred at (x,y)
+function drawPoop(x, y, s, rot, a){
+  ctx.save(); ctx.globalAlpha=a; ctx.translate(x,y); ctx.rotate(rot);
+  ctx.fillStyle='#5a3a1e'; ctx.beginPath(); ctx.ellipse(0, s*0.52, s*0.92, s*0.5, 0,0,Math.PI*2); ctx.fill();  // base
+  ctx.fillStyle='#6a4526'; ctx.beginPath(); ctx.ellipse(0, 0, s*0.64, s*0.44, 0,0,Math.PI*2); ctx.fill();       // mid
+  ctx.fillStyle='#7a5230'; ctx.beginPath(); ctx.ellipse(0, -s*0.42, s*0.38, s*0.3, 0,0,Math.PI*2); ctx.fill();  // tip
+  ctx.fillStyle='rgba(255,255,255,.20)'; ctx.beginPath(); ctx.ellipse(-s*0.22, -s*0.5, s*0.13, s*0.09, 0,0,Math.PI*2); ctx.fill(); // sheen
+  ctx.restore();
 }
 
 // ======================================================================
@@ -4766,9 +4881,27 @@ document.getElementById('celebrate').addEventListener('click',()=>{
   spawnConfetti(W/2, H*0.22);
   toast('party time!');
 });
-// WHIP button: crack the whip -- everyone flinches + works harder ~3s (opposite of CELEBRATE)
+// WHIP button: crack the whip -- everyone flinches + works harder ~3s (opposite of CELEBRATE).
+// EASTER EGG: crack it MORE THAN TWICE within a rolling 60-min window and the crackdown
+// backfires -- the office revolts into ANGRY MODE for exactly 3 minutes, flinging poop at
+// the screen (at YOU). While furious, the normal "work harder" flinch is suppressed.
+const ANGRY_MS=180000;   // 3 minutes of fury, tracked via the performance.now() clock
 document.getElementById('whip').addEventListener('click',()=>{
   const now=performance.now();
+  // rolling 60-minute window of WHIP clicks (drop anything older than an hour)
+  const wall=Date.now();
+  whipClicks.push(wall);
+  whipClicks=whipClicks.filter(t=>wall-t<=3600000);
+  // the 3rd (and any further) click inside the same rolling hour triggers the revolt;
+  // once furious, every subsequent click just refreshes/extends the 3-min deadline
+  if(whipClicks.length>2 || now<angryUntil){
+    const wasAngry=now<angryUntil;
+    angryUntil=now+ANGRY_MS;                                // (re)arm the 3-minute fury
+    people.forEach(p=>{ p.whipUntil=0; });                  // cancel any in-flight flinch
+    lastPoopAt=0;                                           // let poop start flying immediately
+    toast(wasAngry ? 'the agents are furious! 💢' : 'you pushed them too far -- they revolt! 💩');
+    return;                                                 // crackdown backfires: no "work harder"
+  }
   // ONLY the working (seated, at-desk) agents get whipped -- kitchen / beach folk are left alone
   let struck=0;
   people.forEach(p=>{ if(p.kind==='work' && p.seated){
