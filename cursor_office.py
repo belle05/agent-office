@@ -2129,10 +2129,13 @@ let hideScheduled = (localStorage.getItem('office_hide_scheduled')==='on');  // 
 // User-controlled and sticky (persisted), independent of the working/waiting status.
 let finishedIds = new Set(JSON.parse(localStorage.getItem('office_finished')||'[]'));
 function saveFinished(){ localStorage.setItem('office_finished', JSON.stringify([...finishedIds])); }
-// agents "drowned" via the beach easter-egg -- washed out to sea and hidden for good.
-// Persisted + filtered out of every poll so they never wade back in.
-let drownedIds = new Set(JSON.parse(localStorage.getItem('office_drowned')||'[]'));
-function saveDrowned(){ localStorage.setItem('office_drowned', JSON.stringify([...drownedIds])); }
+// agents "drowned" via the beach easter-egg -- washed out to sea and hidden until they're
+// ACTIVE AGAIN. Stored as { id: mtimeAtDrownTime }; a poll where the agent's mtime has moved
+// past that stamp means new activity -> un-drown it (and it wades back in from the ocean).
+let drownedInfo = (()=>{ try{ const r=JSON.parse(localStorage.getItem('office_drowned')||'{}');
+  return (r && typeof r==='object' && !Array.isArray(r)) ? r : {}; }catch(e){ return {}; } })();
+function saveDrowned(){ localStorage.setItem('office_drowned', JSON.stringify(drownedInfo)); }
+let emergeFrom = new Set();    // ids that should spawn at the sea and walk in (just un-drowned)
 const DROWN_SINK_MS = 1500;   // how long an agent takes to slip under once it reaches the sea
 
 // ---- ambient random events (pure scenery; never clickable / never hit-tested) ----
@@ -2219,20 +2222,24 @@ function rebuild(){
     const y = top + r*rowH;
     deskSlots.push({x, y, worker:null});
   }
+  // where a just-un-drowned agent climbs back out of the sea (far-right water strip, mid-beach)
+  const SEA = { x: W-14, y: L.kitchenTop + Math.round((H-L.kitchenTop)*0.45) };
   workers.forEach(a=>{
     const old = prevById[a.id];
     const slot = deskSlots[deskAssign[a.id]];
     // already seated at THIS desk? stay seated. Otherwise walk in and then sit.
     const sameSeat = old && old.kind==='work' && old.seated &&
                      old.deskX===slot.x && old.deskY===slot.y;
+    const emerging = !old && emergeFrom.has(a.id);   // just resurfaced -> wade in from the ocean
     const person = Object.assign(old||{}, {
       id:a.id, agent:a, kind:'work',
       // keep current position so a kitchen->desk move animates as a walk
-      x: old? old.x : slot.x, y: old? old.y : slot.y,
+      x: old? old.x : (emerging? SEA.x : slot.x), y: old? old.y : (emerging? SEA.y : slot.y),
       deskX:slot.x, deskY:slot.y, vx:0, vy:0,
-      seated: old ? !!sameSeat : true,   // fresh load: just sit; transitions walk
+      seated: old ? !!sameSeat : (emerging? false : true),   // emergers walk up from the water
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     });
+    if(emerging) emergeFrom.delete(a.id);
     slot.worker = person;
     next.push(person);
   });
@@ -2260,15 +2267,17 @@ function rebuild(){
                : { x: base[0] + jx + ring*16, y: base[1] + jy + ring*14 };
     // walk in if new or arriving from another zone (desk/beach); otherwise keep mode
     const cameFromElsewhere = !old || old.kind!=='wait';
+    const emerging = !old && emergeFrom.has(a.id);   // just resurfaced -> wade in from the ocean
     next.push(Object.assign(old||{}, {
       id:a.id, agent:a, kind:'wait',
-      // brand-new agents enter from the room doorway (top-center) and walk to
-      // their spot; agents leaving a desk keep their office position and walk down.
-      x: old? old.x : W*0.5, y: old? old.y : k.y+8,
+      // brand-new agents enter from the room doorway (top-center) and walk to their spot;
+      // agents leaving a desk keep their office position; just-un-drowned ones rise from the sea.
+      x: old? old.x : (emerging? SEA.x : W*0.5), y: old? old.y : (emerging? SEA.y : k.y+8),
       home, vx:0, vy:0,
       mode: cameFromElsewhere ? 'walk' : old.mode,
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     }));
+    if(emerging) emergeFrom.delete(a.id);
   });
 
   // pair each waiting agent with its nearest kitchen neighbour (by anchor) so they can
@@ -3950,10 +3959,14 @@ function tick(now){
       }
     }
   }
-  // reap agents that have finished going under: hide them for good and clear the beach flag.
+  // reap agents that have finished going under: hide them (until active again) & clear the
+  // beach flag. Stamp = the agent's mtime now, so any later write resurfaces it.
   if(people.some(p=>p.dead)){
     let n=0;
-    for(const p of people){ if(p.dead){ drownedIds.add(p.id); finishedIds.delete(p.id); n++; } }
+    for(const p of people){ if(p.dead){
+      drownedInfo[p.id] = (p.agent && typeof p.agent.mtime==='number') ? p.agent.mtime : (Date.now()/1000);
+      finishedIds.delete(p.id); n++;
+    } }
     people = people.filter(p=>!p.dead);
     if(n){ saveDrowned(); saveFinished(); }
   }
@@ -4780,8 +4793,8 @@ document.getElementById('sweep-kitchen').addEventListener('click',()=>{
   toast(kitchen.length+' off to the beach 🏖️');
 });
 // Easter-egg #2 -- the little 🌊 tucked in the beach corner: every agent lounging on the
-// sand gets up, wades into the sea and slips under (a staggered cascade), then is cleared
-// for good (drownedIds, filtered out of every future poll). It's just the clear animation.
+// sand gets up, wades into the sea and slips under (a staggered cascade), then is hidden
+// (drownedInfo) until it's active again, at which point it wades back in from the ocean.
 document.getElementById('drown-beach').addEventListener('click',()=>{
   const beach = people.filter(p=>p.kind==='beach' && p.mode!=='drown');
   if(!beach.length){ toast('the beach is empty'); return; }
@@ -4804,7 +4817,19 @@ async function refresh(){
     const res=await fetch('/api/agents'); const data=await res.json();
     WINDOW_HOURS=data.hours||24; document.getElementById('emh').textContent=WINDOW_HOURS;
     document.getElementById('scope').textContent='scope: '+(data.scope||'all projects');
-    agents=(data.agents||[]).filter(a=>!drownedIds.has(a.id)); rebuild();
+    // hide drowned agents until they're active again (mtime advanced past the drown stamp),
+    // then un-drown them and mark them to wade back in from the sea.
+    let _undrowned=false;
+    agents=(data.agents||[]).filter(a=>{
+      const dm=drownedInfo[a.id];
+      if(dm===undefined) return true;                       // not drowned
+      if(typeof a.mtime==='number' && a.mtime>dm+0.5){       // new activity -> resurface
+        delete drownedInfo[a.id]; emergeFrom.add(a.id); _undrowned=true; return true;
+      }
+      return false;                                         // still under
+    });
+    if(_undrowned) saveDrowned();
+    rebuild();
     detectMessages(agents);
     detectInstructions(agents);
     detectFinishes(agents);

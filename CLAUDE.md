@@ -74,8 +74,12 @@ python3 cursor_office.py --watch --demo --port 9100 --no-open   # dev: hot-reloa
 - **Bottom-corner emoji easter eggs** (label-less HTML buttons overlaid on `#screen`, faint
   until hover; no tooltip on purpose): `#sweep-kitchen` (🏖️, kitchen/left corner) sends every
   waiting agent to the beach at once; `#drown-beach` (🌊, beach/right corner) makes every beach
-  agent wade into the sea and sink (`drawDrowning`), then clears them for good via a persisted
-  `drownedIds` set (filtered out of every `refresh()` poll). Sink progress (`p.sinkT`) is
+  agent wade into the sea and sink (`drawDrowning`), then **hides** them (persisted
+  `drownedInfo` = `{id: mtime-at-drown}`) — filtered out of every `refresh()` poll **until the
+  agent is active again** (a poll where its `mtime` has advanced past the stamp), at which point
+  it un-drowns and **wades back in from the sea**: `emergeFrom` (a transient Set) makes `rebuild`
+  spawn it at the far-right water strip (`SEA`) and walk to its desk/kitchen spot instead of the
+  usual doorway. Sink progress (`p.sinkT`) is
   computed **once in `tick()`** and read in `render()` — never recompute it from
   `performance.now()` on the draw side; a stale/negative value makes `drawDrowning`'s ripple
   radius negative and **`ctx.ellipse` throws `IndexSizeError`, which kills the rAF loop and
