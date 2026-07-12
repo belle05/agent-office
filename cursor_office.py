@@ -227,8 +227,22 @@ def _tool_detail(name, inp):
 
 
 def _normalize_events(path):
-    """Return a list of normalized events from a .jsonl transcript."""
+    """Normalize a Cursor .jsonl transcript into the shared event shape.
+
+    Returns ``(events, scheduled, scheduled_name)``. A session started by a
+    scheduled task / automation opens with a ``<scheduled-task name="..."
+    file="...">`` marker in its first user message (the same convention Claude
+    Code uses). We detect it on the RAW text -- before ``_clean_text`` strips the
+    tag -- so those agents can be shown as couriers, mirroring the Claude source.
+    Ordinary interactive sessions return ``scheduled=False``.
+
+    NOTE: Cursor's own scheduled sessions (Automations) currently run as cloud
+    agents and do not write local transcripts, so this is dormant today; it lights
+    up automatically if/when a scheduled Cursor run lands locally with the marker.
+    """
     events = []
+    scheduled = False
+    scheduled_name = ""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -267,6 +281,13 @@ def _normalize_events(path):
                                 "name": block.get("name", "tool"),
                                 "detail": _tool_detail(block.get("name", ""), block.get("input")),
                             })
+                if role == "user" and not scheduled:
+                    joined = "\n".join(texts)  # raw, before tags are stripped
+                    if "<scheduled-task" in joined:
+                        scheduled = True
+                        m = re.search(r'name="([^"]+)"', joined)
+                        if m:
+                            scheduled_name = m.group(1)
                 events.append({
                     "kind": role,
                     "text": _clean_text("\n\n".join(texts)),
@@ -274,7 +295,7 @@ def _normalize_events(path):
                 })
     except Exception:
         pass
-    return events
+    return events, scheduled, scheduled_name
 
 
 def _turn_in_progress(events):
@@ -693,14 +714,16 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
         if cached and cached[0] == mtime and (full <= cached[1].get("_full", False)):
             return cached[1]
 
-    events = _normalize_events(path)
+    events, scheduled, scheduled_name = _normalize_events(path)
 
     task_full = ""
     for ev in events:
         if ev["kind"] == "user" and ev["text"]:
             task_full = _strip_leading_timestamp(ev["text"]) or ev["text"]
             break
-    title = task_full.split("\n")[0].strip()
+    # a scheduled run's opener is the injected marker/context, so prefer the
+    # task's given name (mirrors the Claude source's title fallback).
+    title = (scheduled_name or task_full.split("\n")[0]).strip()
     if len(title) > 70:
         title = title[:67].rstrip() + "..."
     if not title:
@@ -737,7 +760,7 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
     result = {
         "id": uuid,
         "source": "cursor",
-        "scheduled": False,
+        "scheduled": scheduled,
         "name": _name_for(uuid),
         "variant": _variant_for(uuid),
         "project": _pretty_project(project),
@@ -1975,6 +1998,11 @@ const BOSS_MS = 7200;      // how long the "boss" lingers by a desk delivering a
 // the bottom band is split: KITCHEN (waiting) on the left, BEACH (finished, resting)
 // on the right. BEACH_X is the divider; everything to its right is sand + water.
 const BEACH_X = Math.round(W*0.60);
+// the ocean is a proper band hugging the far-right edge; sand fills the rest of the
+// beach zone. SHORE_X is where wet sand meets the sea -- beach props and the resting
+// agents' rest spots all stay LEFT of it so nobody ends up sitting in the water.
+const WATER_W = 56;             // ~20% of the beach zone (BEACH_X..W)
+const SHORE_X = W - WATER_W;    // sand/sea boundary
 
 // Game Boy palette
 const C = { d0:'#0f380f', d1:'#306230', d2:'#8bac0f', d3:'#9bbc0f', floor:'#94ad42', floor2:'#8aa53b' };
@@ -2108,11 +2136,11 @@ const KSPOTS = [
   [255,548],[320,545],[365,540]                     // front-centre gap (between table and beach)
 ];
 
-// stable BEACH rest spots for finished agents (all in the right band, x > BEACH_X,
-// clear of the water strip on the far-right edge, the umbrella and the napping bear).
+// stable BEACH rest spots for finished agents (all in the right band, x > BEACH_X and
+// LEFT of SHORE_X so they sit on the sand, clear of the ocean and the umbrella).
 const BSPOTS = [
   [438,520],[510,532],[464,478],
-  [556,502],[590,458],[534,548]
+  [556,502],[566,466],[534,548]
 ];
 
 // ---- layout regions (in canvas px) ----
@@ -2429,7 +2457,8 @@ function blueChair(x,y){
   ro(x+1,y-17,14,16,c); px(x+2,y-16,12,3,ch); px(x+2,y-4,12,2,cd); // curved back
   px(x+2,y-16,2,15,ch);                                         // left rail sheen
 }
-// a cute sleeping bear-style mascot lounging on the couch (pure scenery, not an agent)
+// a cute sleeping bear-style mascot (pure scenery, not an agent). NOTE: no longer
+// called anywhere (it was removed from the beach); kept intact in case it's wanted again.
 function bearMascot(x,y){
   const fur='#4a6b88', furDk='#3a5572', furHi='#5f82a0', belly='#efe2c2', pad='#dcc99e';
   function el(cx,cy,rx,ry,col){ ctx.fillStyle=col; ctx.beginPath(); ctx.ellipse(cx,cy,rx,ry,0,0,Math.PI*2); ctx.fill(); }
@@ -2951,8 +2980,11 @@ function drawKitchenProps(){
   // (the "DO GOOD WORK" poster now hangs in the office; a "RETIRED AGENTS" beach
   //  sign takes its place -- both drawn elsewhere)
 
-  // ---- "REFRESH!" drinks machine (far right): blue cabinet, lit sign, glass grid, side panel ----
-  const vx=W-74, vy=T+10, vw=64, vh=88;
+  // ---- "REFRESH!" drinks machine: a beach drinks kiosk in the top-right SAND corner.
+  // Positioned so its whole width sits LEFT of SHORE_X (out of the ocean band); every
+  // sub-part + the click slots + the falling-can animation derive from vx/vy/vw/vh, so
+  // moving the origin moves the entire (still-interactive) machine together. ----
+  const vw=64, vh=88, vx=SHORE_X-vw-2, vy=T+10;
   ro(vx,vy,vw,vh,'#2f57a8'); px(vx,vy,vw,3,shade('#2f57a8',.28)); px(vx,vy,3,vh,shade('#2f57a8',.18)); // cabinet + sheen
   px(vx+vw-3,vy,3,vh,shade('#2f57a8',-.22));                                                          // right shade
   // lit header sign
@@ -3056,19 +3088,17 @@ function beachUmbrella(x,y){
 }
 let _sandGrains=null;                                                   // grain built once -> no per-frame flicker & no per-frame hashing
 function drawBeachFloor(){
-  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H, wx=W-22;
-  const base='#e7d3a0', sandW=wx-x0, hgt=y1-y0;
+  const T=layout().kitchenTop, x0=BEACH_X, y0=T+30, y1=H;
+  const shoreX=SHORE_X, base='#e7d3a0', sandW=shoreX-x0, hgt=y1-y0;
   px(x0-1,y0,2,hgt,shade(PAL.base,-.10));                              // divider edge
   // --- dry sand: warm base + soft vertical gradient (paler/drier up near the wall) ---
   px(x0,y0,sandW,hgt,base);
   px(x0,y0,sandW,Math.round(hgt*0.30),shade(base,.05));               // dry top strip
   const _by=y0+Math.round(hgt*0.74); px(x0,_by,sandW,y1-_by,shade(base,-.05)); // warmer front
-  // --- damp sand graduating toward the waterline on the right ---
-  px(wx-11,y0,11,hgt,shade(base,-.06)); px(wx-5,y0,5,hgt,shade(base,-.13)); px(wx-2,y0,2,hgt,'#cfb77c');
   // --- fine grain: deterministic stipple, computed once from hash() (stable, no flicker) ---
   if(!_sandGrains){
     _sandGrains=[];
-    for(let y=y0;y<y1;y+=4) for(let x=x0;x<wx-2;x+=4){
+    for(let y=y0;y<y1;y+=4) for(let x=x0;x<shoreX-2;x+=4){
       const h=hash(x+'_'+y), r=h%11;
       if(r===0)      _sandGrains.push([x,y,1,1,'rgba(120,96,52,.22)']);         // dark grain
       else if(r===1) _sandGrains.push([x,y,1,1,'rgba(255,247,216,.30)']);       // light fleck
@@ -3076,26 +3106,54 @@ function drawBeachFloor(){
     }
   }
   for(const g of _sandGrains) px(g[0],g[1],g[2],g[3],g[4]);
-  // --- water strip + foam shoreline along the far-right edge (unchanged) ---
-  for(let y=y0;y<y1;y+=6) px(wx,y,W-wx,6, ((y/6)&1)?'#49b0c8':'#57c2d8');
-  px(wx,y0,W-wx,2,'rgba(255,255,255,.40)');                            // foam
-  for(let y=y0+5;y<y1;y+=14) px(wx+3,y,6,1,'rgba(255,255,255,.5)');    // ripples
+
+  // ===================== OCEAN (right-hand band) =====================
+  // A calming, gently animated sea. All motion is tiny and slow and is driven off the
+  // shared rAF clock `tCount` (advanced in tick() as `tCount += dt*0.06`, ~60 units/s)
+  // so it can never drift or fight the sand-grain cache -- no setInterval, no re-hashing.
+  const tide  = Math.sin(tCount/74);                    // ~7.7s period, [-1,1] breath
+  const surge = Math.round(tide*2);                     // waterline advances/recedes +-2px
+  const wtrX  = shoreX + surge, wtrW = W - wtrX;         // dynamic sea edge
+  // depth: darker deep water out to sea, lighter shallows near the shore
+  px(wtrX, y0, wtrW, hgt, '#2f9fbf');                                     // mid water
+  px(W-Math.round(wtrW*0.42), y0, Math.round(wtrW*0.42), hgt, '#1f82a6'); // deep far edge
+  px(wtrX, y0, Math.max(8,Math.round(wtrW*0.36)), hgt, '#5cc4da');        // shallows near shore
+  // slow shimmer: a soft light band drifting seaward-and-back across the water (~10s)
+  const sweep = wtrX + 2 + Math.round(((Math.sin(tCount/96)+1)/2)*(wtrW-6));
+  px(sweep, y0, 2, hgt, 'rgba(255,255,255,.15)'); px(sweep+2, y0, 1, hgt, 'rgba(255,255,255,.07)');
+  // slow-drifting ripple highlights (staggered dashes that gently slide with the tide)
+  const rd = Math.round(tide*3), span=Math.max(6,wtrW-12);
+  for(let y=y0+8; y<y1; y+=15){
+    const rx = wtrX + 4 + (((y*7)>>>0) % span) + rd;
+    px(rx, y, 5, 1, 'rgba(255,255,255,.28)');
+  }
+  // --- wet-sand shoreline: damp band on the sand side, translucent so grain shows ---
+  px(wtrX-9, y0, 9, hgt, 'rgba(112,146,146,.26)');
+  px(wtrX-4, y0, 4, hgt, 'rgba(84,132,142,.40)');
+  // --- foamy waterline where the sea meets the sand (breathes with the surge) ---
+  px(wtrX-1, y0, 3, hgt, 'rgba(255,255,255,.72)');
+  for(let y=y0; y<y1; y+=8){ const f=((y+surge)&8)?1:0; px(wtrX-2+f, y+ (f?2:0), 2, 3, 'rgba(255,255,255,.5)'); } // foam bubbles
 }
 function drawBeachProps(){
   const T=layout().kitchenTop, y1=H, x0=BEACH_X;
-  towel(x0+30, y1-58, '#e0533b'); towel(x0+96, y1-72, '#2f93d8'); towel(x0+66, y1-34, '#37b56c');
-  beachUmbrella(x0+40, T+34);
-  // beach ball
-  const bx=x0+126, by=y1-28; px(bx-1,by-1,12,12,PAL.outline);
+  towel(x0+30, y1-58, '#e0533b'); towel(x0+104, y1-72, '#2f93d8'); towel(x0+66, y1-34, '#37b56c');
+  beachUmbrella(x0+16, T+34);   // shifted left so the top row reads umbrella | sign | kiosk
+  // beach ball (nudged toward centre now the mascot no longer occupies the sand)
+  const bx=x0+150, by=y1-30; px(bx-1,by-1,12,12,PAL.outline);
   px(bx,by,10,10,'#f6f6f8'); px(bx,by,5,5,PAL.red); px(bx+5,by+5,5,5,'#2f93d8'); px(bx,by+5,5,5,PAL.yellow);
-  // the office mascot bear, now napping on the sand instead of on a couch
-  ctx.save(); scaleAbout(x0+172, y1-40, 1.12); bearMascot(x0+158, y1-52); ctx.restore();
+  // a little starfish + shell fill the sand where the mascot used to nap (balance)
+  const sx=x0+186, sy=y1-46, sc='#e8935f', sl='#f2b48c';
+  px(sx-1,sy-4,3,4,sc); px(sx-1,sy-4,1,2,sl);                         // top arm
+  px(sx-5,sy-1,4,3,sc); px(sx+2,sy-1,4,3,sc);                         // side arms
+  px(sx-4,sy+2,3,4,sc); px(sx+2,sy+2,3,4,sc);                         // lower arms
+  px(sx,sy,1,1,sl);                                                    // centre glint
+  px(x0+164,y1-22,5,3,'#f2ddc4'); px(x0+165,y1-21,3,1,'#d9b48c');     // small shell
   drawBeachSign();
 }
 
 // a wooden "RETIRED AGENTS" signpost planted in the sand (between umbrella + REFRESH)
 function drawBeachSign(){
-  const T=layout().kitchenTop, cx=BEACH_X+136;
+  const T=layout().kitchenTop, cx=BEACH_X+114;   // centred between the umbrella and the REFRESH! kiosk
   const bw=84, bh=24, bx=cx-bw/2, by=T+32, groundY=T+96;
   px(cx-5, groundY-2, 10, 3, 'rgba(0,0,0,.15)');                    // sand contact shadow
   px(cx-2, by+bh, 4, groundY-(by+bh), PAL.woodDk); px(cx-2, by+bh,1, groundY-(by+bh), PAL.wood); // post
@@ -3808,7 +3866,7 @@ function tick(now){
       // to the left of the divider.
       if(p.mode==='idle'){
         if(p.kind==='beach'){
-          p.x=Math.max(BEACH_X+16, Math.min(W-30, p.x));   // W-30 keeps them out of the water
+          p.x=Math.max(BEACH_X+16, Math.min(SHORE_X-16, p.x));   // stay on the sand, clear of the ocean
         } else {
           p.x=Math.max(L.kitchen.x+18, Math.min(BEACH_X-18, p.x));
         }
