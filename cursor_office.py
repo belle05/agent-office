@@ -405,6 +405,307 @@ def _tool_detail(name, inp):
     return name
 
 
+def _pretty_skill(name):
+    """Short skill id for the office ribbon (folder name or Skill-tool argument)."""
+    name = (name or "").strip().strip("`").strip()
+    name = name.replace("\\", "/").rstrip("/")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    if name.upper() == "SKILL.MD":
+        return ""
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > 32:
+        name = name[:30].rstrip() + "…"
+    return name
+
+
+def _skill_name_from_path(path):
+    """Parent folder of a SKILL.md that actually lives in a skills directory.
+
+    A random ``docs/SKILL.md`` in a repo is not an agent skill. Cursor and Claude
+    keep skills under ``skills/``, ``skills-cursor/``, ``.agents/`` or ``.codex/``.
+    """
+    norm = (path or "").replace("\\", "/").rstrip("/")
+    if os.path.basename(norm).upper() != "SKILL.MD":
+        return ""
+    parts = [p for p in norm.split("/") if p]
+    if len(parts) < 3:
+        return ""
+    parent = parts[-2]
+    ancestors = [p.lower() for p in parts[:-2]]
+    if not any(a in ("skills", "skills-cursor", ".agents", ".codex") or a.endswith("skills")
+               for a in ancestors):
+        return ""
+    if parent.lower() in ("skills", "skills-cursor"):
+        return ""
+    return _pretty_skill(parent)
+
+
+def _skill_name_from_tool(name, inp):
+    """Skill id if this tool call is loading or invoking a skill, else ''."""
+    if not isinstance(inp, dict):
+        return ""
+    if name == "Skill":
+        raw = inp.get("skill") or inp.get("name") or inp.get("skill_name") or ""
+        return _pretty_skill(str(raw))
+    if name in ("Read", "ReadFile"):
+        return _skill_name_from_path(str(inp.get("path") or inp.get("file_path") or ""))
+    return ""
+
+
+def _tool_record(name, inp):
+    rec = {
+        "name": name or "tool",
+        "detail": _tool_detail(name or "", inp),
+    }
+    sk = _skill_name_from_tool(name or "", inp)
+    if sk:
+        rec["skill"] = sk
+        path = _skill_path_from_tool(name or "", inp)
+        if path:
+            rec["skill_path"] = path
+        steps = _steps_for_skill(sk, path)
+        if steps:
+            rec["skill_steps"] = steps
+    return rec
+
+
+_SKILL_NAME_RE = re.compile(r"^Skill Name:\s*(.+)$", re.MULTILINE)
+_ATTACHED_SKILL_RE = re.compile(
+    r"Skill Name:\s*(?P<name>.+)\nPath:\s*(?P<path>.+)\nSKILL\.md content:\n", re.M)
+_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+_CHECK_RE = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s*(?:\d+[\.\)]\s*)?(.+?)\s*$", re.M)
+_H3_NUM_RE = re.compile(r"^###\s+\d+[\.\)]\s+(.+?)\s*$", re.M)
+_SKILL_STEP_CACHE = {}  # abspath -> (mtime, [titles])
+
+
+def _norm_step(title):
+    text = (title or "").lower()
+    text = re.sub(r"^\d+[\.\)]\s*", "", text)
+    text = re.sub(r"[`*_#]", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" .:-")
+    return text
+
+
+def _extract_skill_steps(text):
+    """Ordered step titles from a SKILL.md body.
+
+    Prefer the workflow checklist inside a fenced block (``- [ ] 1. Do the thing``).
+    Otherwise use numbered ``### 1. Title`` headings. Skills with neither get no steps.
+    """
+    text = text or ""
+    best = []
+    for m in _FENCE_RE.finditer(text):
+        items = [title.strip() for _mark, title in _CHECK_RE.findall(m.group(1))]
+        items = [t for t in items if t and len(t) <= 90]
+        if len(items) > len(best):
+            best = items
+    if len(best) >= 2:
+        return best[:16]
+    heads = [m.group(1).strip() for m in _H3_NUM_RE.finditer(text)]
+    heads = [h for h in heads if h and len(h) <= 90]
+    if len(heads) >= 2:
+        return heads[:16]
+    return []
+
+
+def _skill_file_candidates(name):
+    """Places a skill folder named ``name`` is commonly installed."""
+    name = _pretty_skill(name)
+    if not name:
+        return []
+    home = os.path.expanduser("~")
+    paths = [
+        os.path.join(home, ".cursor", "skills", name, "SKILL.md"),
+        os.path.join(home, ".cursor", "skills-cursor", name, "SKILL.md"),
+        os.path.join(home, ".claude", "skills", name, "SKILL.md"),
+        os.path.join(home, ".codex", "skills", name, "SKILL.md"),
+    ]
+    store = os.path.join(home, "Library", "Application Support", "Cursor",
+                         "AgentStores", "cursor_agent_stores")
+    try:
+        entries = os.listdir(store)
+    except OSError:
+        entries = []
+    for entry in entries:
+        paths.append(os.path.join(store, entry, "files", "skills", name, "SKILL.md"))
+    return paths
+
+
+def _steps_from_file(path):
+    if not path:
+        return []
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    cached = _SKILL_STEP_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            titles = _extract_skill_steps(fh.read())
+    except OSError:
+        titles = []
+    _SKILL_STEP_CACHE[path] = (mtime, titles)
+    return titles
+
+
+def _steps_for_skill(name, path=""):
+    """Step titles for a skill, from its path or a known install location."""
+    if path:
+        titles = _steps_from_file(path)
+        if titles:
+            return titles
+    for candidate in _skill_file_candidates(name):
+        titles = _steps_from_file(candidate)
+        if titles:
+            return titles
+    return []
+
+
+def _mark_step_states(titles, assistant_text):
+    """done / active / pending from checkboxes the agent wrote this turn.
+
+    The skill file's own ``- [ ]`` list is not progress. Only assistant text counts.
+    With no checks yet, the first step is active because the skill is running.
+    """
+    checked = set()
+    saw = False
+    for mark, title in _CHECK_RE.findall(assistant_text or ""):
+        key = _norm_step(title)
+        if not key:
+            continue
+        saw = True
+        if mark.lower() == "x":
+            checked.add(key)
+
+    def is_done(title):
+        key = _norm_step(title)
+        if not key:
+            return False
+        if key in checked:
+            return True
+        for done in checked:
+            if len(key) >= 8 and (key.startswith(done) or done.startswith(key)):
+                return True
+        return False
+
+    out = []
+    active_set = False
+    for title in titles:
+        if is_done(title):
+            state = "done"
+        elif not active_set:
+            state = "active"
+            active_set = True
+        else:
+            state = "pending"
+        out.append({"title": title, "state": state})
+    return out
+
+
+def _skills_from_attached(raw):
+    """Skills from a Cursor ``<manually_attached_skills>`` user block.
+
+    Each entry is ``{name, path, steps}``. The full skill body is inlined, so the
+    steps are parsed from that text and the body itself is not kept.
+    """
+    raw = raw or ""
+    if "<manually_attached_skills>" not in raw:
+        return []
+    start = raw.find("<manually_attached_skills>")
+    end = raw.find("</manually_attached_skills>")
+    block = raw[start:end if end != -1 else None]
+    matches = list(_ATTACHED_SKILL_RE.finditer(block))
+    found = []
+    seen = set()
+    for i, m in enumerate(matches):
+        name = _pretty_skill(m.group("name"))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        nxt = matches[i + 1].start() if i + 1 < len(matches) else len(block)
+        steps = _extract_skill_steps(block[m.end():nxt]) or _steps_for_skill(name, m.group("path").strip())
+        found.append({"name": name, "path": m.group("path").strip(), "steps": steps})
+    if found:
+        return found
+    # name-only fallback if the block shape changes
+    for m in _SKILL_NAME_RE.finditer(block):
+        name = _pretty_skill(m.group(1))
+        if name and name not in seen:
+            seen.add(name)
+            found.append({"name": name, "path": "", "steps": _steps_for_skill(name)})
+    return found
+
+
+def _skill_path_from_tool(name, inp):
+    if not isinstance(inp, dict) or name not in ("Read", "ReadFile"):
+        return ""
+    path = str(inp.get("path") or inp.get("file_path") or "")
+    return path if _skill_name_from_path(path) else ""
+
+
+def _remember_skill(order, by_name, name, path="", steps=None):
+    if not name:
+        return
+    entry = by_name.get(name)
+    if entry is None:
+        entry = {"name": name, "path": path or "", "steps": list(steps or [])}
+        by_name[name] = entry
+        order.append(name)
+        return
+    if path and not entry["path"]:
+        entry["path"] = path
+    if steps and not entry["steps"]:
+        entry["steps"] = list(steps)
+
+
+def _active_skill_runs(events, turn_in_progress, claude=False):
+    """Skills guiding the open turn, each with its steps and done/active/pending.
+
+    Empty once the turn has ended. Cursor turns are cut by ``turn_ended``. Claude
+    turns start at the latest real user prompt.
+    """
+    if not turn_in_progress:
+        return []
+    if claude:
+        start = 0
+        for i, e in enumerate(events):
+            if e["kind"] == "user" and not e.get("is_tool_result") and not e.get("injected"):
+                start = i
+        window = events[start:]
+    else:
+        last_end = -1
+        for i, e in enumerate(events):
+            if e["kind"] == "turn_ended":
+                last_end = i
+        window = events[last_end + 1:]
+    order = []
+    by_name = {}
+    assistant_bits = []
+    for e in window:
+        if e.get("kind") == "assistant" and e.get("text"):
+            assistant_bits.append(e["text"])
+        for s in e.get("skills") or []:
+            if isinstance(s, str):
+                _remember_skill(order, by_name, s)
+            elif isinstance(s, dict):
+                _remember_skill(order, by_name, s.get("name") or "", s.get("path") or "", s.get("steps"))
+        for t in e.get("tools") or []:
+            _remember_skill(order, by_name, t.get("skill") or "", t.get("skill_path") or "", t.get("skill_steps"))
+    progress = "\n".join(assistant_bits)
+    runs = []
+    for name in order:
+        entry = by_name[name]
+        titles = entry["steps"] or _steps_for_skill(name, entry["path"])
+        runs.append({
+            "name": name,
+            "steps": _mark_step_states(titles, progress),
+        })
+    return runs
+
+
 def _normalize_events(path):
     """Normalize a Cursor .jsonl transcript into the shared event shape.
 
@@ -456,13 +757,12 @@ def _normalize_events(path):
                         if btype == "text" and block.get("text"):
                             texts.append(block["text"])
                         elif btype == "tool_use":
-                            tools.append({
-                                "name": block.get("name", "tool"),
-                                "detail": _tool_detail(block.get("name", ""), block.get("input")),
-                            })
-                if role == "user" and not scheduled:
+                            tools.append(_tool_record(block.get("name", "tool"), block.get("input")))
+                skills = []
+                if role == "user":
                     joined = "\n".join(texts)  # raw, before tags are stripped
-                    if "<scheduled-task" in joined:
+                    skills = _skills_from_attached(joined)
+                    if not scheduled and "<scheduled-task" in joined:
                         scheduled = True
                         m = re.search(r'name="([^"]+)"', joined)
                         if m:
@@ -471,6 +771,7 @@ def _normalize_events(path):
                     "kind": role,
                     "text": _clean_text("\n\n".join(texts)),
                     "tools": tools,
+                    "skills": skills,
                 })
     except Exception:
         pass
@@ -923,6 +1224,8 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
 
     turn_in_progress = _turn_in_progress(events)
     status = "working" if _is_working(turn_in_progress, mtime, sub_files) else "waiting"
+    skill_runs = _active_skill_runs(events, turn_in_progress, claude=False)
+    skills = [r["name"] for r in skill_runs]
     msg_count = sum(1 for e in events if e["kind"] in ("user", "assistant"))
 
     # what the agent is doing *right now*: most recent assistant text, else the
@@ -955,6 +1258,11 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "last_tool": (("%s: %s" % (latest_tool["name"], latest_tool.get("detail", ""))).strip().rstrip(":") if latest_tool else ""),
         "last_message": ((latest_response[:360].rstrip() + (" ..." if len(latest_response) > 360 else "")) if latest_response else ""),
         "message_count": msg_count,
+        # skill guiding this open turn (latest name + the full list). Empty once the
+        # turn ends, so a finished chat doesn't keep wearing the ribbon.
+        "skill": skills[-1] if skills else "",
+        "skills": skills,
+        "skill_runs": skill_runs,
         "mtime": mtime,
         "last_activity_rel": _rel_time(time.time() - mtime),
         "_full": False,
@@ -1064,15 +1372,14 @@ def _normalize_events_claude(path):
                         if btype == "text" and block.get("text"):
                             texts.append(block["text"])
                         elif btype == "tool_use":
-                            tools.append({
-                                "name": block.get("name", "tool"),
-                                "detail": _tool_detail(block.get("name", ""), block.get("input")),
-                            })
+                            tools.append(_tool_record(block.get("name", "tool"), block.get("input")))
                         elif btype == "tool_result":
                             is_tool_result = True
                 injected = False
+                skills = []
                 if role == "user":
                     joined = "\n".join(texts)  # raw, before tags are stripped
+                    skills = _skills_from_attached(joined)
                     # slash-command echoes, local-command output, task notifications,
                     # system reminders and caveats are appended as user-role lines but
                     # are NOT a real user turn -- flag them so turn-detection can skip them.
@@ -1088,6 +1395,7 @@ def _normalize_events_claude(path):
                     "tools": tools,
                     "is_tool_result": is_tool_result,
                     "injected": injected,
+                    "skills": skills,
                 })
     except Exception:
         pass
@@ -1219,6 +1527,8 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
 
     turn_in_progress = _turn_in_progress_claude(events)
     status = "working" if _is_working(turn_in_progress, mtime, sub_files) else "waiting"
+    skill_runs = _active_skill_runs(events, turn_in_progress, claude=True)
+    skills = [r["name"] for r in skill_runs]
     msg_count = sum(1 for e in events if e["kind"] in ("user", "assistant"))
 
     latest_activity = latest_response
@@ -1259,6 +1569,9 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "last_message": ((latest_response[:360].rstrip() + (" ..." if len(latest_response) > 360 else "")) if latest_response else ""),
         "last_instruction": last_instruction,
         "message_count": msg_count,
+        "skill": skills[-1] if skills else "",
+        "skills": skills,
+        "skill_runs": skill_runs,
         "model": usage["model"],
         "tokens": usage["tokens"],
         "spend": usage["spend"],
@@ -1840,6 +2153,21 @@ def get_agent_detail(uuid):
     return None
 
 
+def _demo_skill_run():
+    """One sample skill so --demo can open the step list."""
+    titles = [
+        ("Resolve PR", "done"),
+        ("Fetch metadata + diff", "done"),
+        ("Score PR risk", "active"),
+        ("Read the author model", "pending"),
+        ("Agent code review", "pending"),
+        ("Checkout + Bugbot", "pending"),
+        ("Merge findings + report", "pending"),
+        ("Post summary comment", "pending"),
+    ]
+    return {"name": "review-pr", "steps": [{"title": t, "state": s} for t, s in titles]}
+
+
 def _demo_working_agents(n, now):
     """TEST HOOK (--demo-working N): exactly N synthetic WORKING agents, all destined for
     desks, so the dynamic desk scaling can be verified at any headcount."""
@@ -1874,6 +2202,9 @@ def _demo_working_agents(n, now):
             "latest": "Editing %s.py" % title.split()[1].lower(),
             "latest_kind": "tool",
             "last_tool": "Edit: service.py",
+            "skill": "review-pr" if i == 0 else "",
+            "skills": ["review-pr"] if i == 0 else [],
+            "skill_runs": [_demo_skill_run()] if i == 0 else [],
             "last_message": "Working on " + title.split()[1].lower(),
             "last_instruction": "Please " + title[0].lower() + title[1:],
             "message_count": 9,
@@ -2009,6 +2340,9 @@ def demo_agents():
             "latest": latest,
             "latest_kind": lkind,
             "last_tool": ["Bash: pytest -q tests/", "Edit: service.py", "Grep: export path", "Read: config.yaml"][idx % 4],
+            "skill": "review-pr" if uuid == "demo-aaaa-0001" else "",
+            "skills": ["review-pr"] if uuid == "demo-aaaa-0001" else [],
+            "skill_runs": [_demo_skill_run()] if uuid == "demo-aaaa-0001" else [],
             "last_message": latest if lkind == "assistant" else ("Reviewing the changes about " + title.split()[0].lower()),
             "last_instruction": last_instr,
             "message_count": 12,
@@ -2130,6 +2464,7 @@ PAGE = r"""<!DOCTYPE html>
   .nt-badge.src-claude,.badge.src-claude{background:#d97757;color:#2a1409;}
   .nt-badge.scheduled,.badge.scheduled{background:#2f5fb0;color:#eaf1ff;}
   .nt-badge.workflow,.badge.workflow{background:#6a4fb0;color:#f1eaff;}
+  .nt-badge.skill,.badge.skill{background:#e3b021;color:#3a2410;}
   #nametag .nt-meta{font-size:9px;color:var(--ink-lo);margin:6px 0 8px;}
   #nametag .nt-label{font-size:8px;letter-spacing:1px;color:var(--ink-lo);text-transform:uppercase;margin-top:8px;}
   #nametag .nt-text{font-size:11px;color:var(--ink-mid);margin-top:3px;}
@@ -2191,6 +2526,25 @@ PAGE = r"""<!DOCTYPE html>
   #kbody .k-ttl{font-size:11px;color:var(--card-ink);font-weight:bold;word-break:break-word;line-height:1.5;}
   #kbody .k-msg{font-size:10px;color:var(--card-ink-lo);margin-top:4px;line-height:1.6;word-break:break-word;}
   #kbody .k-empty{text-align:center;color:var(--card-ink-lo);padding:26px 10px;font-size:10px;line-height:2;}
+  /* skill step list -- opened by clicking the gold ribbon */
+  #soverlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(15,24,8,.55);padding:14px;z-index:22;}
+  #sdialog{width:100%;max-width:460px;max-height:100%;background:var(--card);
+    border:3px solid var(--panel);border-radius:8px;display:flex;flex-direction:column;
+    box-shadow:0 0 0 3px var(--panel-line), 0 18px 40px rgba(0,0,0,.5);overflow:hidden;}
+  #shead{background:var(--panel);color:var(--ink-hi);padding:12px 14px;
+    display:flex;justify-content:space-between;align-items:center;gap:8px;}
+  #shead .who{font-size:12px;color:var(--ink-hi);line-height:1.5;}
+  #shead button{font-family:inherit;background:var(--panel2);color:var(--ink-hi);
+    border:1px solid var(--panel-line);border-radius:4px;font-size:9px;padding:5px 8px;cursor:pointer;}
+  #sbody{padding:12px;overflow:auto;font-size:11px;color:var(--card-ink);}
+  #sbody .srun{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--card-ink-lo);margin:4px 0 8px;}
+  #sbody .sstep{background:#fff;border:1px solid var(--card-line);border-left:3px solid #c8c8ce;
+    padding:8px 10px;border-radius:4px;margin-bottom:6px;line-height:1.5;}
+  #sbody .sstep.done{border-left-color:#3f8f4a;}
+  #sbody .sstep.active{border-left-color:#e3b021;background:#fff8e4;}
+  #sbody .sstep .smark{display:inline-block;width:16px;font-size:10px;}
+  #sbody .sempty{text-align:center;color:var(--card-ink-lo);padding:22px 10px;font-size:10px;line-height:2;}
   #toast{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);background:var(--panel);
     color:var(--ink-hi);font-size:8px;padding:7px 12px;border-radius:5px;display:none;z-index:30;}
   #empty{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;
@@ -2210,6 +2564,7 @@ PAGE = r"""<!DOCTYPE html>
           <span class="pill" id="hud-beach" style="display:none">on beach: 0</span>
           <span class="pill" id="hud-subs" style="display:none">subagents: 0</span>
           <span class="pill" id="hud-wf" style="display:none">workflows: 0</span>
+          <span class="pill" id="hud-skill" style="display:none">skills: 0</span>
         </div>
         <div id="tip">click a worker</div>
         <button id="sweep-kitchen" class="zonebtn" aria-label="send everyone in the kitchen to the beach" data-tip="send everyone in the kitchen to the beach">&#127958;</button>
@@ -2232,6 +2587,15 @@ PAGE = r"""<!DOCTYPE html>
               <button id="d-open">OPEN TRANSCRIPT FILE (.jsonl)</button>
               <button id="d-copy" class="ghost">COPY SESSION ID</button>
             </div>
+          </div>
+        </div>
+        <div id="soverlay">
+          <div id="sdialog">
+            <div id="shead">
+              <div class="who" id="s-title">Skill</div>
+              <button id="s-x" title="close">X</button>
+            </div>
+            <div id="sbody"></div>
           </div>
         </div>
         <div id="koverlay">
@@ -2375,6 +2739,7 @@ let officeRooms = []; // labeled desk clusters drawn as light "work rooms" once 
 let activeHolidays = []; // holiday theme names active right now (from the server; see refresh())
 let hanukkahNight = 5;   // which night of Hanukkah (1..8) to light; from the server (see refresh())
 let helperHits = [];  // per-frame hover regions for the subagent dwarves
+let skillHits = [];   // per-frame click rects for a running skill's ribbon
 let workflowHits = []; // per-frame hover regions for the workflow tents
 let shellHits = [];    // per-frame hover regions for the open-shell terminal windows
 let bubbleAnchors = []; // per-frame: bubbles to draw as a screen-space overlay
@@ -2717,6 +3082,14 @@ function rebuild(){
   hs.textContent='subagents: '+subCount; hs.style.display = subCount ? '' : 'none';
   const hw=document.getElementById('hud-wf');
   hw.textContent='workflows: '+wfCount; hw.style.display = wfCount ? '' : 'none';
+  const skillCount = agents.filter(a=>a.status==='working' && a.skill).length;
+  const hk=document.getElementById('hud-skill');
+  hk.textContent='skills: '+skillCount; hk.style.display = skillCount ? '' : 'none';
+  if(openSkillId && soverlay.style.display==='flex'){
+    const live=agents.find(a=>a.id===openSkillId);
+    if(live && live.skill) paintSkill(live);
+    else closeSkill();
+  }
   document.getElementById('empty').style.display = agents.length? 'none':'flex';
 }
 
@@ -3713,6 +4086,35 @@ function drawCap(x, hy, col){
   px(x-14,hy+1,8,2,shade(col,-.15));  // front visor / brim
   px(x-8,hy+1,16,1,shade(col,-.22));  // band shadow
 }
+// a gold skill ribbon on a short stick, upper-right of the head. Shown only while a
+// skill is guiding the open turn. `count` > 1 appends "+N" for the extras.
+function drawSkillRibbon(x, y, name, count, t){
+  const label = String(name||'skill');
+  ctx.save();
+  ctx.font = '4px "Press Start 2P", monospace';
+  let shown = label.length>16 ? label.slice(0,15)+'\u2026' : label;
+  if(count>1) shown += ' +'+(count-1);
+  const tw = Math.ceil(ctx.measureText(shown).width);
+  const bw = tw + 8, bh = 8;
+  const bob = (Math.floor((t||0)*0.2)&1) ? -1 : 0;
+  const bx = Math.round(x+9), by = Math.round(y-36+bob);
+  px(bx, by+bh, 1, 6, '#6b4a2a');                 // stick
+  ro(bx, by, bw, bh, '#e3b021');                  // gold flag
+  px(bx, by, bw, 1, '#ffe07a');                   // sheen
+  px(bx+2, by+2, 4, 4, '#fff8e6');                // tiny book
+  px(bx+3, by+2, 1, 4, '#c0392b');                // spine
+  ctx.fillStyle = '#3a2410'; ctx.textAlign = 'left';
+  ctx.fillText(shown, bx+7, by+6);
+  ctx.restore();
+  return {bx:bx, by:by, bw:bw, bh:bh+6};   // flag + stick, in the sprite's local space
+}
+// screen-space rect for a ribbon drawn inside scaleAbout(anchor, sc)
+function pushSkillHit(anchorX, anchorY, rect, sc, agent){
+  if(!rect || !agent) return;
+  const x0 = anchorX + (rect.bx - anchorX) * sc;
+  const y0 = anchorY + (rect.by - anchorY) * sc;
+  skillHits.push({ x0:x0, y0:y0, x1:x0 + rect.bw*sc, y1:y0 + rect.bh*sc, agent:agent });
+}
 // a small envelope emblem (like ✉️) stamped on a courier's chest, centered on (cx,cy)
 function drawEnvelope(cx, cy){
   const paper='#f4f4f6', edge='#3a3a44';
@@ -3960,6 +4362,10 @@ function drawDeskPod(x, y, p, t, sc){
     px(x-7,y-14,14,1,'rgba(0,0,0,.10)');                                // soft jaw shade
     drawHairAcc(x, y-26, f); drawFace(x, y-26, f);
     if(angry) drawAngryFace(x, y-26, f);
+    if(p.agent && p.agent.skill && p.agent.status==='working'){
+      const rib = drawSkillRibbon(x, y, p.agent.skill, (p.agent.skills||[]).length, t);
+      pushSkillHit(arguments[0], arguments[1], rib, sc, p.agent);
+    }
   }
   // --- wood desk top: bright surface + grain hint + shaded front edge ---
   px(x-26,y+1,52,4,PAL.woodHi);                                         // bright top surface
@@ -4428,6 +4834,10 @@ function drawStanding(p, t){
   px(x-7+hx,y-13+ht,14,1,'rgba(0,0,0,.10)');               // soft jaw shade
   drawHairAcc(x+hx, y-25+ht, f); drawFace(x+hx, y-25+ht, f);
   if(performance.now()<angryUntil) drawAngryFace(x+hx, y-25+ht, f);
+  if(p.agent && p.agent.skill && p.agent.status==='working' && p.kind!=='beach'){
+    const rib = drawSkillRibbon(x+hx, y, p.agent.skill, (p.agent.skills||[]).length, t);
+    pushSkillHit(p.x, p.y, rib, pscale(p), p.agent);
+  }
   // small-talk bubble while chatting, else the cozy heart when settled
   if(settled){
     if(talking){ const nd=1+((((now/700)|0)+(kh%3))%3); talkBubble(x + (faceDir<0?-15:15), y-34, nd); }
@@ -5095,6 +5505,7 @@ function drawHolidayWeather(t){
 
 function render(t){
   helperHits = [];                   // rebuilt each frame as dwarves are drawn
+  skillHits = [];                    // rebuilt each frame as skill ribbons are drawn
   workflowHits = [];                 // rebuilt each frame as workflow tents are drawn
   shellHits = [];                    // rebuilt each frame as open-shell terminals are drawn
   bubbleAnchors = [];                // rebuilt each frame; drawn as an overlay below
@@ -5876,6 +6287,17 @@ function pickWorkflow(mx,my){ let best=null,bd=1e9;
 function pickShell(mx,my){ let best=null,bd=1e9;
   for(const s of shellHits){ const d=(mx-s.x)*(mx-s.x)+(my-s.y)*(my-s.y); if(d<s.r*s.r && d<bd){bd=d;best=s;} }
   return best; }
+function pickSkill(mx,my){
+  for(let i=skillHits.length-1;i>=0;i--){ const h=skillHits[i];
+    if(mx>=h.x0 && mx<=h.x1 && my>=h.y0 && my<=h.y1) return h; }
+  return null; }
+function skillStepHTML(steps){
+  return (steps||[]).map((s,i)=>{
+    const st=s.state||'pending';
+    const mark=st==='done'?'\u2713':(st==='active'?'\u25B6':'\u25CB');
+    return '<div class="sstep '+st+'"><span class="smark">'+mark+'</span>'+(i+1)+'. '+esc(s.title||'')+'</div>';
+  }).join('');
+}
 function pickVend(mx,my){
   for(const s of vendSlots){ if(mx>=s.x0 && mx<=s.x1 && my>=s.y0 && my<=s.y1) return s; }
   return null; }
@@ -5894,6 +6316,23 @@ cv.addEventListener('mousemove', e=>{
   if(vs){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
   // clickable props -- pointer cursor only, no tooltip (discover them by clicking)
   if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
+  // a skill ribbon? click opens the step list; hover previews the current step
+  const skh=pickSkill(m.x,m.y);
+  if(skh){
+    hover=null; cv.style.cursor='pointer';
+    const a=skh.agent||{};
+    const runs=a.skill_runs||[];
+    const steps=(runs[0]&&runs[0].steps)||[];
+    const done=steps.filter(s=>s.state==='done').length;
+    const cur=steps.find(s=>s.state==='active');
+    nametag.innerHTML =
+      '<div class="nt-name">'+esc(a.skill||'skill')+'<span class="nt-badge skill">skill</span></div>'+
+      '<div class="nt-meta">'+(steps.length?(done+' / '+steps.length+' steps'):'no step list')+'</div>'+
+      (cur?('<div class="nt-label">Now</div><div class="nt-text">'+esc(cur.title)+'</div>'):'')+
+      '<div class="nt-hint">click the ribbon for every step</div>';
+    nametag.style.display='block'; placeNametag(m);
+    return;
+  }
   // a workflow tent? (takes precedence over helpers)
   const wf=pickWorkflow(m.x,m.y);
   if(wf){
@@ -5981,10 +6420,13 @@ cv.addEventListener('mousemove', e=>{
       '<div class="nt-name">'+esc(nameFor(a.id))+
         '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
         srcBadgeHTML(a.source)+
-        (a.scheduled?'<span class="nt-badge scheduled">scheduled</span>':'')+'</div>'+
+        (a.scheduled?'<span class="nt-badge scheduled">scheduled</span>':'')+
+        (a.skill && a.status==='working'?'<span class="nt-badge skill">skill</span>':'')+'</div>'+
       '<div class="nt-meta">'+esc(meta)+'  ·  '+where+'</div>'+
       '<div class="nt-label">Task</div>'+
       '<div class="nt-text">'+esc(a.title||'(untitled session)')+'</div>'+
+      (a.skill && a.status==='working' ? ('<div class="nt-label">Running skill</div><div class="nt-text">'+esc((a.skills&&a.skills.length)?a.skills.join(', '):a.skill)+'</div>') : '')+
+      (a.skill && a.status==='working' ? '<div class="nt-hint">click the gold ribbon for the steps</div>' : '')+
       (a.last_instruction ? ('<div class="nt-label">Last instruction</div><div class="nt-text">'+esc(a.last_instruction)+'</div>') : '')+
       (a.last_tool ? ('<div class="nt-label">'+toolLbl+'</div><div class="nt-text">'+esc(a.last_tool)+'</div>') : '')+
       (a.last_message ? ('<div class="nt-label">Last message</div><div class="nt-text">'+esc(a.last_message)+'</div>') : '')+
@@ -6007,6 +6449,8 @@ cv.addEventListener('click', e=>{
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
   if(slot){ dispenseDrink(slot); return; }
+  const skh=pickSkill(m.x,m.y);               // gold ribbon -> that skill's steps
+  if(skh){ openSkill(skh.agent); return; }
   const p=pick(m.x,m.y);
   if(p){ openDetail(p.agent.id); return; }    // an individual sprite -> its detail overlay
   // the kitchen BACKGROUND (not a sprite/prop/drink/button) -> list who's waiting there
@@ -6061,7 +6505,8 @@ async function openDetail(id){
   document.getElementById('d-sub').innerHTML=
     '<span class="badge '+d.status+'">'+d.status.toUpperCase()+'</span> '+
     '<span class="badge '+(d.source==='claude'?'src-claude':'src-cursor')+'">'+esc(srcLabel(d.source).toUpperCase())+'</span> '+
-    (d.scheduled?'<span class="badge scheduled">SCHEDULED</span> ':'')+'&nbsp; '+
+    (d.scheduled?'<span class="badge scheduled">SCHEDULED</span> ':'')+
+    (d.skill && d.status==='working'?'<span class="badge skill">SKILL: '+esc(d.skill)+'</span> ':'')+'&nbsp; '+
     esc(d.project)+' &nbsp;·&nbsp; '+esc(d.last_activity_rel)+' &nbsp;·&nbsp; '+d.message_count+' msgs'+
     ' &nbsp;·&nbsp; <span id="d-char">'+esc(nameFor(d.id))+'</span>';
   const body=document.getElementById('dbody');
@@ -6111,7 +6556,37 @@ async function openDetail(id){
 function closeDetail(){overlay.style.display='none';currentDetail=null;}
 document.getElementById('d-x').addEventListener('click',closeDetail);
 overlay.addEventListener('click',e=>{ if(e.target===overlay) closeDetail(); });
-document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeDetail(); closeKitchen(); } });
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeDetail(); closeKitchen(); closeSkill(); } });
+
+// ---- skill steps: click the gold ribbon on a worker that is running a skill ----
+const soverlay=document.getElementById('soverlay');
+let openSkillId=null;
+function openSkill(agent){
+  if(!agent) return;
+  openSkillId=agent.id;
+  paintSkill(agent);
+  soverlay.style.display='flex';
+}
+function paintSkill(agent){
+  const runs=agent.skill_runs||[];
+  const names=(agent.skills&&agent.skills.length)?agent.skills:(agent.skill?[agent.skill]:[]);
+  document.getElementById('s-title').textContent = names.length>1 ? (names.length+' skills') : (names[0]||agent.skill||'Skill');
+  const sb=document.getElementById('sbody');
+  if(!runs.length){
+    sb.innerHTML='<div class="sempty">No steps for this skill.</div>';
+  } else {
+    sb.innerHTML=runs.map(run=>{
+      const steps=run.steps||[];
+      const done=steps.filter(s=>s.state==='done').length;
+      const head='<div class="srun">'+esc(run.name||'skill')+(steps.length?(' \u00b7 '+done+'/'+steps.length):'')+'</div>';
+      const body=steps.length?skillStepHTML(steps):'<div class="sempty">This skill does not list steps.</div>';
+      return head+body;
+    }).join('');
+  }
+}
+function closeSkill(){ soverlay.style.display='none'; openSkillId=null; }
+document.getElementById('s-x').addEventListener('click',closeSkill);
+soverlay.addEventListener('click',e=>{ if(e.target===soverlay) closeSkill(); });
 
 // ---- kitchen list panel: every agent currently WAITING (in the kitchen) ----
 // Reuses the detail-overlay pattern (DOM panel, PAL colours, click-outside / X / Esc).

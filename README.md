@@ -92,6 +92,13 @@ you see both backend and UI changes without touching the terminal or the browser
 - If you run agents in Multitask mode, a parent whose own turn ended still counts as
   working while a background subagent is active — its desk shows a dim standby screen (it
   isn't typing itself) while the helper dwarf beside it keeps working.
+- While a skill is guiding the open turn, that worker wears a gold **skill ribbon**
+  (the skill name, upper-right of the head) and the header shows a **skills** count.
+  A skill counts when this turn attached it (`<manually_attached_skills>`) or the
+  agent invoked it (Claude's `Skill` tool, or a `Read` of `SKILL.md` inside a skills
+  directory). The ribbon comes off when the turn ends. Click the ribbon to open
+  that skill's steps: done, the one in progress, and what's left. Progress comes
+  from checkboxes the agent writes during the turn (`- [x]`).
 - Scheduled / automated agents (cron jobs, daily monitors — anything launched by a
   scheduled task) are drawn as **couriers**: a solid uniform with a matching cap and an
   envelope badge, so a squad of recurring jobs doesn't get mistaken for chats you
