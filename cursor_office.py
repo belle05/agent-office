@@ -60,17 +60,22 @@ localhost.
 """
 
 import argparse
+import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import webbrowser
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote, urlparse
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------
 # Transcript discovery + parsing
@@ -132,6 +137,867 @@ def cursor_session_name(uuid):
         _SESSION_NAME_CACHE[uuid] = (name, now)
     return name
 
+
+# Cursor's sidebar spinner stays on while a chat's own turn runs OR while any of its
+# (background) subagents has a run in flight -- even after the parent wrote turn_ended.
+# The persisted marker for "run in flight" is composerData:<uuid>.unfinishedRunAt (on
+# parents AND subagents): Cursor sets it to the run's start time (with status "aborted",
+# so a crash reads as aborted) when a run starts and clears it (status -> "completed"/
+# "none") when the run finishes. A crash leaves it set forever, so it is only trusted
+# together with recent activity.
+#
+# A PARENT chat's .jsonl lags its turn: Cursor appends the turn's records when the turn
+# ends (sometimes flushing the user prompt a few seconds in), and a brand-new chat has no
+# transcript dir at all until its first turn ends. So for parents the transcript alone
+# reads "turn ended" (or nothing) for the whole turn; unfinishedRunAt is the live signal.
+_RUN_FLAG_CACHE = {}              # uuid -> (info dict | None no record, fetched_at)
+_RUN_FLAG_LOCK = threading.Lock()
+_RUN_FLAG_TTL = 5
+
+
+def _open_cursor_db():
+    uri = "file:%s?mode=ro" % quote(CURSOR_GLOBAL_DB)
+    return sqlite3.connect(uri, uri=True, timeout=0.5)
+
+
+def cursor_run_info(uuids):
+    """Return {uuid: info|None} from composerData, where info is
+    ``{"run_at": run start (epoch s) or 0.0 when idle, "status": str, "parent":
+    parentComposerId or "", "name": str, "folder": workspace fsPath or "", "sub_ids": [subagent
+    composer ids], "sub_type": subagentTypeName or ""}``. None = no record / DB unreadable, so
+    callers fall back to transcript heuristics. Read-only, TTL-cached."""
+    now = time.time()
+    out, missing = {}, []
+    with _RUN_FLAG_LOCK:
+        for u in uuids:
+            hit = _RUN_FLAG_CACHE.get(u)
+            if hit and (now - hit[1]) < _RUN_FLAG_TTL:
+                out[u] = hit[0]
+            else:
+                missing.append(u)
+    if not missing:
+        return out
+    fetched = dict.fromkeys(missing)
+    try:
+        if os.path.isfile(CURSOR_GLOBAL_DB):
+            conn = _open_cursor_db()
+            try:
+                keys = ["composerData:" + u for u in missing]
+                cur = conn.execute(
+                    "SELECT key, json_extract(value,'$.unfinishedRunAt'), json_extract(value,'$.status'),"
+                    " json_extract(value,'$.subagentInfo.parentComposerId'),"
+                    " json_extract(value,'$.name'),"
+                    " json_extract(value,'$.workspaceIdentifier.uri.fsPath'),"
+                    " json_extract(value,'$.subagentComposerIds'),"
+                    " json_extract(value,'$.subagentInfo.subagentTypeName') FROM cursorDiskKV "
+                    "WHERE key IN (%s)" % ",".join("?" * len(keys)), keys)
+                for key, run_at, status, parent, name, folder, sub_ids, sub_type in cur.fetchall():
+                    try:
+                        sub_ids = json.loads(sub_ids) if isinstance(sub_ids, str) else []
+                    except ValueError:
+                        sub_ids = []
+                    if run_at is None:
+                        started = 0.0
+                    elif isinstance(run_at, (int, float)) and run_at > 0:
+                        started = run_at / 1000.0
+                    else:
+                        started = 1.0   # set but unparseable: in flight, start unknown
+                    fetched[key[len("composerData:"):]] = {
+                        "run_at": started,
+                        "status": status if isinstance(status, str) else "",
+                        "parent": parent if isinstance(parent, str) else "",
+                        "name": name.strip() if isinstance(name, str) else "",
+                        "folder": folder if isinstance(folder, str) else "",
+                        "sub_ids": [s for s in sub_ids if isinstance(s, str) and _UUID_RE.match(s)]
+                                   if isinstance(sub_ids, list) else [],
+                        "sub_type": sub_type if isinstance(sub_type, str) else "",
+                    }
+            finally:
+                conn.close()
+    except Exception:
+        logger.debug("composerData run-state lookup failed", exc_info=True)
+        fetched = dict.fromkeys(missing)
+    with _RUN_FLAG_LOCK:
+        for u, v in fetched.items():
+            _RUN_FLAG_CACHE[u] = (v, now)
+    out.update(fetched)
+    return out
+
+
+def cursor_runs_in_flight(uuids):
+    """Return {uuid: True|False|None} from composerData.unfinishedRunAt (None = no record /
+    DB unreadable, so callers fall back to transcript heuristics)."""
+    return {u: (None if info is None else bool(info["run_at"]))
+            for u, info in cursor_run_info(uuids).items()}
+
+
+def cursor_run_finished(uuid):
+    """True when Cursor's own record says the chat's run is over (no unfinishedRunAt and
+    status completed/none). Cursor sometimes flushes a turn's user prompt but never its
+    closing records, leaving a transcript that reads "in progress" long after the turn."""
+    info = cursor_run_info([uuid]).get(uuid)
+    return bool(info) and not info["run_at"] and info["status"] in ("completed", "none")
+
+
+# Which composers Cursor is writing to right now. cursorDiskKV is declared
+# "key UNIQUE ON CONFLICT REPLACE", so every write re-inserts its row at a new, highest
+# rowid: the rowid tail is a cheap recency index (a covering scan, values never read).
+# A live turn writes bubbleId:<composer>:<bubble> rows as it streams.
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_DB_TAIL_LOCK = threading.Lock()
+_DB_TAIL = {"at": 0.0, "max_rowid": 0}
+_DB_TAIL_SEEN = {}                # composer uuid -> (last write observed at | 0.0 unknown, added_at)
+_DB_TAIL_ROWS = 3000
+_DB_TAIL_TTL = 5
+
+
+def cursor_recent_writers():
+    """{composer uuid: wall time a DB write to it was last observed (0.0 = before this
+    process started watching)}, kept for WORKING_STALE_CAP_SECONDS so a run sitting in one
+    long tool call stays a candidate after its rows scroll out of the tail."""
+    now = time.time()
+    with _DB_TAIL_LOCK:
+        if (now - _DB_TAIL["at"]) < _DB_TAIL_TTL:
+            return {u: s for u, (s, _a) in _DB_TAIL_SEEN.items()}
+        _DB_TAIL["at"] = now
+        last_max = _DB_TAIL["max_rowid"]
+    rows = []
+    try:
+        if os.path.isfile(CURSOR_GLOBAL_DB):
+            conn = _open_cursor_db()
+            try:
+                rows = conn.execute(
+                    "SELECT rowid, key FROM cursorDiskKV WHERE rowid > ? ORDER BY rowid DESC LIMIT ?",
+                    (last_max, _DB_TAIL_ROWS)).fetchall()
+            finally:
+                conn.close()
+    except Exception:
+        logger.debug("cursorDiskKV tail scan failed", exc_info=True)
+    seen_at = now if last_max else 0.0
+    with _DB_TAIL_LOCK:
+        for rowid, key in rows:
+            parts = key.split(":", 2) if isinstance(key, str) else []
+            if len(parts) < 2 or parts[0] == "agentKv" or not _UUID_RE.match(parts[1]):
+                continue
+            prev = _DB_TAIL_SEEN.get(parts[1])
+            _DB_TAIL_SEEN[parts[1]] = (max(seen_at, prev[0] if prev else 0.0), prev[1] if prev else now)
+        if rows:
+            _DB_TAIL["max_rowid"] = max(_DB_TAIL["max_rowid"], rows[0][0])
+        for u in [u for u, (s, a) in _DB_TAIL_SEEN.items()
+                  if (now - max(s, a)) > WORKING_STALE_CAP_SECONDS]:
+            del _DB_TAIL_SEEN[u]
+        return {u: s for u, (s, _a) in _DB_TAIL_SEEN.items()}
+
+
+def cursor_live_runs():
+    """{uuid: latest activity time} for Cursor composers (parents or subagents) whose run is
+    in flight per composerData.unfinishedRunAt and active within WORKING_STALE_CAP_SECONDS,
+    plus {uuid: info} for each (see cursor_run_info)."""
+    writers = cursor_recent_writers()
+    if not writers:
+        return {}, {}
+    infos = cursor_run_info(list(writers))
+    now = time.time()
+    live, live_infos = {}, {}
+    for u, info in infos.items():
+        if not info or not info["run_at"]:
+            continue
+        last = max(info["run_at"], writers.get(u, 0.0))
+        if (now - last) <= WORKING_STALE_CAP_SECONDS:
+            live[u] = last
+            live_infos[u] = info
+    return live, live_infos
+
+
+# "Waiting on you": a chat blocked on a question for the user. Two strengths:
+#   * "form"    -- an unanswered multiple-choice form (Cursor's ask_question tool / Claude
+#                  Code's AskUserQuestion). Overrides WORKING: the agent can't go on without you.
+#   * "message" -- the turn ended and the last assistant message ends with a question.
+#
+# Cursor keeps the form as a tool-call bubble, cursorDiskKV["bubbleId:<composer>:<bubble>"]:
+# toolFormerData.name == "ask_question", and toolFormerData.additionalData.status is
+# "pending" until the user acts ("submitted" + a result once answered, "cancelled" with
+# userDecision "rejected" when skipped). The chat's run is NOT in flight while the form waits
+# (unfinishedRunAt cleared, status "completed") and a brand-new chat has no transcript yet,
+# so this is the only signal. A form still streaming in an in-flight run reads
+# toolFormerData.status "loading" with no additionalData.status.
+# A pending bubble only counts while it is the chat's latest ask_question with no later user
+# bubble (type 1): typing a reply in the chat instead of using the form leaves it "pending".
+ASK_RECENT_SECONDS = 6 * 3600     # only chats in flight or ended this recently are checked
+_ASK_BUBBLE_ROWS = 12             # newest bubble rows (by rowid = last write) inspected per chat
+_ASK_CACHE = {}                   # uuid -> (write stamp, checked_at, form dict | None)
+_ASK_LOCK = threading.Lock()
+_ASK_TTL = 30
+_ASK_PREVIEW_CHARS = 160
+
+
+def _fingerprint(*parts):
+    """Stable short hash used as question_id -- never the question text itself."""
+    return hashlib.sha1("\x1f".join(str(p) for p in parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _iso_epoch(s):
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _short_preview(s, n=_ASK_PREVIEW_CHARS):
+    s = WS_RE.sub(" ", (s or "").replace("\n", " ")).strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "\u2026"
+
+
+def _form_preview(params):
+    """(preview, question_count) from an ask_question params JSON string."""
+    try:
+        p = json.loads(params) if isinstance(params, str) else (params or {})
+    except Exception:
+        return "", 0
+    qs = [q for q in (p.get("questions") or []) if isinstance(q, dict)]
+    first = next((q.get("prompt") or q.get("question") or "" for q in qs), "")
+    head = (p.get("title") or "").strip()
+    text = (head + ": " + first) if head and first else (head or first)
+    return _short_preview(_clean_text(text)), len(qs)
+
+
+def _pending_form_from_rows(uuid, rows, in_flight):
+    """rows: [(bubble_id, type, createdAt, tool name, tool status, additionalData.status,
+    params, toolCallId)] for a chat's newest bubbles. Returns the form dict or None."""
+    asks = [r for r in rows if r[3] == "ask_question"]
+    if not asks:
+        return None
+    ask = max(asks, key=lambda r: r[2] or "")
+    bubble_id, _t, created, _n, status, ui_status, params, call_id = ask
+    pending = ui_status == "pending" or (ui_status is None and status == "loading" and in_flight)
+    if not pending:
+        return None
+    if any(r[1] == 1 and (r[2] or "") > (created or "") for r in rows):
+        return None
+    preview, count = _form_preview(params)
+    return {"asking": "form", "asked_at": _iso_epoch(created or ""),
+            "question_id": _fingerprint(uuid, bubble_id, call_id or ""),
+            "question_preview": preview, "question_count": count}
+
+
+def cursor_pending_forms(uuids, live_ids=()):
+    """{uuid: form dict | None} for Cursor chats blocked on an unanswered ask_question form.
+
+    One read-only connection per batch; each chat costs a covering-index range scan over its
+    bubble keys plus value reads for its newest _ASK_BUBBLE_ROWS rows. A result is reused
+    until the DB tail shows a new write to that chat (cursor_recent_writers) or _ASK_TTL
+    passes, so a steady office re-reads almost nothing."""
+    now = time.time()
+    writers = cursor_recent_writers()
+    live_ids = set(live_ids)
+    out, todo = {}, []
+    with _ASK_LOCK:
+        for u in uuids:
+            stamp = (writers.get(u), u in live_ids)
+            hit = _ASK_CACHE.get(u)
+            if hit and hit[0] == stamp and (now - hit[1]) < _ASK_TTL:
+                out[u] = hit[2]
+            else:
+                todo.append((u, stamp))
+    if not todo:
+        return out
+    fetched = {}
+    t0 = time.time()
+    try:
+        if os.path.isfile(CURSOR_GLOBAL_DB):
+            conn = _open_cursor_db()
+            try:
+                for u, stamp in todo:
+                    lo, hi = "bubbleId:%s:" % u, "bubbleId:%s;" % u
+                    ids = [r[0] for r in conn.execute(
+                        "SELECT rowid FROM cursorDiskKV WHERE key >= ? AND key < ? "
+                        "ORDER BY rowid DESC LIMIT ?", (lo, hi, _ASK_BUBBLE_ROWS))]
+                    rows = []
+                    if ids:
+                        rows = conn.execute(
+                            "SELECT substr(key, ?), json_extract(value,'$.type'),"
+                            " json_extract(value,'$.createdAt'),"
+                            " json_extract(value,'$.toolFormerData.name'),"
+                            " json_extract(value,'$.toolFormerData.status'),"
+                            " json_extract(value,'$.toolFormerData.additionalData.status'),"
+                            " CASE WHEN json_extract(value,'$.toolFormerData.name')='ask_question'"
+                            "  THEN json_extract(value,'$.toolFormerData.params') END,"
+                            " json_extract(value,'$.toolFormerData.toolCallId')"
+                            " FROM cursorDiskKV WHERE rowid IN (%s)" % ",".join("?" * len(ids)),
+                            [len(lo) + 1] + ids).fetchall()
+                    fetched[u] = (stamp, _pending_form_from_rows(u, rows, stamp[1]))
+            finally:
+                conn.close()
+    except Exception:
+        logger.debug("ask_question bubble lookup failed", exc_info=True)
+    logger.debug("ask_question lookup: %d chats, %d pending, %d ms", len(todo),
+                 sum(1 for _s, f in fetched.values() if f), int((time.time() - t0) * 1000))
+    with _ASK_LOCK:
+        for u, (stamp, form) in fetched.items():
+            _ASK_CACHE[u] = (stamp, now, form)
+        for u in [u for u, v in _ASK_CACHE.items() if (now - v[1]) > WORKING_STALE_CAP_SECONDS]:
+            del _ASK_CACHE[u]
+    for u, _stamp in todo:
+        out[u] = fetched.get(u, (None, None))[1]
+    return out
+
+
+# "Listening": a chat subscribed to Slack / GitHub / Linear / Origin events through the
+# cursor-subscriptions MCP tools. Cursor keeps no local registry (it is server-side), but
+# every call and every delivered event is a bubble row, cursorDiskKV["bubbleId:<c>:<b>"]:
+#   * toolFormerData.name "mcp-cursor-subscriptions-<tool>"; params JSON .tools[0].parameters
+#     (a JSON string of the call args); result JSON .result -> .content[0].text (JSON) =
+#     {subscriptionId, expiresAt, subscription{source,type,scope,repo,pullNumber,branch,
+#     channelId,...}, subscriptionMetadata{channelName,...}} or {error}. unsubscribe ->
+#     {closed}; list_subscriptions -> {subscriptions:[{subscriptionId, subscriptionArgs,
+#     subscriptionMetadata, expiresAt, ...}]}, the authoritative set at that moment.
+#   * a delivered event is a user bubble with eventNotification{source, action, headline,
+#     url, detail}. Slack headlines read "<sender> in #<channel>"; `detail` is message text
+#     and is never read.
+# Active = subscribed, not expired, not unsubscribed, not auto-closed (a PR merged/closed
+# without keepWatchingAfterClose; default-branch CI after its first result), replayed in
+# bubble order from the latest list_subscriptions snapshot. Only chats whose transcript
+# shows a real cursor-subscriptions call are looked up; each keeps a rowid high-water mark
+# so a refresh only reads rows written since (rewrites get a new rowid). The first fill of
+# a chat can read 100k+ bubbles, so it always runs on a background worker.
+_LISTEN_CALL_RE = re.compile(rb'"namespace"\s*:\s*"cursor-subscriptions"')
+_LISTEN_SCAN = {}                 # transcript path -> (bytes scanned, found)
+_LISTEN_SCAN_LOCK = threading.Lock()
+_LISTEN = {}                      # uuid -> {"hw", "recs", "ready", "checked", "stamp", "queued"}
+_LISTEN_LOCK = threading.Lock()
+_LISTEN_WAKE = threading.Condition(_LISTEN_LOCK)
+_LISTEN_QUEUE = []
+_LISTEN_WORKER = {"thread": None}
+_LISTEN_TTL = 60                  # re-read a chat at least this often even without a seen write
+_LISTEN_INLINE_BUDGET = 0.25      # seconds of incremental reads allowed inside one request
+_LISTEN_MAX = 8
+_LISTEN_PREFIX = "mcp-cursor-subscriptions-"
+
+# CI on a repo's default branch is one-shot. Neither the subscribe result nor the CI/PR
+# events carry the default branch, so it comes from a local clone of the repo: its origin
+# remote in .git/config gives the repo, refs/remotes/origin/HEAD the default branch. Clones
+# are found by a shallow walk of the home dir (up to _REPO_SCAN_DEPTH levels, never inside
+# a repo), rebuilt on a background thread every _REPO_HEAD_TTL. The usual trunk names in
+# _FALLBACK_DEFAULT_BRANCHES count too. Either way a CI subscription only drops once a
+# result for that branch has arrived.
+_FALLBACK_DEFAULT_BRANCHES = ("main", "master", "dev")
+_REPO_SCAN_DEPTH = 3
+_REPO_SCAN_SKIP = {"Library", "Applications", "Pictures", "Music", "Movies", "node_modules",
+                   "venv", "env", "site-packages", "dist", "build"}
+_REPO_HEAD_TTL = 600
+_REPO_HEAD = {"map": {}, "at": 0.0, "building": False}
+_REPO_HEAD_LOCK = threading.Lock()
+_REMOTE_SLUG_RE = re.compile(r"[:/]([^/:\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+def _git_common_dir(repo_dir):
+    """The .git dir holding config + refs (a worktree's .git file points at its gitdir,
+    whose commondir is the main repo's .git)."""
+    g = os.path.join(repo_dir, ".git")
+    if os.path.isdir(g):
+        return g
+    try:
+        with open(g, "r", encoding="utf-8", errors="replace") as fh:
+            gd = fh.read().split("gitdir:", 1)[1].strip()
+    except (OSError, IndexError):
+        return None
+    gd = gd if os.path.isabs(gd) else os.path.normpath(os.path.join(repo_dir, gd))
+    try:
+        with open(os.path.join(gd, "commondir"), "r", encoding="utf-8") as fh:
+            return os.path.normpath(os.path.join(gd, fh.read().strip()))
+    except OSError:
+        return gd
+
+
+def _clone_default_branch(git_dir):
+    """(owner/repo lowercased, default branch) for a clone's origin, or None."""
+    url = None
+    try:
+        with open(os.path.join(git_dir, "config"), "r", encoding="utf-8", errors="replace") as fh:
+            in_origin = False
+            for line in fh:
+                s = line.strip()
+                if s.startswith("["):
+                    in_origin = s.replace(" ", "") in ('[remote"origin"]',)
+                elif in_origin and s.startswith("url"):
+                    url = s.split("=", 1)[-1].strip()
+                    break
+        with open(os.path.join(git_dir, "refs", "remotes", "origin", "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
+    except OSError:
+        return None
+    m = _REMOTE_SLUG_RE.search(url or "")
+    prefix = "ref: refs/remotes/origin/"
+    if not m or not head.startswith(prefix):
+        return None
+    return ("%s/%s" % (m.group(1), m.group(2))).lower(), head[len(prefix):]
+
+
+def _scan_default_branches():
+    t0 = time.time()
+    home = os.path.expanduser("~")
+    votes, clones = {}, 0
+    stack = [(home, 0)]
+    while stack:
+        d, depth = stack.pop()
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        if ".git" in entries and d != home:
+            clones += 1
+            gd = _git_common_dir(d)
+            got = _clone_default_branch(gd) if gd else None
+            if got:
+                votes.setdefault(got[0], {}).setdefault(got[1], 0)
+                votes[got[0]][got[1]] += 1
+            continue
+        if depth >= _REPO_SCAN_DEPTH:
+            continue
+        for e in entries:
+            if e.startswith(".") or e in _REPO_SCAN_SKIP:
+                continue
+            p = os.path.join(d, e)
+            if os.path.isdir(p) and not os.path.islink(p):
+                stack.append((p, depth + 1))
+    heads = {slug: max(v.items(), key=lambda kv: kv[1])[0] for slug, v in votes.items()}
+    with _REPO_HEAD_LOCK:
+        _REPO_HEAD.update({"map": heads, "at": time.time(), "building": False})
+    logger.debug("default-branch index: %d clones, %d repos, %d ms",
+                 clones, len(heads), int((time.time() - t0) * 1000))
+
+
+def repo_default_branches():
+    """{owner/repo: default branch} from local clones; never blocks (a stale or missing
+    index is rebuilt in the background and the last one is served meanwhile)."""
+    with _REPO_HEAD_LOCK:
+        stale = (time.time() - _REPO_HEAD["at"]) > _REPO_HEAD_TTL
+        if stale and not _REPO_HEAD["building"]:
+            _REPO_HEAD["building"] = True
+            threading.Thread(target=_scan_default_branches, daemon=True, name="repo-heads").start()
+        return _REPO_HEAD["map"]
+
+
+def _is_default_branch(repo, branch, heads):
+    """A clone's origin/HEAD is fixed at clone time and can lag a later default-branch
+    change, so it adds to the trunk names rather than replacing them."""
+    known = heads.get(_repo_slug(repo).lower()) if repo else None
+    return bool(branch) and (branch == known or branch in _FALLBACK_DEFAULT_BRANCHES)
+
+
+def _transcript_listens(path):
+    """True once the transcript holds a real cursor-subscriptions tool call (tool catalogs
+    echoed into prompts don't match). Scans only bytes appended since the last check."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    with _LISTEN_SCAN_LOCK:
+        done, found = _LISTEN_SCAN.get(path, (0, False))
+    if found and size >= done:
+        return True
+    if size < done:
+        done = 0
+    if size == done:
+        return found
+    start = max(0, done - 64)
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            found = bool(_LISTEN_CALL_RE.search(fh.read(size - start)))
+    except OSError:
+        return False
+    with _LISTEN_SCAN_LOCK:
+        _LISTEN_SCAN[path] = (size, found)
+    return found
+
+
+def _json_or_none(s):
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _listen_call_args(params):
+    p = _json_or_none(params)
+    tools = (p or {}).get("tools") if isinstance(p, dict) else None
+    if not tools or not isinstance(tools[0], dict):
+        return {}
+    args = tools[0].get("parameters")
+    args = _json_or_none(args) if isinstance(args, str) else args
+    return args if isinstance(args, dict) else {}
+
+
+def _listen_call_result(result):
+    r = _json_or_none(result)
+    inner = _json_or_none(r.get("result")) if isinstance(r, dict) else None
+    try:
+        text = inner["content"][0]["text"]
+    except Exception:
+        return None
+    out = _json_or_none(text)
+    return out if isinstance(out, dict) else None
+
+
+_SLACK_HEADLINE_RE = re.compile(r"^(?P<who>.+?) in #(?P<chan>\S+)\s*$")
+_SLACK_URL_RE = re.compile(r"/archives/(?P<chan>[A-Z0-9]+)/p(?P<ts>\d{10})(?P<frac>\d+)")
+_GH_PR_URL_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+_CI_HEADLINE_RE = re.compile(r"^CI (?P<result>\w+) on (?P<branch>.+?)\s*$")
+
+
+def _listen_record(tool_name, status, params, result, created, ev_source, ev_action,
+                   ev_headline, ev_url):
+    """Reduce one bubble row to the few fields the active-set replay needs. Slack headlines
+    are cut down to the sender and channel name here, so nothing else is kept in memory."""
+    at = _iso_epoch(created) if isinstance(created, str) else (
+        created / 1000.0 if isinstance(created, (int, float)) else 0.0)
+    if isinstance(tool_name, str) and tool_name.startswith(_LISTEN_PREFIX):
+        if status != "completed":
+            return None
+        res = _listen_call_result(result)
+        if not res or "error" in res:
+            return None
+        return {"at": at, "tool": tool_name[len(_LISTEN_PREFIX):],
+                "args": _listen_call_args(params), "res": res}
+    if not ev_source:
+        return None
+    rec = {"at": at, "event": ev_source, "action": ev_action or "", "url": ev_url or ""}
+    if ev_source == "slack":
+        m = _SLACK_HEADLINE_RE.match(ev_headline or "")
+        if m:
+            rec["who"], rec["chan_name"] = m.group("who").strip(), m.group("chan")
+        u = _SLACK_URL_RE.search(ev_url or "")
+        if u:
+            rec["chan"] = u.group("chan")
+            rec["ts"] = "%s.%s" % (u.group("ts"), u.group("frac"))
+        tm = re.search(r"[?&]thread_ts=([0-9.]+)", ev_url or "")
+        rec["thread"] = tm.group(1) if tm else rec.get("ts")
+    elif ev_source == "github":
+        c = _CI_HEADLINE_RE.match(ev_headline or "")
+        if c:
+            rec["ci_result"], rec["branch"] = c.group("result").lower(), c.group("branch")
+    return rec
+
+
+def _repo_slug(repo):
+    parts = [p for p in re.sub(r"^[a-z]+://", "", str(repo or "")).split("/") if p]
+    if parts and "." in parts[0] and len(parts) > 2:
+        parts = parts[1:]
+    if parts[:1] == ["codebase"]:
+        parts = parts[1:]
+    return "/".join(parts[:2])
+
+
+def _listen_sub(sid, args, sub, meta, expires, tool):
+    opts = args.get("options") if isinstance(args.get("options"), dict) else {}
+    s = dict(args)
+    s.update(opts)
+    s.update(sub or {})
+    s.update({"sid": sid, "meta": meta if isinstance(meta, dict) else {},
+              "expires": _iso_epoch(expires) if isinstance(expires, str) else 0.0,
+              "keep": bool(args.get("keepWatchingAfterClose")), "tool": tool or "",
+              "last_event": 0.0, "senders": [], "chan_name": "", "url": "", "ci": ""})
+    if not s.get("source"):
+        s["source"] = ("slack" if "slack" in s["tool"] else "github" if "github" in s["tool"]
+                       else "linear" if "linear" in s["tool"] else "origin" if "origin" in s["tool"] else "")
+    return s
+
+
+def _listen_event_matches(s, e):
+    if e["event"] == "slack":
+        if s.get("source") != "slack" or not e.get("chan") or s.get("channelId") != e["chan"]:
+            return False
+        ts = s.get("threadTs")
+        return not ts or ts in (e.get("thread"), e.get("ts"))
+    if e["event"] == "github" and s.get("source") == "github":
+        if e.get("branch"):
+            m = re.search(r"github\.com/([^/\s]+/[^/\s]+)/commit/", e.get("url", ""))
+            same_repo = not (m and s.get("repo")) or _repo_slug(s["repo"]).lower() == m.group(1).lower()
+            return s.get("type") == "ci" and s.get("branch") == e["branch"] and same_repo
+        m = _GH_PR_URL_RE.search(e.get("url", ""))
+        if not m or not s.get("repo") or _repo_slug(s["repo"]).lower() != m.group(1).lower():
+            return False
+        return s.get("scope") != "pr" or str(s.get("pullNumber")) == m.group(2)
+    return False
+
+
+def _listening_from_records(recs, now, heads=None):
+    """Replay a chat's subscription calls + events (bubble order) into its active list.
+    `heads` ({owner/repo: default branch}) is fetched only if a CI result needs it."""
+    subs = {}
+    for r in sorted(recs, key=lambda r: r["at"]):
+        tool = r.get("tool")
+        if tool:
+            res, args = r["res"], r["args"]
+            if tool.startswith("subscribe_") and res.get("subscriptionId"):
+                sid = res["subscriptionId"]
+                prev = subs.get(sid)
+                subs[sid] = _listen_sub(sid, args, res.get("subscription"),
+                                        res.get("subscriptionMetadata"), res.get("expiresAt"), tool)
+                if prev:
+                    for k in ("last_event", "senders", "chan_name", "url", "ci"):
+                        subs[sid][k] = prev[k]
+            elif tool == "unsubscribe" and res.get("closed", True):
+                subs.pop(args.get("subscriptionId"), None)
+            elif tool == "list_subscriptions" and isinstance(res.get("subscriptions"), list):
+                snap = {}
+                for it in res["subscriptions"]:
+                    if not isinstance(it, dict) or not it.get("subscriptionId"):
+                        continue
+                    sid = it["subscriptionId"]
+                    prev = subs.get(sid) or {}
+                    sa = it.get("subscriptionArgs") if isinstance(it.get("subscriptionArgs"), dict) else {}
+                    s = _listen_sub(sid, {}, sa, it.get("subscriptionMetadata"), it.get("expiresAt"),
+                                    prev.get("tool", ""))
+                    for k in ("keep", "threadTs", "channelNameContains", "last_event", "senders",
+                              "chan_name", "url", "ci"):
+                        if k in prev:
+                            s[k] = prev[k]
+                    snap[sid] = s
+                subs = snap
+            continue
+        for sid, s in list(subs.items()):
+            if not _listen_event_matches(s, r):
+                continue
+            s["last_event"] = max(s["last_event"], r["at"])
+            if r.get("url"):
+                s["url"] = r["url"]
+            if r.get("who") and r["who"] not in s["senders"]:
+                s["senders"].append(r["who"])
+            if r.get("chan_name"):
+                s["chan_name"] = r["chan_name"]
+            if r.get("ci_result"):
+                s["ci"] = r["ci_result"]
+                if heads is None:
+                    heads = repo_default_branches()
+                if _is_default_branch(s.get("repo"), s.get("branch"), heads):
+                    del subs[sid]
+            elif (r["event"] == "github" and r["action"] in ("merged", "closed")
+                  and s.get("scope") == "pr" and not s["keep"]):
+                del subs[sid]
+    out = [_listen_entry(s) for s in subs.values() if not s["expires"] or s["expires"] > now]
+    out.sort(key=lambda e: (-(e["last_event_at"] or 0), e["kind"], e["label"]))
+    return out[:_LISTEN_MAX]
+
+
+def _listen_entry(s):
+    kind, scope = s.get("source") or "github", s.get("scope") or ""
+    repo = _repo_slug(s.get("repo")) if s.get("repo") else ""
+    detail, url = "", s.get("url") or ""
+    if kind == "slack":
+        chan = s["meta"].get("channelName") or s.get("chan_name")
+        chan = ("#" + chan.lstrip("#")) if chan else ("channel " + str(s.get("channelId") or "?"))
+        if s.get("tool") == "subscribe_slack_new_channels" or s.get("type") == "channel_created":
+            sub, label = "new_channels", "new Slack channels"
+            if s.get("channelNameContains"):
+                label += " matching \u201c%s\u201d" % s["channelNameContains"]
+        elif s.get("threadTs"):
+            sub, label = "thread", "thread in " + chan
+        else:
+            sub, label = "channel", chan
+        who = s["senders"]
+        detail = (", ".join(who[:3]) + (" +%d" % (len(who) - 3) if len(who) > 3 else "")) if who else ""
+    elif kind in ("github", "origin"):
+        if s.get("type") == "ci" or "ci" in s.get("tool", ""):
+            sub, label = "ci", "CI on " + str(s.get("branch") or "?")
+            detail = repo + (" \u00b7 last: " + s["ci"] if s["ci"] else "")
+        elif scope == "pr" or s.get("pullNumber") or s.get("prUrl"):
+            num = s.get("pullNumber")
+            if not num and s.get("prUrl"):
+                m = re.search(r"/pull/(\d+)", s["prUrl"])
+                num = m.group(1) if m else "?"
+                repo = repo or _repo_slug(s["prUrl"].split("/pull/")[0])
+            sub, label = "pr", "PR #%s %s" % (num, repo)
+            if kind == "github" and not url and repo:
+                url = "https://github.com/%s/pull/%s" % (repo, num)
+        elif scope == "author":
+            sub, label = "author", "PRs by %s in %s" % (s.get("author") or "?", repo)
+        else:
+            sub, label = "repo", "PRs in " + repo
+    else:
+        sub = scope or "issue"
+        ref = s.get("issueId") or s.get("teamId") or s.get("projectId") or ""
+        label = "Linear " + ("comments on " if "comment" in s.get("tool", "") else "") + (
+            ("team " if sub == "team" else "project " if sub == "project" else "") + str(ref))
+    return {"kind": kind, "sub": sub, "label": label.strip(), "detail": detail, "url": url,
+            "expires_at": s["expires"] or None, "last_event_at": s["last_event"] or None}
+
+
+_LISTEN_SQL = (
+    "SELECT rowid, substr(key, ?), json_extract(value,'$.createdAt'),"
+    " json_extract(value,'$.toolFormerData.name'), json_extract(value,'$.toolFormerData.status'),"
+    " json_extract(value,'$.toolFormerData.params'), json_extract(value,'$.toolFormerData.result'),"
+    " json_extract(value,'$.eventNotification.source'), json_extract(value,'$.eventNotification.action'),"
+    " json_extract(value,'$.eventNotification.headline'), json_extract(value,'$.eventNotification.url')"
+    " FROM cursorDiskKV WHERE key >= ? AND key < ? AND rowid > ?"
+    " AND (instr(value, 'mcp-cursor-subscriptions-') > 0 OR instr(value, '\"eventNotification\"') > 0)")
+
+
+def _listen_read(conn, uuid, hw):
+    """(new high-water mark, {bubble id: record | None}) for rows written after `hw`."""
+    top = conn.execute("SELECT max(rowid) FROM cursorDiskKV").fetchone()[0] or 0
+    lo, hi = "bubbleId:%s:" % uuid, "bubbleId:%s;" % uuid
+    got = {}
+    for row in conn.execute(_LISTEN_SQL, (len(lo) + 1, lo, hi, hw)):
+        got[row[1]] = _listen_record(*row[3:7], row[2], *row[7:])
+    return top, got
+
+
+def _listen_apply(uuid, hw, got, stamp, now):
+    with _LISTEN_LOCK:
+        st = _LISTEN.setdefault(uuid, {"hw": 0, "recs": {}, "ready": False, "checked": 0.0,
+                                       "stamp": None, "queued": False})
+        st["recs"].update(got)
+        for k in [k for k, v in st["recs"].items() if v is None]:
+            del st["recs"][k]
+        st.update({"hw": max(st["hw"], hw), "ready": True, "checked": now, "stamp": stamp})
+
+
+def _listen_worker():
+    while True:
+        with _LISTEN_LOCK:
+            while not _LISTEN_QUEUE:
+                _LISTEN_WAKE.wait()
+            uuid, stamp = _LISTEN_QUEUE.pop(0)
+            hw = _LISTEN.get(uuid, {}).get("hw", 0)
+        t0 = time.time()
+        try:
+            conn = _open_cursor_db()
+            try:
+                top, got = _listen_read(conn, uuid, hw)
+            finally:
+                conn.close()
+            _listen_apply(uuid, top, got, stamp, time.time())
+            logger.debug("listening fill %s: %d rows, %d ms", uuid, len(got), int((time.time() - t0) * 1000))
+        except Exception:
+            logger.debug("listening fill failed for %s", uuid, exc_info=True)
+        with _LISTEN_LOCK:
+            if uuid in _LISTEN:
+                _LISTEN[uuid]["queued"] = False
+
+
+def _listen_enqueue(uuid, stamp):
+    """Caller holds _LISTEN_LOCK."""
+    st = _LISTEN.setdefault(uuid, {"hw": 0, "recs": {}, "ready": False, "checked": 0.0,
+                                   "stamp": None, "queued": False})
+    if st["queued"]:
+        return
+    st["queued"] = True
+    _LISTEN_QUEUE.append((uuid, stamp))
+    if not _LISTEN_WORKER["thread"]:
+        _LISTEN_WORKER["thread"] = threading.Thread(target=_listen_worker, daemon=True,
+                                                    name="listening-fill")
+        _LISTEN_WORKER["thread"].start()
+    _LISTEN_WAKE.notify()
+
+
+def cursor_listening(paths):
+    """{uuid: [listening entry]} for Cursor chats ({uuid: transcript path}). Never blocks on
+    a first fill: unready chats are queued for the worker and read [] until it finishes."""
+    now = time.time()
+    cands = [u for u, p in paths.items() if p and _transcript_listens(p)]
+    out = {}
+    if not cands or not os.path.isfile(CURSOR_GLOBAL_DB):
+        return {u: [] for u in paths}
+    writers = cursor_recent_writers()
+    inline = []
+    with _LISTEN_LOCK:
+        for u in cands:
+            st = _LISTEN.get(u)
+            stamp = writers.get(u)
+            if not st or not st["ready"]:
+                _listen_enqueue(u, stamp)
+            elif not st["queued"] and (st["stamp"] != stamp or (now - st["checked"]) >= _LISTEN_TTL):
+                inline.append((u, st["hw"], stamp))
+    if inline:
+        t0 = time.time()
+        try:
+            conn = _open_cursor_db()
+            try:
+                for i, (u, hw, stamp) in enumerate(inline):
+                    if time.time() - t0 > _LISTEN_INLINE_BUDGET:
+                        with _LISTEN_LOCK:
+                            for u2, _hw, s2 in inline[i:]:
+                                _listen_enqueue(u2, s2)
+                        break
+                    top, got = _listen_read(conn, u, hw)
+                    _listen_apply(u, top, got, stamp, time.time())
+            finally:
+                conn.close()
+        except Exception:
+            logger.debug("listening refresh failed", exc_info=True)
+        logger.debug("listening refresh: %d chats, %d ms", len(inline), int((time.time() - t0) * 1000))
+    with _LISTEN_LOCK:
+        recs = {u: list(_LISTEN[u]["recs"].values()) for u in cands
+                if u in _LISTEN and _LISTEN[u]["ready"]}
+    for u in paths:
+        out[u] = _listening_from_records(recs[u], now) if u in recs else []
+    return out
+
+
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_TRAIL_MARKUP = set("*_~`'\")]}\u201d\u2019\u00bb")
+
+
+def _ends_with_question(text):
+    """The "message" heuristic: the last non-empty prose line (fenced code blocks dropped)
+    ends with "?", ignoring trailing whitespace, markdown emphasis, closing quotes/brackets
+    and emoji. Returns that line, or "" when it isn't a question."""
+    lines, in_fence = [], False
+    for ln in (text or "").split("\n"):
+        if _FENCE_RE.match(ln):
+            in_fence = not in_fence
+            continue
+        if not in_fence and ln.strip():
+            lines.append(ln.strip())
+    if not lines:
+        return ""
+    last = lines[-1]
+    end = len(last)
+    while end and (last[end - 1].isspace() or last[end - 1] in _TRAIL_MARKUP
+                   or unicodedata.category(last[end - 1]) in ("So", "Sk", "Cf", "Mn", "Cs")):
+        end -= 1
+    return last if end and last[end - 1] in "?\uff1f" else ""
+
+
+def _message_question(uuid, events, skip_injected=False):
+    """{asking: "message", ...} when the transcript's last conversational event is an
+    assistant message ending with a question, else None. question_id hashes the event's
+    position + length, never its text."""
+    for i in range(len(events) - 1, -1, -1):
+        e = events[i]
+        if e["kind"] == "turn_ended" or (skip_injected and e["kind"] == "user" and e.get("injected")):
+            continue
+        if e["kind"] != "assistant" or not e["text"] or e["tools"]:
+            return None
+        line = _ends_with_question(e["text"])
+        if not line:
+            return None
+        return {"asking": "message", "question_id": _fingerprint(uuid, "msg", i, len(e["text"])),
+                "question_preview": _short_preview(line), "question_count": 1}
+    return None
+
+
+_NO_ASK = {"asking": None, "asked_at": None, "question_id": None,
+           "question_preview": "", "question_count": 0}
+
+
+def _apply_ask(a, ask, fallback_at):
+    """Copy the asking fields onto an agent dict (cleared when ask is None). A pending
+    form overrides WORKING: the agent can't continue until the user answers."""
+    a.update(_NO_ASK)
+    if not ask:
+        return
+    a.update(ask)
+    if not a.get("asked_at"):
+        a["asked_at"] = fallback_at
+    if ask["asking"] == "form":
+        a["status"] = "waiting"
+        a["self_active"] = False
+
 # Office (working/desk) vs kitchen (waiting) is decided by TURN STATE, not raw
 # write-recency: a session is "working" while its latest turn is still IN PROGRESS
 # (a user/assistant message after the last `turn_ended`). This keeps a genuinely
@@ -139,10 +1005,18 @@ def cursor_session_name(uuid):
 # call, a long generation, or simply while you read -- which a write-recency window
 # got wrong (it kept dropping active chats to "idle" during those gaps). A chat
 # whose latest turn has ENDED is waiting on you, so it walks to the kitchen, picked
-# up on the next poll. Two refinements layer on top:
+# up on the next poll. Refinements layer on top:
+#   * Live run (Cursor): the transcript lags the turn (see cursor_run_info), so a chat
+#     whose composerData.unfinishedRunAt is set and that was active within
+#     WORKING_STALE_CAP_SECONDS counts as mid-turn too -- including a brand-new chat that
+#     has no transcript yet (shown via _untranscribed_cursor_agent). Conversely a
+#     transcript left "in progress" by a lost closing flush is overridden once Cursor's
+#     record says the run finished (cursor_run_finished).
 #   * Multitask rollup: if the parent's turn has ended but a background SUBAGENT was
-#     written within SUBAGENT_ACTIVE_SECONDS, the chat still counts as working
-#     (the Multitask Mode case, where the parent is idle while a worker runs).
+#     written within SUBAGENT_ACTIVE_SECONDS -- or (Cursor) its latest run is still
+#     unfinished per its transcript and Cursor's composerData.unfinishedRunAt -- the
+#     chat still counts as working (the Multitask Mode case, where the parent is idle
+#     while a worker runs).
 #   * Staleness cap: a turn that has been completely silent (chat AND subagents)
 #     for longer than WORKING_STALE_CAP_SECONDS is treated as abandoned/crashed and
 #     sent to the kitchen, so a half-finished turn can't sit at a desk forever.
@@ -498,13 +1372,6 @@ def _turn_in_progress(events):
     return last_msg > last_end
 
 
-def _latest_sub_mtime(sub_files):
-    """Most recent write across a session's background subagent transcripts (0 if none)."""
-    if not sub_files:
-        return 0.0
-    return max((m for _, m in sub_files), default=0.0)
-
-
 def _active_sub_count(sub_files):
     """How many background subagents are *currently running* -- i.e. their transcript
     was written within the freshness window. The subagents/ dir also holds finished
@@ -514,6 +1381,62 @@ def _active_sub_count(sub_files):
         return 0
     now = time.time()
     return sum(1 for _, m in sub_files if (now - m) <= SUBAGENT_ACTIVE_SECONDS)
+
+
+_ENDED_CACHE = {}  # transcript path -> (mtime, ends_with_turn_ended)
+_ENDED_LOCK = threading.Lock()
+
+
+def _transcript_ended(path, mtime):
+    """True if a Cursor transcript's last record is ``turn_ended``. Cursor strips that
+    trailing marker when a subagent is resumed and re-appends it when the run finishes,
+    so a missing one means the latest run has not finished."""
+    with _ENDED_LOCK:
+        hit = _ENDED_CACHE.get(path)
+        if hit and hit[0] == mtime:
+            return hit[1]
+    ended = True
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read().decode("utf-8", "replace")
+        for line in reversed(tail.splitlines()):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            ended = obj.get("type") == "turn_ended"
+            break
+    except Exception:
+        ended = True
+    with _ENDED_LOCK:
+        _ENDED_CACHE[path] = (mtime, ended)
+    return ended
+
+
+def _running_sub_files(sub_files, cursor_subs=False):
+    """The subagents that count as running: written within SUBAGENT_ACTIVE_SECONDS, or (Cursor
+    only) whose latest run is unfinished -- no trailing ``turn_ended`` and Cursor's
+    ``unfinishedRunAt`` flag not cleared -- and written within WORKING_STALE_CAP_SECONDS.
+    The second rule catches a background subagent busy in one long tool call, which writes
+    nothing for many minutes after the parent's own turn has ended."""
+    if not sub_files:
+        return []
+    now = time.time()
+    running, unfinished = [], []
+    for path, m in sub_files:
+        age = now - m
+        if age <= SUBAGENT_ACTIVE_SECONDS:
+            running.append((path, m))
+        elif cursor_subs and age <= WORKING_STALE_CAP_SECONDS and not _transcript_ended(path, m):
+            unfinished.append((path, m))
+    if unfinished:
+        ids = [os.path.splitext(os.path.basename(p))[0] for p, _ in unfinished]
+        flags = cursor_runs_in_flight(ids)
+        running.extend(pm for pm, u in zip(unfinished, ids) if flags.get(u) is not False)
+    return running
 
 
 def _first_user_text(path):
@@ -609,18 +1532,220 @@ def _sub_activity(path):
     return (bub_txt, bub_kind, last_tool, last_message)
 
 
-def _subagent_infos(sub_files):
+# ---- helper (subagent) hover-card fields ------------------------------------------------
+# A Cursor subagent's short title is the `description` its parent passed to the Task tool;
+# Cursor stores it as the subagent's own composerData:<sub-uuid>.name (exact-key lookup, so
+# it's cheap even on the huge state DB). Claude subagents carry it in <name>.meta.json.
+_SUB_META_CACHE = {}              # sub uuid -> (name, created_epoch, fetched_at)
+_SUB_META_LOCK = threading.Lock()
+_SUB_META_MISS_TTL = 60           # a found name never changes; only re-check misses
+
+_TS_PREFIX_RE = re.compile(
+    r"^(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+)?"
+    r"(?:[a-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})"
+    r"(?:[,\sT]+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\s*(?:am|pm)?)?"
+    r"\s*(?:\(?(?:utc|gmt)[^)\s]*\)?)?[\s,.:\-]*", re.IGNORECASE)
+_WORK_IN_RE = re.compile(
+    r"^you(?:'re| are)? work(?:ing)? in (?:the )?.{0,80}?\brepo(?:sitory)?\b"
+    r"(?: at \S+)?(?:\s*\([^)]*\)?)?[\s.,:;]*", re.IGNORECASE)
+_SYS_BLOCK_RE = re.compile(r"<(system[\w-]*|user_info|rules?)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_STEP_PREFIX_RE = re.compile(
+    r"^(?:phase|step|part|stage|task)\s*\d+(?:\s*(?:of|/)\s*\d+)?\s*[:.)\-\u2013\u2014]+\s*", re.IGNORECASE)
+_GENERIC_HEADINGS = {"context", "task", "background", "instructions", "goal", "goals", "overview",
+                     "summary", "role", "your task", "objective", "constraints", "notes"}
+
+
+def _cursor_sub_meta(sub_id):
+    """(name, created_epoch) for a Cursor subagent from composerData:<sub_id>; ("", 0.0)
+    when unknown. Exact-key read-only lookup, cached (found names permanently)."""
+    now = time.time()
+    with _SUB_META_LOCK:
+        hit = _SUB_META_CACHE.get(sub_id)
+        if hit and (hit[0] or (now - hit[2]) < _SUB_META_MISS_TTL):
+            return hit[0], hit[1]
+    name, created = "", 0.0
+    try:
+        if os.path.isfile(CURSOR_GLOBAL_DB):
+            conn = _open_cursor_db()
+            try:
+                row = conn.execute(
+                    "SELECT json_extract(value,'$.name'), json_extract(value,'$.createdAt')"
+                    " FROM cursorDiskKV WHERE key=?", ("composerData:" + sub_id,)).fetchone()
+            finally:
+                conn.close()
+            if row:
+                name = row[0].strip() if isinstance(row[0], str) else ""
+                created = row[1] / 1000.0 if isinstance(row[1], (int, float)) and row[1] > 0 else 0.0
+    except Exception:
+        logger.debug("subagent composerData lookup failed", exc_info=True)
+    with _SUB_META_LOCK:
+        if len(_SUB_META_CACHE) > 4000:
+            _SUB_META_CACHE.clear()
+        _SUB_META_CACHE[sub_id] = (name, created, now)
+    return name, created
+
+
+def _clean_helper_title(s, limit=40):
+    """A short, human label from a subagent title or prompt: the first meaningful line with
+    timestamps, "You work in the X repo at ..." preambles, <system...> blocks, "PHASE 1 OF 2:"
+    prefixes and markdown stripped, truncated on a word boundary to ~`limit` chars."""
+    s = _SYS_BLOCK_RE.sub(" ", str(s or ""))
+    s = _clean_text(s)
+    for raw in s.split("\n"):
+        ln = raw.strip()
+        heading = ln.startswith("#")
+        for _ in range(4):
+            prev = ln
+            ln = re.sub(r"^(?:#{1,6}\s*|[-*+>]\s+|\d+[.)]\s+)", "", ln).strip()
+            ln = _TS_PREFIX_RE.sub("", ln, count=1).strip() if _TS_PREFIX_RE.match(ln) else ln
+            ln = _WORK_IN_RE.sub("", ln, count=1).strip()
+            ln = _STEP_PREFIX_RE.sub("", ln, count=1).strip()
+            if ln == prev:
+                break
+        ln = re.sub(r"\*\*|__|`|~~", "", ln)
+        ln = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", ln).strip(" \t-:;,.")
+        if not ln or not re.search(r"[A-Za-z]", ln):
+            continue
+        if (heading or ln.endswith(":")) and ln.rstrip(":").strip().lower() in _GENERIC_HEADINGS:
+            continue
+        if ln.lower() in ("new chat", "untitled", "new agent"):
+            continue
+        if len(ln) > limit:
+            cut = ln[:limit + 1].rsplit(" ", 1)[0]
+            ln = (cut if len(cut) >= limit * 0.6 else ln[:limit]).rstrip(" ,.;:-") + "\u2026"
+        return ln[:1].upper() + ln[1:]
+    return ""
+
+
+_SHELL_DROP_SEGMENT = {"cd", "pushd", "popd", "export", "source", ".", "set", "unset", "fi", "done",
+                       "true", ":", "echo"}
+_SHELL_WRAPPERS = {"sudo", "env", "time", "nohup", "exec", "then", "do", "if", "else", "while", "command"}
+
+
+def _cmd_words(cmd, cap=3):
+    """The first word of each command in a shell line ("sleep 5; ls -la && cd x" -> sleep, ls),
+    skipping cd/env/VAR=val noise. Only bare program names -- never arguments or paths."""
+    words = []
+    for seg in re.split(r"&&|\|\||[;|\n]|\$\(|`", str(cmd or "")):
+        for tok in seg.strip().lstrip("({").split():
+            tok = tok.strip("'\"")
+            if not tok or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok) or tok.lower() in _SHELL_WRAPPERS:
+                continue
+            if tok.lower() in _SHELL_DROP_SEGMENT:
+                break
+            tok = os.path.basename(tok)
+            if re.match(r"^[A-Za-z][A-Za-z0-9._+-]{0,15}$", tok) and tok not in words:
+                words.append(tok)
+            break
+        if len(words) >= cap:
+            break
+    return words
+
+
+def _tool_plain(name, inp):
+    """One plain-English line (with an emoji) for a tool call, e.g. "✏️ editing sync.py"."""
+    inp = inp if isinstance(inp, dict) else {}
+    n = str(name or "")
+    low = n.lower()
+    def base(*keys):
+        for k in keys:
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                return os.path.basename(v.strip().rstrip("/")) or v.strip()
+        return ""
+    if low in ("shell", "bash", "run_terminal_command_v2", "run_terminal_cmd", "powershell"):
+        w = _cmd_words(inp.get("command"))
+        return "\U0001F5A5\uFE0F running: " + ", ".join(w) if w else "\U0001F5A5\uFE0F running a shell command"
+    if low in ("awaitshell", "await", "bashoutput", "killshell", "killbash"):
+        return "\u23F3 waiting on a shell"
+    if low in ("strreplace", "edit", "multiedit", "edit_file_v2", "edit_file", "search_replace",
+               "notebookedit", "editnotebook", "apply_patch"):
+        f = base("path", "file_path", "notebook_path", "target_file")
+        return "\u270F\uFE0F editing " + f if f else "\u270F\uFE0F editing a file"
+    if low in ("write", "write_file"):
+        f = base("path", "file_path", "target_file")
+        return "\U0001F4DD writing " + f if f else "\U0001F4DD writing a file"
+    if low in ("read", "read_file_v2", "read_file"):
+        f = base("path", "file_path", "target_file")
+        return "\U0001F4D6 reading " + f if f else "\U0001F4D6 reading a file"
+    if low in ("delete", "delete_file"):
+        f = base("path", "file_path", "target_file")
+        return "\U0001F5D1\uFE0F deleting " + f if f else "\U0001F5D1\uFE0F deleting a file"
+    if low in ("grep", "glob", "semanticsearch", "ripgrep_raw_search", "glob_file_search",
+               "codebase_search", "grep_search", "file_search", "ls", "list_dir"):
+        return "\U0001F50D searching the code"
+    if low in ("webfetch", "web_fetch", "fetch"):
+        return "\U0001F310 fetching a web page"
+    if low in ("websearch", "web_search"):
+        return "\U0001F310 searching the web"
+    if low in ("task", "agent", "task_v2"):
+        return "\U0001F916 launched a helper"
+    if low in ("todowrite", "todo_write"):
+        return "\U0001F4CB updating the to-do list"
+    if low in ("askquestion", "ask_question", "askuserquestion"):
+        return "\u2753 asking you a question"
+    if low in ("readlints", "read_lints"):
+        return "\U0001F9F9 checking lints"
+    if low in ("calldynamictool", "getdynamictools", "fetchmcpresource") or low.startswith(("mcp", "mcp__")):
+        return "\U0001F50C using an integration"
+    words = re.sub(r"([a-z])([A-Z])", r"\1 \2", n).replace("_", " ").replace("-", " ").lower().split()
+    return "\U0001F6E0\uFE0F using " + (" ".join(words)[:24] or "a tool")
+
+
+def _sub_last_tool_plain(path, tail_bytes=262144):
+    """Plain-English line for a transcript's most recent tool call ("" when none). Reads only
+    the file's tail."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return ""
+    for line in reversed(lines):
+        if '"tool_use"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        c = (o.get("message") or {}).get("content")
+        if c is None:
+            c = o.get("content")
+        if isinstance(c, list):
+            for b in reversed(c):
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    return _tool_plain(b.get("name"), b.get("input"))
+    return ""
+
+
+def _file_started(path):
+    try:
+        st = os.stat(path)
+        return float(getattr(st, "st_birthtime", 0) or min(st.st_ctime, st.st_mtime))
+    except OSError:
+        return 0.0
+
+
+def _sub_card_fields(path, sub_id, title_src="", cursor_sub=False):
+    """Extra fields for the helper hover card: a clean short `title`, the last tool as plain
+    English (`doing`) and the run's start time (`started`, epoch s)."""
+    name, created = _cursor_sub_meta(sub_id) if cursor_sub else ("", 0.0)
+    title = _clean_helper_title(name) or _clean_helper_title(title_src)
+    return {"title": title, "doing": _sub_last_tool_plain(path),
+            "started": created or _file_started(path)}
+
+
+def _subagent_infos(sub_files, cursor_subs=False):
     """For the *currently running* subagents, return [{type, detail}] describing what
     each is doing. Claude subagents carry a sibling ``<name>.meta.json`` with an
     ``agentType`` + ``description``; otherwise we fall back to the subagent's opening
     prompt. Sorted by path so a given subagent keeps the same helper slot."""
     if not sub_files:
         return []
-    now = time.time()
     infos = []
-    for path, m in sorted(sub_files, key=lambda pm: pm[0]):
-        if (now - m) > SUBAGENT_ACTIVE_SECONDS:
-            continue
+    for path, m in sorted(_running_sub_files(sub_files, cursor_subs), key=lambda pm: pm[0]):
         typ, detail = "", ""
         meta = (path[:-len(".jsonl")] + ".meta.json") if path.endswith(".jsonl") else path + ".meta.json"
         try:
@@ -637,7 +1762,50 @@ def _subagent_infos(sub_files):
         bub_txt, bub_kind, last_tool, last_message = _sub_activity(path)
         infos.append({"type": typ, "detail": detail[:140], "id": sub_id,
                       "last_msg": bub_txt[:160], "last_kind": bub_kind,
-                      "last_tool": last_tool, "last_message": last_message, "ts": m})
+                      "last_tool": last_tool, "last_message": last_message, "ts": m,
+                      **_sub_card_fields(path, sub_id, detail, cursor_subs)})
+    return infos
+
+
+def _untranscribed_subagents(parent_uuid, sub_files):
+    """Placeholder helpers for a Cursor parent's subagents whose run is in flight per
+    composerData.unfinishedRunAt but that have no transcript yet (Cursor creates a subagent's
+    .jsonl some ~45 s into its run). Two indexed reads: the parent's subagentComposerIds,
+    then the children not on disk in one ``key IN (...)`` -- both via cursor_run_info's cache."""
+    pinfo = cursor_run_info([parent_uuid]).get(parent_uuid)
+    if not pinfo or not pinfo.get("sub_ids"):
+        return []
+    on_disk = {os.path.splitext(os.path.basename(p))[0] for p, _m in (sub_files or [])}
+    cands = [u for u in pinfo["sub_ids"] if u not in on_disk]
+    if not cands:
+        return []
+    now = time.time()
+    writers = cursor_recent_writers()
+    out = []
+    for u, info in cursor_run_info(cands).items():
+        if not info or not info["run_at"] or info["parent"] not in ("", parent_uuid):
+            continue
+        last = max(info["run_at"], writers.get(u, 0.0))
+        if (now - last) > WORKING_STALE_CAP_SECONDS:
+            continue
+        name, created = _cursor_sub_meta(u)
+        out.append({"type": info.get("sub_type") or "", "detail": "", "id": u,
+                    "last_msg": "", "last_kind": "", "last_tool": "", "last_message": "",
+                    "ts": last, "title": _clean_helper_title(name), "doing": "",
+                    "started": created or (info["run_at"] if info["run_at"] > 1.0 else 0.0),
+                    "no_transcript": True})
+    if out:
+        logger.debug("untranscribed subagents for %s: %d of %d candidates", parent_uuid, len(out), len(cands))
+    return sorted(out, key=lambda s: s["id"])
+
+
+def _cursor_helpers(parent_uuid, sub_files, live=False, working=False):
+    """Running helpers for a Cursor parent: transcript-based ones plus, while the parent is in
+    flight / working, in-flight subagents with no transcript yet (deduped by uuid)."""
+    infos = _subagent_infos(sub_files, True)
+    if live or working or infos:
+        seen = {s["id"] for s in infos}
+        infos += [s for s in _untranscribed_subagents(parent_uuid, sub_files) if s["id"] not in seen]
     return infos
 
 
@@ -723,11 +1891,11 @@ def _open_shells_claude(path, cap=6):
     return out
 
 
-def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0):
+def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0, cursor_subs=False):
     """Office (working) vs kitchen (waiting), decided by TURN STATE + rollups.
 
     Working when the latest turn is still in progress, OR a background subagent
-    was written very recently (multitask: parent idle, worker running), OR a dynamic
+    is running per ``_running_sub_files`` (multitask: parent idle, worker running), OR a dynamic
     Workflow's files were written very recently (the Workflow tool returns immediately
     after launch, so the parent's own turn ends while its subagents are still running).
     Either way a turn completely silent past the staleness cap is considered abandoned
@@ -746,8 +1914,7 @@ def _is_working(turn_in_progress, eff_mtime, sub_files, wf_latest=0.0):
         if turn_in_progress == "reply" and (now - eff) > REPLY_STALE_SECONDS:
             return False
         return True
-    latest_sub = _latest_sub_mtime(sub_files)
-    if latest_sub and (now - latest_sub) <= SUBAGENT_ACTIVE_SECONDS:
+    if _running_sub_files(sub_files, cursor_subs):
         return True
     # a dynamic Workflow whose journal / agent transcripts were touched within the
     # freshness window keeps the parent "working" even though its own turn has ended.
@@ -922,7 +2089,7 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
             break
 
     turn_in_progress = _turn_in_progress(events)
-    status = "working" if _is_working(turn_in_progress, mtime, sub_files) else "waiting"
+    status = "working" if _is_working(turn_in_progress, mtime, sub_files, cursor_subs=True) else "waiting"
     msg_count = sum(1 for e in events if e["kind"] in ("user", "assistant"))
 
     # what the agent is doing *right now*: most recent assistant text, else the
@@ -957,6 +2124,7 @@ def parse_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "message_count": msg_count,
         "mtime": mtime,
         "last_activity_rel": _rel_time(time.time() - mtime),
+        "_ask_msg": _message_question(uuid, events),
         "_full": False,
     }
 
@@ -1053,6 +2221,7 @@ def _normalize_events_claude(path):
                 content = msg.get("content") or []
                 texts = []
                 tools = []
+                ask = None
                 is_tool_result = False
                 if isinstance(content, str):
                     texts.append(content)
@@ -1068,6 +2237,12 @@ def _normalize_events_claude(path):
                                 "name": block.get("name", "tool"),
                                 "detail": _tool_detail(block.get("name", ""), block.get("input")),
                             })
+                            if block.get("name") == "AskUserQuestion":
+                                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                                qs = [q for q in (inp.get("questions") or []) if isinstance(q, dict)]
+                                ask = {"id": block.get("id") or "", "count": len(qs),
+                                       "preview": _short_preview(_clean_text(
+                                           next((q.get("question") or "" for q in qs), "")))}
                         elif btype == "tool_result":
                             is_tool_result = True
                 injected = False
@@ -1088,6 +2263,7 @@ def _normalize_events_claude(path):
                     "tools": tools,
                     "is_tool_result": is_tool_result,
                     "injected": injected,
+                    "ask": ask,
                 })
     except Exception:
         pass
@@ -1123,6 +2299,21 @@ def _turn_in_progress_claude(events):
             return "tool"
         return "reply"         # a plain user message with no reply yet -> agent owes a reply
     return ""                  # no conversation yet
+
+
+def _pending_ask_claude(uuid, events):
+    """Claude Code's AskUserQuestion blocks the turn until the user picks an answer, which
+    lands as its tool_result. Pending = the latest real event is an assistant AskUserQuestion
+    tool_use (injected user-role lines skipped, a tool_result or interrupt ends it)."""
+    for e in reversed(events):
+        if e["kind"] == "user" and e.get("injected"):
+            continue
+        if e["kind"] != "assistant" or not e.get("ask"):
+            return None
+        ask = e["ask"]
+        return {"asking": "form", "question_id": _fingerprint(uuid, ask["id"]),
+                "question_preview": ask["preview"], "question_count": ask["count"]}
+    return None
 
 
 # user-role transcript lines that aren't something the user actually typed: slash commands,
@@ -1264,6 +2455,8 @@ def parse_claude_agent(uuid, project, path, mtime, sub_files=None, full=False):
         "spend": usage["spend"],
         "mtime": mtime,
         "last_activity_rel": _rel_time(time.time() - mtime),
+        "_ask_form": _pending_ask_claude(uuid, events),
+        "_ask_msg": _message_question(uuid, events, skip_injected=True),
         "_full": False,
     }
 
@@ -1615,12 +2808,14 @@ def _workflow_progress(run_dir):
             bub_txt, bub_kind, last_tool, last_message = _sub_activity(ap)
             pending.append({"type": "workflow-subagent", "_prompt": _first_user_text(ap),
                             "id": best_aid, "last_msg": bub_txt[:160], "last_kind": bub_kind,
-                            "last_tool": last_tool, "last_message": last_message, "ts": best_am})
+                            "last_tool": last_tool, "last_message": last_message, "ts": best_am,
+                            "doing": _sub_last_tool_plain(ap), "started": _file_started(ap)})
     # de-boilerplate the sibling prompts together so each dwarf reads distinctly
     details = _distinctive_details([p.pop("_prompt") for p in pending])
     active = []
     for p, d in zip(pending, details):
         p["detail"] = d or "workflow subagent"
+        p["title"] = _clean_helper_title(p["detail"])
         active.append(p)
     return {
         "total": base["total"],
@@ -1763,12 +2958,77 @@ def _enabled_sources(sources):
     return [s for s in _SOURCES if s[0] in want]
 
 
+def _cursor_project_folder(fs_path):
+    """Cursor's ~/.cursor/projects/<folder> name for a workspace path."""
+    folder = re.sub(r"[^A-Za-z0-9]+", "-", fs_path or "").strip("-")
+    return folder or "empty-window"
+
+
+def _untranscribed_cursor_agent(uuid, info, live_at):
+    """A WORKING placeholder for a Cursor chat whose run is in flight but which has no
+    transcript yet (a new chat's .jsonl is only created when its first turn ends)."""
+    project = _cursor_project_folder(info.get("folder"))
+    title = info.get("name") or "(new chat)"
+    if len(title) > 70:
+        title = title[:67].rstrip() + "..."
+    subs = _untranscribed_subagents(uuid, [])
+    return {
+        "id": uuid,
+        "source": "cursor",
+        "scheduled": False,
+        "name": _name_for(uuid),
+        "variant": _variant_for(uuid),
+        "project": _pretty_project(project),
+        "_project_folder": project,
+        "status": "working",
+        "turn_in_progress": True,
+        "run_in_flight": True,
+        "no_transcript": True,
+        "title": title,
+        "preview": title,
+        "latest": "working on the first turn (transcript not written yet)",
+        "latest_kind": "task",
+        "last_tool": "",
+        "last_message": "",
+        "message_count": 0,
+        "mtime": live_at,
+        "last_activity_rel": _rel_time(time.time() - live_at),
+        "_full": False,
+        "workflows": [],
+        "wf_running_agents": 0,
+        "self_active": True,
+        "subagents": subs,
+        "subs": len(subs),
+        "shells": [],
+        "listening": [],
+    }
+
+
+def _untranscribed_cursor_agents(live, live_infos, transcribed_ids):
+    with _KNOWN_SUBAGENT_LOCK:
+        known_subs = set(_KNOWN_SUBAGENT_IDS)
+    out = []
+    for u, live_at in live.items():
+        info = live_infos.get(u) or {}
+        if u in transcribed_ids or u in known_subs or info.get("parent"):
+            continue
+        out.append(_untranscribed_cursor_agent(u, info, live_at))
+    return out
+
+
 def get_agents(hours, full=False, project_filter=None, sources=None):
     cutoff = time.time() - hours * 3600
     agents = []
-    for _src, discover, parse in _enabled_sources(sources):
+    enabled = _enabled_sources(sources)
+    live, live_infos = cursor_live_runs() if any(s[0] == "cursor" for s in enabled) else ({}, {})
+    cursor_ids = set()
+    listen_paths = {}
+    for _src, discover, parse in enabled:
         for uuid, project, path, mtime, _sub_files in discover():
-            if mtime < cutoff:
+            live_at = live.get(uuid, 0.0) if _src == "cursor" else 0.0
+            if _src == "cursor":
+                cursor_ids.add(uuid)
+            if max(mtime, live_at) < cutoff:
                 continue
             a = parse(uuid, project, path, mtime, sub_files=_sub_files, full=full)
             if not _project_matches(project_filter, project, a["project"]):
@@ -1784,24 +3044,101 @@ def get_agents(hours, full=False, project_filter=None, sources=None):
             # recompute status fresh each request: parse is cached, but working/
             # kitchen depends on wall-clock (the staleness cap + subagent freshness)
             # vs the turn state, so it can change even when the transcript hasn't.
-            a["status"] = "working" if _is_working(a.get("turn_in_progress"), mtime, _sub_files, wf_latest) else "waiting"
+            cursor_subs = _src == "cursor"
+            # `a` is the parse cache's dict: the live-run overlay goes in separate keys
+            # recomputed every request, never into the cached turn_in_progress.
+            own_turn = bool(live_at) or (bool(a.get("turn_in_progress"))
+                                         and not (cursor_subs and cursor_run_finished(uuid)))
+            eff = max(mtime, live_at)
+            a["run_in_flight"] = bool(live_at)
+            a["mtime"] = eff
+            a["status"] = "working" if _is_working(own_turn, eff, _sub_files, wf_latest,
+                                                   cursor_subs) else "waiting"
             # parent is "self active" only while its OWN turn is in progress; when it's merely
             # working because a subagent/workflow is live, the desk should stop typing (item 8).
-            a["self_active"] = bool(a.get("turn_in_progress")) and a["status"] == "working"
-            a["last_activity_rel"] = _rel_time(time.time() - mtime)
-            a["subagents"] = _subagent_infos(_sub_files)   # running subagents -> little helpers
+            a["self_active"] = own_turn and a["status"] == "working"
+            a["last_activity_rel"] = _rel_time(time.time() - eff)
+            # running subagents -> little helpers
+            a["subagents"] = (_cursor_helpers(uuid, _sub_files, bool(live_at), a["status"] == "working")
+                              if cursor_subs else _subagent_infos(_sub_files))
             a["subs"] = len(a["subagents"])
             # open background shells (Claude only) -> little terminal windows. A background
             # shell survives the turn, so show it whether the chat is at a desk (working) or
             # in the kitchen (waiting) -- but not for archived/beach agents. Only genuinely-
             # running ones become sprites.
+            if _src == "claude":
+                _overlay_claude_ask(a, eff)
             if _src == "claude" and a["status"] in ("working", "waiting"):
                 a["shells"] = [s for s in _open_shells_claude(path) if s["running"]][:3]
             else:
                 a["shells"] = []
+            a["listening"] = []
+            if _src == "cursor":
+                listen_paths[uuid] = path
             agents.append(a)
+    if listen_paths:
+        listening = cursor_listening(listen_paths)
+        for a in agents:
+            if a["source"] == "cursor":
+                a["listening"] = listening.get(a["id"]) or []
+    if any(s[0] == "cursor" for s in enabled):
+        for a in _untranscribed_cursor_agents(live, live_infos, cursor_ids):
+            if a["mtime"] >= cutoff and _project_matches(project_filter, a["_project_folder"], a["project"]):
+                agents.append(a)
+        _overlay_cursor_asks([a for a in agents if a["source"] == "cursor"], live)
+        for a in _untranscribed_asking_cursor_agents(live, cursor_ids):
+            if _project_matches(project_filter, a["_project_folder"], a["project"]):
+                agents.append(a)
     agents.sort(key=lambda a: a["mtime"], reverse=True)
     return agents
+
+
+def _overlay_claude_ask(a, eff):
+    fresh = (time.time() - eff) <= ASK_RECENT_SECONDS
+    ask = a.get("_ask_form") if fresh else None
+    if not ask and a["status"] == "waiting":
+        ask = a.get("_ask_msg")
+    _apply_ask(a, ask, eff)
+
+
+def _overlay_cursor_asks(cursor_agents, live):
+    """Batch the form lookup over Cursor chats in flight or active within ASK_RECENT_SECONDS;
+    the rest only get the (transcript-only) message heuristic."""
+    now = time.time()
+    cands = [a["id"] for a in cursor_agents
+             if a.get("run_in_flight") or (now - a["mtime"]) <= ASK_RECENT_SECONDS]
+    forms = cursor_pending_forms(cands, live.keys()) if cands else {}
+    for a in cursor_agents:
+        ask = forms.get(a["id"])
+        if not ask and a["status"] == "waiting":
+            ask = a.get("_ask_msg")
+        _apply_ask(a, ask, a["mtime"])
+
+
+def _untranscribed_asking_cursor_agents(live, transcribed_ids):
+    """Kitchen placeholders for chats that wrote to Cursor's DB recently, have no transcript
+    and are not in flight, yet are blocked on a pending form -- a new chat's first turn ends
+    at the form, so no .jsonl exists until it is answered."""
+    writers = cursor_recent_writers()
+    with _KNOWN_SUBAGENT_LOCK:
+        known_subs = set(_KNOWN_SUBAGENT_IDS)
+    cands = [u for u in writers if u not in transcribed_ids and u not in live and u not in known_subs]
+    if not cands:
+        return []
+    infos = cursor_run_info(cands)
+    cands = [u for u in cands if infos.get(u) and not infos[u]["parent"]]
+    forms = cursor_pending_forms(cands) if cands else {}
+    out = []
+    for u in cands:
+        ask = forms.get(u)
+        if not ask:
+            continue
+        a = _untranscribed_cursor_agent(u, infos[u], ask["asked_at"] or time.time())
+        a.update({"status": "waiting", "turn_in_progress": False, "run_in_flight": False,
+                  "latest": "waiting for your answer to a question form (transcript not written yet)"})
+        _apply_ask(a, ask, a["mtime"])
+        out.append(a)
+    return out
 
 
 def list_projects(hours, sources=None):
@@ -1821,6 +3158,7 @@ def list_projects(hours, sources=None):
 
 
 def get_agent_detail(uuid):
+    live, live_infos = cursor_live_runs()
     for _src, discover, parse in _SOURCES:
         for u, project, path, mtime, _sub_files in discover():
             if u == uuid:
@@ -1830,13 +3168,36 @@ def get_agent_detail(uuid):
                 else:
                     wf_runs, wf_latest = [], 0.0
                 d["workflows"] = wf_runs
-                d["status"] = "working" if _is_working(d.get("turn_in_progress"), mtime, _sub_files, wf_latest) else "waiting"
-                d["last_activity_rel"] = _rel_time(time.time() - mtime)
-                d["subagents"] = _subagent_infos(_sub_files)
+                cursor_subs = _src == "cursor"
+                live_at = live.get(uuid, 0.0) if cursor_subs else 0.0
+                eff = max(mtime, live_at)
+                d["run_in_flight"] = bool(live_at)
+                d["mtime"] = eff
+                own_turn = bool(live_at) or (bool(d.get("turn_in_progress"))
+                                             and not (cursor_subs and cursor_run_finished(uuid)))
+                d["status"] = "working" if _is_working(own_turn, eff, _sub_files, wf_latest,
+                                                       cursor_subs) else "waiting"
+                d["last_activity_rel"] = _rel_time(time.time() - eff)
+                d["subagents"] = (_cursor_helpers(uuid, _sub_files, bool(live_at), d["status"] == "working")
+                                  if cursor_subs else _subagent_infos(_sub_files))
                 d["subs"] = len(d["subagents"])
                 d["shells"] = ([s for s in _open_shells_claude(path) if s["running"]][:3]
                                if _src == "claude" else [])
+                if cursor_subs:
+                    _overlay_cursor_asks([d], live)
+                else:
+                    _overlay_claude_ask(d, eff)
+                d["listening"] = (cursor_listening({uuid: path}).get(uuid) or []) if cursor_subs else []
                 return d
+    if uuid in live:
+        agents = _untranscribed_cursor_agents({uuid: live[uuid]}, live_infos, set())
+        _overlay_cursor_asks(agents, live)
+    else:
+        agents = [a for a in _untranscribed_asking_cursor_agents(live, set()) if a["id"] == uuid]
+    if agents:
+        agents[0].update({"task_full": agents[0]["title"], "latest_response": "", "latest_tool": None,
+                          "timeline": [], "transcript_path": "", "_full": True})
+        return agents[0]
     return None
 
 
@@ -1862,6 +3223,7 @@ def _demo_working_agents(n, now):
             "subagents": [],
             "subs": 0,
             "shells": [],
+            "listening": [],
             "workflows": [],
             "wf_running_agents": 0,
             "self_active": True,
@@ -1895,9 +3257,13 @@ def demo_agents():
     # slow, staggered clock so the office shows the odd bubble popping -- not a wall of them.
     def _blip(off, period=15):
         return int((now + off) // period)
-    subs_a = [{"type": "general-purpose", "detail": "Review the working diff for bugs",
+    subs_a = [{"type": "general-purpose",
+               "detail": "Thursday, Nov 26, 2026, 11:33 AM (UTC+2) You work in the demo repo at "
+                         "/tmp/demo-repo (GitHub: acme/demo). PHASE 1 OF 2: Review the working diff for bugs",
                "id": "demoA-0", "last_msg": "Grep: export path (%d)" % _blip(0), "last_kind": "tool",
-               "last_tool": "Grep: export path", "last_message": "scanning for the config loader", "ts": now},
+               "last_tool": "Grep: export path",
+               "last_message": "**Found the culprit:** the `export` config loader reads the settings file twice on "
+                               "every request, which explains the drift. Next I'll check the cache layer.", "ts": now},
               {"type": "test-runner", "detail": "Run the unit test suite",
                "id": "demoA-1", "last_msg": "unit suite green, pass %d" % _blip(5), "last_kind": "assistant",
                "last_tool": "Bash: pytest -q", "last_message": "unit suite green, all 42 pass", "ts": now}]
@@ -1928,6 +3294,11 @@ def demo_agents():
                     "id": "demoW-2", "last_msg": "WebFetch: cve database (%d)" % _blip(14), "last_kind": "tool",
                     "last_tool": "WebFetch: nvd.nist.gov", "last_message": "cross-checking against the CVE list", "ts": now}],
     }]
+    for i, s in enumerate(subs_a + subs_e + wf_demo[0]["active"]):
+        tname, _, tdet = s["last_tool"].partition(": ")
+        s["title"] = _clean_helper_title(s["detail"])
+        s["doing"] = _tool_plain(tname, {"command": tdet, "path": tdet})
+        s["started"] = now - 75 - 140 * i
     samples = [
         ("demo-aaaa-0001", "working", "Refactor the data export pipeline", 120, "cursor", False, subs_a, []),
         ("demo-bbbb-0002", "working", "Add pagination to the users API endpoint", 600, "claude", False, [], []),
@@ -1937,7 +3308,21 @@ def demo_agents():
         ("demo-hhhh-0008", "working", "Audit the payments service for vulnerabilities", 45, "claude", False, [], wf_demo),
         ("demo-ffff-0006", "waiting", "Daily production error monitor", 9000, "claude", True, [], []),
         ("demo-gggg-0007", "waiting", "Nightly dependency update check", 12000, "claude", True, [], []),
+        ("demo-iiii-0009", "waiting", "Choose the CSV export format", 40, "cursor", False, [], []),
+        # "working" on purpose: a form blocks the run, and asking must override WORKING
+        ("demo-jjjj-0010", "working", "Plan the auth token migration", 30, "claude", False, [], []),
+        ("demo-kkkk-0011", "waiting", "Pick a caching strategy for the reports", 300, "cursor", False, [], []),
+        ("demo-llll-0012", "waiting", "Tidy up the README badges", 200, "claude", False, [], []),
     ]
+    # "waiting on you" demo: (kind, seconds since asked, preview, question count, demo_snoozed).
+    # Ages span the three escalation tiers (<2m, 2-10m, >10m).
+    demo_asks = {
+        "demo-iiii-0009": ("form", 40, "Export format: Which delimiter should the CSV export use?", 2, False),
+        "demo-jjjj-0010": ("form", 960, "Migration plan: Rotate all tokens at once, or migrate per tenant?", 3, False),
+        "demo-kkkk-0011": ("form", 300, "Cache: Should report results be cached in Redis or in Postgres?", 2, True),
+        "demo-cccc-0003": ("message", 1500, "Should I clear the archived flag on the restored records?", 1, False),
+        "demo-llll-0012": ("message", 200, "Want me to open a PR with these badge fixes?", 1, False),
+    }
     # demo open background shells (little terminal windows by the desk): one clean single
     # shell, a 3-shell max case (alongside helper dwarves), and a 2-shell case (alongside a
     # workflow easel) so QA covers coexistence with both neighbours.
@@ -1961,6 +3346,26 @@ def demo_agents():
         "demo-dddd-0004": [
             {"id": "sh-d1", "command": "pytest -q --looponfail tests/importer", "running": True,
              "output_tail": "watching for changes... / 12 passed in 0.42s"}],
+    }
+    # demo "listening" subscriptions: a desk worker on a PR + its CI (a fresh event every
+    # 90s keeps the pulse visible), a kitchen agent on a Slack thread, and an asker with both
+    # kinds so the glyphs sit beside the knock bubble / "not now" chip.
+    def _li(kind, sub, label, detail, url, expires_in, event_ago):
+        return {"kind": kind, "sub": sub, "label": label, "detail": detail, "url": url,
+                "expires_at": now + expires_in, "last_event_at": (now - event_ago) if event_ago is not None else None}
+    pulse_ago = now % 90
+    demo_listening = {
+        "demo-aaaa-0001": [
+            _li("github", "pr", "PR #482 acme/data-export", "", "https://github.com/acme/data-export/pull/482", 3 * 86400, pulse_ago),
+            _li("github", "ci", "CI on feature/export-v2", "acme/data-export \u00b7 last: failure", "", 7200, 1800)],
+        "demo-cccc-0003": [
+            _li("slack", "thread", "thread in #support-escalations", "Ana Ruiz, Ben Cole", "", 86400, 600)],
+        "demo-kkkk-0011": [
+            _li("slack", "channel", "#reports-team", "Dana Kim", "", 20 * 3600, 5),
+            _li("github", "pr", "PR #77 acme/reports", "", "https://github.com/acme/reports/pull/77", 30 * 86400, None)],
+        "demo-iiii-0009": [
+            _li("linear", "issue", "Linear SEC-142", "", "", 5 * 86400, None),
+            _li("origin", "pr", "PR #12 acme/payments", "", "", 3 * 86400, None)],
     }
     out = []
     for idx, (uuid, status, title, ago, source, scheduled, subagents, workflows) in enumerate(samples):
@@ -1995,6 +3400,7 @@ def demo_agents():
             "subagents": subagents,
             "subs": len(subagents),
             "shells": demo_shells.get(uuid, []),
+            "listening": demo_listening.get(uuid, []),
             "workflows": workflows,
             "wf_running_agents": sum(w["running"] for w in workflows),
             # a working parent that has helpers/workflows running is NOT typing itself
@@ -2019,6 +3425,17 @@ def demo_agents():
             "last_activity_rel": _rel_time(ago),
             "demo": True,
         })
+        ask = demo_asks.get(uuid)
+        if ask:
+            kind, ask_ago, preview, count, snoozed = ask
+            if kind == "message":
+                out[-1].update({"latest": preview, "latest_kind": "assistant", "last_message": preview})
+            _apply_ask(out[-1], {"asking": kind, "asked_at": now - ask_ago,
+                                 "question_id": _fingerprint(uuid, "demo-q"),
+                                 "question_preview": preview, "question_count": count}, now - ask_ago)
+            out[-1]["demo_snoozed"] = snoozed
+        else:
+            _apply_ask(out[-1], None, None)
     return out
 
 
@@ -2113,6 +3530,16 @@ PAGE = r"""<!DOCTYPE html>
   #hud{position:absolute;left:0;top:0;display:flex;flex-direction:column;align-items:flex-start;
     gap:4px;padding:6px 8px;font-size:8px;color:#fff;pointer-events:none;}
   #hud .pill{background:rgba(0,0,0,.42);padding:4px 7px;border-radius:4px;}
+  #hud #hud-ask{background:rgba(120,84,0,.72);}
+  #hud .dim{opacity:.6;}
+  #dbody section.ask{background:#fff6d6;border:2px solid #e3b021;border-radius:6px;padding:10px 12px;}
+  #dbody section.ask.snoozed{background:#eef3ee;border-color:#9fb8a2;}
+  #dbody section.ask h4{color:#7a5a00;}
+  #dbody section.ask .box{border-left-color:#e3b021;font-size:12px;}
+  #dbody .asknote{font-size:9px;color:var(--card-ink-lo);margin-top:8px;line-height:1.7;}
+  #dfoot button#d-snooze{background:#fff6d6;color:#5a4300;border-color:#e3b021;}
+  #kbody .k-ask{display:inline-block;margin-right:4px;}
+  #kbody .k-ask.snz{opacity:.45;}
   #tip{position:absolute;left:40px;bottom:8px;font-size:7px;color:#fff;
     background:rgba(0,0,0,.32);padding:3px 6px;border-radius:4px;pointer-events:none;}
   #nametag{position:absolute;background:var(--panel);
@@ -2130,6 +3557,11 @@ PAGE = r"""<!DOCTYPE html>
   .nt-badge.src-claude,.badge.src-claude{background:#d97757;color:#2a1409;}
   .nt-badge.scheduled,.badge.scheduled{background:#2f5fb0;color:#eaf1ff;}
   .nt-badge.workflow,.badge.workflow{background:#6a4fb0;color:#f1eaff;}
+  .nt-badge.listen-slack,.badge.listen-slack{background:#4a154b;color:#f7e9f7;}
+  .nt-badge.listen-github,.badge.listen-github{background:#24292f;color:#f0f3f6;}
+  .nt-badge.listen-linear,.badge.listen-linear{background:#5e6ad2;color:#eef0ff;}
+  .nt-badge.listen-origin,.badge.listen-origin{background:#1f6f5c;color:#e4f7f1;}
+  #nametag .nt-sub{font-size:9px;color:var(--ink-lo);margin-top:2px;}
   #nametag .nt-meta{font-size:9px;color:var(--ink-lo);margin:6px 0 8px;}
   #nametag .nt-label{font-size:8px;letter-spacing:1px;color:var(--ink-lo);text-transform:uppercase;margin-top:8px;}
   #nametag .nt-text{font-size:11px;color:var(--ink-mid);margin-top:3px;}
@@ -2207,6 +3639,7 @@ PAGE = r"""<!DOCTYPE html>
         <div id="hud">
           <span class="pill" id="hud-work">working: 0</span>
           <span class="pill" id="hud-wait">in kitchen: 0</span>
+          <span class="pill" id="hud-ask" style="display:none"></span>
           <span class="pill" id="hud-beach" style="display:none">on beach: 0</span>
           <span class="pill" id="hud-subs" style="display:none">subagents: 0</span>
           <span class="pill" id="hud-wf" style="display:none">workflows: 0</span>
@@ -2228,6 +3661,7 @@ PAGE = r"""<!DOCTYPE html>
             </div>
             <div id="dbody"></div>
             <div id="dfoot">
+              <button id="d-snooze" style="display:none">&#128524; NOT NOW</button>
               <button id="d-finish">&#127958; SEND TO BEACH</button>
               <button id="d-open">OPEN TRANSCRIPT FILE (.jsonl)</button>
               <button id="d-copy" class="ghost">COPY SESSION ID</button>
@@ -2377,6 +3811,7 @@ let hanukkahNight = 5;   // which night of Hanukkah (1..8) to light; from the se
 let helperHits = [];  // per-frame hover regions for the subagent dwarves
 let workflowHits = []; // per-frame hover regions for the workflow tents
 let shellHits = [];    // per-frame hover regions for the open-shell terminal windows
+let listenHits = [];   // per-frame hover regions for the "listening" Slack/GitHub glyphs
 let bubbleAnchors = []; // per-frame: bubbles to draw as a screen-space overlay
 let vendSlots = [];   // per-frame click rects for the vending-machine drink slots
 let vendDrops = {};   // slot idx -> {start,col,fromX,fromY} while a can is dropping/resting
@@ -2429,6 +3864,61 @@ function saveDrowned(){ localStorage.setItem('office_drowned', JSON.stringify(dr
 let emergeFrom = new Set();    // ids that should spawn at the sea and walk in (just un-drowned)
 const DROWN_SINK_MS = 1500;   // how long an agent takes to slip under once it reaches the sea
 
+// ---- "waiting on you": agents blocked on a question for the user (asking = 'form'|'message') ----
+// A 'form' asker walks to the front and knocks on the glass; a 'message' asker raises a hand
+// under a bouncing "?". "Not now" snoozes ONE question: stored as {"<id>|<question_id>": ms}
+// (ids + hashes only -- never question text). A new question has a new question_id, so it
+// wakes the agent again. Entries are pruned by age, by cap, and once superseded.
+const SNOOZE_KEY = 'office_snoozed', SNOOZE_MAX_AGE_MS = 3*86400000, SNOOZE_MAX = 200;
+let snoozed = (()=>{ try{ const r=JSON.parse(localStorage.getItem(SNOOZE_KEY)||'{}');
+  return (r && typeof r==='object' && !Array.isArray(r)) ? r : {}; }catch(e){ return {}; } })();
+function saveSnoozed(){ localStorage.setItem(SNOOZE_KEY, JSON.stringify(snoozed)); }
+function isAsking(a){ return !!(a && a.asking && a.question_id); }
+function snoozeKey(a){ return a.id+'|'+a.question_id; }
+function isSnoozed(a){ return isAsking(a) && snoozed[snoozeKey(a)]!=null; }
+// escalation tier by how long it has been waiting: 0 (<2 min), 1 (2-10 min), 2 (>10 min)
+function askTier(a){ const s=Date.now()/1000-((a&&a.asked_at)||Date.now()/1000); return s<120?0:(s<600?1:2); }
+// an asker that should be visibly pestering you right now (not snoozed, not on the beach)
+function askActive(p){ return !!(p && p.agent && isAsking(p.agent) && !isSnoozed(p.agent)
+  && (p.kind==='wait' || p.kind==='knock') && p.mode!=='drown'); }
+function pruneSnoozed(list){
+  const now=Date.now(), cur={}; let changed=false;
+  list.forEach(a=>{ cur[a.id]=a.question_id||null; });
+  for(const k of Object.keys(snoozed)){
+    const i=k.lastIndexOf('|'), id=k.slice(0,i), q=k.slice(i+1);
+    if(!(typeof snoozed[k]==='number') || now-snoozed[k]>SNOOZE_MAX_AGE_MS || (cur[id] && cur[id]!==q)){
+      delete snoozed[k]; changed=true; }
+  }
+  const keys=Object.keys(snoozed);
+  if(keys.length>SNOOZE_MAX){ keys.sort((a,b)=>snoozed[a]-snoozed[b]).slice(0,keys.length-SNOOZE_MAX)
+    .forEach(k=>delete snoozed[k]); changed=true; }
+  if(changed) saveSnoozed();
+}
+// --demo marks one asker `demo_snoozed`: snooze it once (remembered, so un-snoozing sticks)
+function seedDemoSnoozes(list){
+  let seeded; try{ seeded=JSON.parse(localStorage.getItem('office_demo_snooze_seeded')||'[]'); }catch(e){ seeded=[]; }
+  let changed=false;
+  list.forEach(a=>{ if(a.demo_snoozed && isAsking(a) && seeded.indexOf(snoozeKey(a))<0){
+    seeded.push(snoozeKey(a)); snoozed[snoozeKey(a)]=Date.now(); changed=true; } });
+  if(changed){ localStorage.setItem('office_demo_snooze_seeded', JSON.stringify(seeded.slice(-50))); saveSnoozed(); }
+}
+function setSnooze(a, on){
+  if(!isAsking(a)) return;
+  if(on) snoozed[snoozeKey(a)]=Date.now(); else delete snoozed[snoozeKey(a)];
+  saveSnoozed();
+  rebuild();
+  const p=people.find(q=>q.id===a.id), now=performance.now();
+  if(p && on){ p.bubbleTool=false; p.bubbleText='ok \u{1F60C}'; p.bubbleStart=now; p.bubbleUntil=now+7000; }
+  toast(on ? 'ok \u{1F60C} '+nameFor(a.id)+' will wait quietly' : nameFor(a.id)+' is asking again \u2753');
+}
+let knockAssign = {};   // agent id -> stable front-of-glass knock spot index
+let snoozeHits = [];    // per-frame click rects of the "not now" chips
+let glassTaps = [];     // knuckle-tap ripples on the "glass" (screen space; capped, auto-expire)
+let askSeen = null;     // id -> question_id last seen asking (null until the first poll)
+const KNOCK_XS = [0.5, 0.31, 0.69, 0.17, 0.83, 0.41, 0.59];   // fractions of W along the front edge
+const KNOCK_Y = H - 34;  // anchor: legs run off the bottom edge -- pressed right up to the glass
+const KNOCK_SC = 2.3;    // drawn bigger: closer to the viewer
+
 // ---- ambient random events (pure scenery; never clickable / never hit-tested) ----
 // One dog OR cat OR agent-relocate fires every 30-60s, scheduled inside tick() off
 // the same rAF clock so it can't drift like a stray setInterval. These critters live
@@ -2464,12 +3954,9 @@ function layout(){
   };
 }
 
-// On-screen footprint of ONE desk pod (worker + chair + name-plate) at drawing scale 1.0.
-// Used to scale desks down so they stay non-overlapping as the grid packs tighter.
-const DESK_FOOT_W = 48, DESK_FOOT_H = 56;
 // Build the office desk grid for `n` desks. At n<=6 it is the original fixed 2x3 pod
-// layout (unchanged look + seat stability). Above that it computes a grid whose column
-// count roughly matches the floor's aspect, scales the pods down to fit each cell, and
+// layout (unchanged look + seat stability). Above that it picks the column count that
+// allows the biggest pods, packs the rows evenly between the wall and the kitchen, and
 // -- once it's large -- groups the columns into light, labeled "work rooms".
 function deskGrid(n, L){
   if(n<=6){
@@ -2479,31 +3966,41 @@ function deskGrid(n, L){
       slots.push({ x:left+c*((right-left)/(cols-1)), y:top+r*rowH, scale:SC, room:0, worker:null }); }
     return { slots, rooms:[], cols, rows:2 };
   }
-  // usable office floor for desks: leave headroom under the windows and a margin above
-  // the kitchen so a docked worker + its name-plate never cross into the next room/zone.
-  const padX=70, padTop=WALL_H+40, padBot=L.kitchenTop-36;
-  const usableW = (W - padX) - padX;
-  const usableH = padBot - padTop;
-  // pick a column count whose cell aspect roughly matches the floor, then recompute from
-  // the resulting row count so the final row isn't left nearly empty.
-  let cols = Math.max(3, Math.round(Math.sqrt(n * usableW / usableH)));
-  let rows = Math.ceil(n / cols);
-  cols = Math.ceil(n / rows);
+  // Every row must sit fully on the office floor between the wall and the kitchen counter:
+  // a pod reaches POD_UP above its anchor (head / headrest) and POD_DOWN below (a 2-line
+  // name-plate); horizontally the desk spans +-26 and the first helper gnome sits at -46.
+  const POD_UP=32, POD_DOWN=44, POD_H=POD_UP+POD_DOWN, POD_W=76, GAP_MIN=4;
+  const padX=70, floorTop=WALL_H+6, floorBot=L.kitchenTop-6;
+  const usableW = (W - padX) - padX, availH = floorBot - floorTop;
+  // try every column count; keep the one that allows the biggest pods (prefer fewer
+  // columns on a near-tie so the grid stays compact).
+  let best=null;
+  for(let c=3; c<=n; c++){
+    const r=Math.ceil(n/c);
+    if(best && r===best.rows) continue;
+    const sW = c>1 ? (usableW/(c-1))/POD_W : SC;
+    const sH = (availH - (r+1)*GAP_MIN)/(r*POD_H);
+    const s = Math.min(SC, sW, sH);
+    if(!best || s > best.scale+0.03) best={cols:c, rows:r, scale:s};
+  }
+  const cols=Math.ceil(n/best.rows), rows=best.rows;
+  const scale=Math.max(0.6, best.scale);   // legibility floor for a very crowded office
   const colSpace = cols>1 ? usableW/(cols-1) : 0;
-  const rowSpace = rows>1 ? usableH/(rows-1) : 0;
-  // shrink the pods so a full cell fits with a small gap; never bigger than the original
-  // SC, floored so sprites/text stay legible even in a very crowded office.
-  let scale = SC;
-  if(cols>1) scale = Math.min(scale, colSpace*0.92/DESK_FOOT_W);
-  // leave extra vertical room so a desk's name-plate never grazes the row below it
-  if(rows>1) scale = Math.min(scale, rowSpace*0.74/DESK_FOOT_H);
-  scale = Math.max(0.6, scale);
+  // spread the spare height evenly above, between and below the rows; if the floor clamp
+  // made the pods too tall to fit, overlap the rows rather than cross into the kitchen.
+  const podH=POD_H*scale;
+  let gap=(availH - rows*podH)/(rows+1), pitch=podH+gap;
+  if(gap<0){ gap=0; pitch = rows>1 ? (availH-podH)/(rows-1) : 0; }
+  // name-plate text width (local px) so neighbouring plates in a tight row never touch
+  const plateW = cols>1 ? Math.max(30, Math.min(84, Math.floor(colSpace/scale) - 14)) : 84;
   const slots=[];
   for(let i=0;i<n;i++){
     const c=i%cols, r=Math.floor(i/cols);
-    const x = cols>1 ? (padX + c*colSpace) : W/2;
-    const y = rows>1 ? (padTop + r*rowSpace) : (padTop + usableH/2);
-    slots.push({ x:Math.round(x), y:Math.round(y), scale, room:0, worker:null });
+    const inRow=Math.min(cols, n-r*cols);
+    const x = cols>1 ? (padX + (c + (cols-inRow)/2)*colSpace) : W/2;   // centre a short last row
+    const y = floorTop + gap + POD_UP*scale + r*pitch;
+    const edgeW = Math.floor(2*Math.min(x, W-x)/scale) - 14;     // keep edge plates on-canvas
+    slots.push({ x:Math.round(x), y:Math.round(y), scale, plateW:Math.max(30, Math.min(plateW, edgeW)), room:0, worker:null });
   }
   // once the office has grown tall AND wide, split the columns into a few labeled rooms
   // (light dividers + a small tag) so a big grid reads as intentional "work rooms".
@@ -2520,7 +4017,7 @@ function deskGrid(n, L){
       const xR=(c1===cols-1) ? W : padX+(c1+0.5)*colSpace;
       rooms.push({ x0:Math.round(xL), x1:Math.round(xR), cx:Math.round((xL+xR)/2),
                    label:'ROOM '+names[g] });
-      slots.forEach((s,si)=>{ const c=si%cols; if(c>=c0 && c<=c1) s.room=g; });
+      slots.forEach(s=>{ if(s.x>=xL && s.x<xR) s.room=g; });
     }
   }
   return { slots, rooms, cols, rows };
@@ -2547,7 +4044,13 @@ function drawRooms(){
 }
 
 // desk scale for a WORK person (seated or walking in); SC for everyone else.
-function pscale(p){ return (p && p.kind==='work' && p.deskScale) ? p.deskScale : SC; }
+function pscale(p){
+  if(p && p.kind==='knock'){   // grows as it walks toward the viewer
+    const top=H-Math.round(H*0.40), u=Math.max(0, Math.min(1, (p.y-top)/(KNOCK_Y-top)));
+    return SC + (KNOCK_SC-SC)*u;
+  }
+  return (p && p.kind==='work' && p.deskScale) ? p.deskScale : SC;
+}
 
 // assign stable positions: desks for workers (grid), wander targets for waiters
 function rebuild(){
@@ -2583,6 +4086,12 @@ function rebuild(){
   waiters.forEach(a=>{ if(seatAssign[a.id]==null){ let i=0; while(usedSeats.has(i)) i++; seatAssign[a.id]=i; usedSeats.add(i); } });
   const usedBeach = new Set(Object.values(beachAssign));
   beachers.forEach(a=>{ if(beachAssign[a.id]==null){ let i=0; while(usedBeach.has(i)) i++; beachAssign[a.id]=i; usedBeach.add(i); } });
+  // unanswered, un-snoozed question forms walk up to the glass (they keep their kitchen seat)
+  const knockers = waiters.filter(a=>a.asking==='form' && !isSnoozed(a));
+  const knockIds = new Set(knockers.map(a=>a.id));
+  Object.keys(knockAssign).forEach(id=>{ if(!knockIds.has(id)) delete knockAssign[id]; });
+  const usedKnock = new Set(Object.values(knockAssign));
+  knockers.forEach(a=>{ if(knockAssign[a.id]==null){ let i=0; while(usedKnock.has(i)) i++; knockAssign[a.id]=i; usedKnock.add(i); } });
 
   // a desk layout that is ALWAYS drawn (so the room looks furnished even when nobody
   // is working) AND that GROWS so the office never runs out of desks: as the working
@@ -2607,7 +4116,7 @@ function rebuild(){
       id:a.id, agent:a, kind:'work',
       // keep current position so a kitchen->desk move animates as a walk
       x: old? old.x : (emerging? SEA.x : slot.x), y: old? old.y : (emerging? SEA.y : slot.y),
-      deskX:slot.x, deskY:slot.y, deskScale:slot.scale, vx:0, vy:0,
+      deskX:slot.x, deskY:slot.y, deskScale:slot.scale, plateW:slot.plateW||84, vx:0, vy:0,
       seated: old ? !!sameSeat : (emerging? false : true),   // emergers walk up from the water
       seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
     });
@@ -2627,6 +4136,18 @@ function rebuild(){
   // REFRESH! machine and the DO GOOD WORK poster. Spaced ≥~44px for hovering.
   waiters.forEach(a=>{
     const old = prevById[a.id];
+    if(knockIds.has(a.id)){
+      const ki = knockAssign[a.id], ring = Math.floor(ki / KNOCK_XS.length);
+      next.push(Object.assign(old||{}, {
+        id:a.id, agent:a, kind:'knock',
+        x: old? old.x : W*0.5, y: old? old.y : k.y+8,
+        home: { x: Math.round(KNOCK_XS[ki % KNOCK_XS.length]*W) + ring*22, y: KNOCK_Y },
+        vx:0, vy:0,
+        mode: (!old || old.kind!=='knock') ? 'walk' : old.mode,
+        seed:hash(a.id), variant:a.variant, feat:featuresForAgent(a),
+      }));
+      return;
+    }
     const idx = seatAssign[a.id];
     const base = KSPOTS[idx % KSPOTS.length];
     const ring = Math.floor(idx / KSPOTS.length);   // overflow agents nudge outward
@@ -2706,7 +4227,12 @@ function rebuild(){
 
   people = next;
   document.getElementById('hud-work').textContent = 'working: '+workers.length;
-  document.getElementById('hud-wait').textContent = 'in kitchen: '+waiters.length;
+  document.getElementById('hud-wait').textContent = 'in kitchen: '+(waiters.length-knockers.length);
+  const askers = rest.filter(isAsking), nSnz = askers.filter(isSnoozed).length;
+  const ha = document.getElementById('hud-ask');
+  ha.innerHTML = '&#10067; waiting on you: '+(askers.length-nSnz)+
+    (nSnz ? ' <span class="dim">(+'+nSnz+' snoozed)</span>' : '');
+  ha.style.display = askers.length ? '' : 'none';
   const hb=document.getElementById('hud-beach');
   hb.textContent = 'on beach: '+beachers.length;
   hb.style.display = beachers.length ? '' : 'none';   // only show the pill when in use
@@ -3909,9 +5435,126 @@ function drawDrowning(p, st){
   ctx.globalAlpha=1;
 }
 
+// ---- helper-dwarf placement (subagent dwarves + workflow easel) ----
+// Per desk, per frame: which side the easel and the dwarves go on, how many dwarves fit per
+// row (a staggered back row when the front one is full) and at what size, so every dwarf
+// stays on-canvas and out of the neighbouring desks. Units are pod-local px (offset from
+// the desk anchor; screen = anchor + local*scale). A dwarf spans cx-6..cx+13 and stands in
+// y-1..y+24 (back row y-13..y+12): below the listening glyphs (y-28..y-18) and above every
+// name-plate (y+30..), so only the horizontal room has to be negotiated.
+const HLP = { inner:28, wl:6, wr:13, pitch:22, body:30, easelOut:82, easelMin:0.3, edge:3, max:6, sizes:[1, 0.8, 0.65] };
+function slotAgent(s){ return (s.worker && s.worker.seated && s.worker.agent) || null; }
+// outer reach (local px) of a desk's easel, which shrinks about x+-body (see drawWorkflowTent)
+function easelReach(s){ return HLP.body+(HLP.easelOut-HLP.body)*(s.easelScale||1); }
+function helperFit(s, side, hs, lim){
+  const sc=s.scale||SC, inner=(s.easel===side ? easelReach(s)+2 : HLP.inner);
+  const d0=inner+(side==='R' ? HLP.wl : HLP.wr)*hs, step=HLP.pitch*hs, outer=(side==='R' ? HLP.wr : HLP.wl)*hs;
+  const room=(side==='R' ? lim-s.x : s.x-lim)/sc;
+  const front=room>=d0+outer ? Math.floor((room-d0-outer)/step)+1 : 0;
+  const back=room>=d0+step/2+outer ? Math.floor((room-d0-step/2-outer)/step)+1 : 0;
+  return { front, back, d0, step, room, outer, total:Math.min(HLP.max, front+back) };
+}
+function helperLimit(row, side, j, sd, edgeL, edgeR){
+  if(sd==='R'){ if(j+1>=row.length) return W-HLP.edge;
+    const e=edgeL(row[j+1]); return side[j+1]==='L' ? (edgeR(row[j])+e)/2 : e; }
+  if(j===0) return HLP.edge;
+  const e=edgeR(row[j-1]); return side[j-1]==='R' ? (e+edgeL(row[j]))/2 : e;
+}
+// Side per desk in one row. Preferred: right for desks in the left half, left otherwise --
+// but two facing neighbours would then split one gap, so every L/R assignment of the desks
+// that have helpers is scored: worst shown/needed ratio, then total shown, then preference.
+// Cached per row geometry + demand (2^n tries, n = helper desks in the row, capped at 10).
+const _helperSideCache = new Map();
+function helperSides(row, want, edgeL, edgeR){
+  const key = row.map((s,j)=>[Math.round(s.x), (s.scale||SC).toFixed(3), want[j], s.easel||'',
+                              (s.easelScale||1).toFixed(2)].join(':')).join('|');
+  const hit = _helperSideCache.get(key);
+  if(hit) return hit.slice();
+  const pref = row.map((s,j)=> !want[j] ? null : (s.x < W/2-1 ? 'R' : 'L'));
+  const idx = row.map((_,j)=>j).filter(j=>want[j]);
+  let best = pref, bestScore = null;
+  if(idx.length && idx.length<=10){
+    const small = HLP.sizes[HLP.sizes.length-1];
+    for(let mask=0; mask<(1<<idx.length); mask++){
+      const side = row.map(()=>null);
+      idx.forEach((j,b)=>{ side[j] = ((mask>>b)&1) ? 'R' : 'L'; });
+      let worst=1e9, total=0, match=0;
+      for(const j of idx){
+        const need=Math.min(want[j], HLP.max), L=helperLimit(row, side, j, side[j], edgeL, edgeR);
+        const c=Math.min(need, helperFit(row[j], side[j], small, L).total);
+        const full=Math.min(need, helperFit(row[j], side[j], 1, L).total);
+        worst=Math.min(worst, c/need); total+=c+full*0.01; match+=(side[j]===pref[j]) ? 1 : 0;
+      }
+      const score=[worst, total, match];
+      if(!bestScore || score[0]>bestScore[0]+1e-9 || (Math.abs(score[0]-bestScore[0])<1e-9 &&
+         (score[1]>bestScore[1]+1e-9 || (Math.abs(score[1]-bestScore[1])<1e-9 && score[2]>bestScore[2])))){
+        bestScore=score; best=side;
+      }
+    }
+  }
+  if(_helperSideCache.size>200) _helperSideCache.clear();
+  _helperSideCache.set(key, best);
+  return best.slice();
+}
+function helperLayout(slots){
+  for(const s of slots){
+    const a=slotAgent(s), sc=s.scale||SC;
+    s.hl=null;
+    s.easel = (a && a.workflows && a.workflows.length) ? ((s.x+HLP.easelOut*sc > W-HLP.edge) ? 'L' : 'R') : null;
+  }
+  const rows={};
+  for(const s of slots) (rows[Math.round(s.y)] = rows[Math.round(s.y)] || []).push(s);
+  for(const k in rows){
+    const row=rows[k].sort((a,b)=>a.x-b.x);
+    // shrink an easel that would reach the next desk (or the canvas edge) on its side; two
+    // easels facing the same gap (the far-right one flipped to 'L') split it at the middle
+    row.forEach((s,j)=>{
+      s.easelScale=1;
+      if(!s.easel) return;
+      const nb = s.easel==='R' ? row[j+1] : row[j-1];
+      const lim = !nb ? (s.easel==='R' ? W-HLP.edge : HLP.edge)
+                : (nb.easel && nb.easel!==s.easel) ? (s.x+nb.x)/2
+                : nb.x+(s.easel==='R' ? -1 : 1)*HLP.body*(nb.scale||SC);
+      const room=(s.easel==='R' ? lim-s.x : s.x-lim)/(s.scale||SC) - 2;
+      s.easelScale=Math.max(HLP.easelMin, Math.min(1, (room-HLP.body)/(HLP.easelOut-HLP.body)));
+    });
+    const edgeR=s=>s.x+(s.easel==='R' ? easelReach(s) : HLP.body)*(s.scale||SC);
+    const edgeL=s=>s.x-(s.easel==='L' ? easelReach(s) : HLP.body)*(s.scale||SC);
+    const want=row.map(s=>{ const a=slotAgent(s); return a ? (a.subs||0) : 0; });
+    const side=helperSides(row, want, edgeL, edgeR);
+    // outward limit (screen x) for desk j on side sd; a gap both neighbours want is split
+    const lim=(j,sd)=>helperLimit(row, side, j, sd, edgeL, edgeR);
+    for(let j=0;j<row.length;j++){
+      if(!want[j]) continue;
+      const s=row[j], sd=side[j], L=lim(j,sd), need=Math.min(want[j],HLP.max);
+      let fit=null, hs=1;
+      for(const z of HLP.sizes){ const f=helperFit(s, sd, z, L); if(!fit || f.total>fit.total){ fit=f; hs=z; } if(f.total>=need) break; }
+      let front=Math.min(want[j], fit.front, HLP.max);
+      let back=Math.min(want[j]-front, fit.back, HLP.max-front);
+      let d0=fit.d0;
+      if(front<1){
+        // no free floor on either side: still show one (smallest) dwarf, tucked in against
+        // its OWN desk so it never crosses the outward limit (the neighbour / canvas edge)
+        hs=HLP.sizes[HLP.sizes.length-1]; fit=helperFit(s, sd, hs, L);
+        front=1; back=0; d0=Math.max(0, Math.min(fit.d0, fit.room-fit.outer));
+      }
+      s.hl={ side:sd, hs, d0, step:fit.step, front, back, extra:want[j]-front-back };
+    }
+  }
+}
+// a tiny white "+N" tag (dark outline) centred at (cx, cy), pod-local; returns its half-width
+function drawPlusBadge(cx, cy, n){
+  ctx.font='4px "Press Start 2P", monospace';
+  const txt='+'+n, w=Math.round(ctx.measureText(txt).width)+4, h=7, bx=Math.round(cx-w/2), by=Math.round(cy-h/2);
+  ro(bx, by, w, h, PAL.paper);
+  ctx.fillStyle=PAL.ink; ctx.textAlign='center'; ctx.fillText(txt, bx+w/2, by+h-1); ctx.textAlign='left';
+  return w/2;
+}
+
 // a full workstation: office chair + desk + monitor + filing cabinet + plant,
 // with (optionally) a worker seated behind it, facing us. Even empty it looks furnished.
-function drawDeskPod(x, y, p, t, sc){
+function drawDeskPod(x, y, p, t, sc, slot){
+  const hl = slot && slot.hl;
   sc = sc || SC;   // the pod is drawn scaled by `sc` about (x,y); hit regions convert with it
   const f = p ? (p.feat||featuresFor(p.id)) : null;
   // a seated worker "works" (types, its screen animates, its mug steams) only while its OWN
@@ -3998,7 +5641,7 @@ function drawDeskPod(x, y, p, t, sc){
   // line and long ones wrap to at most 2 lines (last line '…'-truncated at a word boundary).
   if(p && p.agent && p.agent.title){
     ctx.font='4px "Press Start 2P", monospace';
-    const PL_MAXW=84;                                          // max line width -> fits ~"Medication selection"
+    const PL_MAXW=p.plateW||84;                                // 84 fits ~"Medication selection"; less in a crowded grid
     const plLines = wrapWords(p.agent.title, PL_MAXW, 2);
     let tw=0; for(const ln of plLines) tw=Math.max(tw, ctx.measureText(ln).width);
     const pw=Math.round(tw)+10, ph=5*plLines.length+3, plx=Math.round(x-pw/2), ply=y+30;  // centered under the desk
@@ -4012,21 +5655,40 @@ function drawDeskPod(x, y, p, t, sc){
   }
   // running subagents: a helper dwarf digging away next to the desk (one per subagent).
   // We also register a hover region so you can see what each one is doing.
-  if(p && p.agent && p.agent.subs>0){
-    const subs=p.agent.subagents||[]; const n=Math.min(p.agent.subs,4);
-    for(let i=0;i<n;i++){
-      const cx=x-40-i*22, cy=y+15;
-      drawHelper(cx, cy, t, (hash(p.id)+i*7)%997);
+  // Placement comes from helperLayout (side / size / rows); feet sit on the floor line, the
+  // back row is staggered half a step outward and drawn first.
+  if(p && p.agent && p.agent.subs>0 && hl){
+    const subs=p.agent.subagents||[], sgn=(hl.side==='R' ? 1 : -1), hs=hl.hs, parent=p.agent.title||'';
+    const spots=[];
+    for(let i=0;i<hl.front;i++) spots.push({ cx:x+sgn*(hl.d0+i*hl.step), cy:y+15 });
+    for(let i=0;i<hl.back;i++)  spots.push({ cx:x+sgn*(hl.d0+hl.step/2+i*hl.step), cy:y+3 });
+    const r=(hl.back ? 11 : 15)*hs*sc;
+    const order=spots.map((_,i)=>i).sort((a,b)=>spots[a].cy-spots[b].cy);
+    for(const i of order){
+      const cx=spots[i].cx, cy=spots[i].cy, foot=cy+9;
+      ctx.save(); scaleAbout(cx, foot, hs); drawHelper(cx, cy, t, (hash(p.id)+i*7)%997); ctx.restore();
       // pod is drawn scaled by `sc` about (x,y); convert the dwarf centre to mouse-logical coords
-      helperHits.push({ x: x+(cx-x)*sc, y: y+((cy-6)-y)*sc, r: 15*sc, sub: subs[i]||null });
+      helperHits.push({ x: x+(cx-x)*sc, y: y+((foot-15*hs)-y)*sc, r, sub: subs[i]||null, parent });
       const sb0 = subs[i] && subs[i].id ? subBubbles[subs[i].id] : null;
       if(sb0){ const lo=(i&1)===1;   // stagger: even dwarf -> above the hat, odd -> below the face
-        bubbleAnchors.push({ x: x+(cx-x)*sc, y: y+((cy+(lo?2:-15))-y)*sc, text:sb0.text, start:sb0.start, until:sb0.until, below:lo, tool:sb0.tool }); }
+        bubbleAnchors.push({ x: x+(cx-x)*sc, y: y+((foot-(lo?7:24)*hs)-y)*sc, text:sb0.text, start:sb0.start, until:sb0.until, below:lo, tool:sb0.tool }); }
+    }
+    if(hl.extra>0){
+      // "+N" over the outermost dwarf, at the front row's hat line (clear of the listening glyphs)
+      const out=spots.reduce((b,s)=> Math.abs(s.cx-x)>Math.abs(b.cx-x) ? s : b, spots[0]);
+      const by=y+15+9-25*hs-4;
+      const lo=(HLP.edge-x)/sc+x+9, hi=(W-HLP.edge-x)/sc+x-9;
+      const bx=Math.max(lo, Math.min(hi, out.cx));
+      const hw=drawPlusBadge(bx, by, hl.extra);
+      helperHits.push({ x: x+(bx-x)*sc, y: y+(by-y)*sc, r: Math.max(hw, 5)*sc, badge:true, parent,
+                        extra: subs.slice(spots.length), more: hl.extra });
     }
   }
   // dynamic-workflow easel (drawn beside the desk; returns its hover hit centre)
   if(p && p.agent && p.agent.workflows && p.agent.workflows.length){
-    const hit = drawWorkflowTent(x, y, p.agent.workflows, t, sc);
+    const h0 = helperHits.length;
+    const hit = drawWorkflowTent(x, y, p.agent.workflows, t, sc, (slot && slot.easel) || 'R', slot && slot.easelScale);
+    for(let i=h0;i<helperHits.length;i++) helperHits[i].parent = p.agent.title||'';
     if(hit) workflowHits.push({ x: x+(hit.x-x)*sc, y: y+(hit.y-y)*sc, r: hit.r*sc, workflow: p.agent.workflows });
   }
   // open background shells: up to 3 tiny terminal windows in a row just above the desk
@@ -4101,14 +5763,21 @@ function humanizeWf(s){
   if(!s) return 'Workflow';
   return s.split(' ').map(w => (w===w.toUpperCase() ? w : (w[0].toUpperCase()+w.slice(1)))).join(' ');
 }
-function drawWorkflowTent(x, y, workflows, t, sc){
+function drawWorkflowTent(x, y, workflows, t, sc, side, es){
   sc = sc || SC;   // matches the desk pod's draw scale, for hit-region conversion
   if(!workflows || !workflows.length) return null;   // backend already gates to genuinely-live runs
   // a WHITE whiteboard (like the wall inspiration board), floating a few px above the desk
-  // on easel legs. Always to the RIGHT of the desk with a small horizontal gap so it reads
-  // as "beside" the desk, not sitting on it; desks are ~216px apart so adjacent easels
-  // never collide, and the far-right column clips only a few px past the edge.
-  const bw=44, bh=40, cxT = x + 56, byT = y - 46, bxT = cxT - bw/2;   // left edge clears the desk + the above desk's name-plate (which reaches anchor+42px on screen)
+  // on easel legs, beside the desk with a small horizontal gap so it reads as "beside" it,
+  // not sitting on it. To the RIGHT unless that would cross the canvas edge (helperLayout
+  // then picks 'L'); the subagent dwarves are laid out around whichever side it takes.
+  // In a tight grid helperLayout passes es<1: the whole easel shrinks about the desk-side
+  // floor point (ax, ay) so it fits before the neighbouring desk; S() maps easel-local
+  // coords to mouse-logical ones for the hit regions and bubbles.
+  es = es || 1;
+  const ax = x + (side==='L' ? -30 : 30), ay = y+22;
+  const S = (lx, ly) => ({ x: x+((ax+(lx-ax)*es)-x)*sc, y: y+((ay+(ly-ay)*es)-y)*sc });
+  ctx.save(); scaleAbout(ax, ay, es);
+  const bw=44, bh=40, cxT = x + (side==='L' ? -56 : 56), byT = y - 46, bxT = cxT - bw/2;   // inner edge clears the desk + the above desk's name-plate (which reaches anchor+42px on screen)
   // easel: just the 2 side legs (no middle leg), each on a little caster wheel
   const legH = (y+22) - (byT + bh - 2);
   px(bxT+4, byT+bh-2, 2, legH-2, PAL.woodDk); px(bxT+bw-6, byT+bh-2, 2, legH-2, PAL.woodDk);
@@ -4147,12 +5816,21 @@ function drawWorkflowTent(x, y, workflows, t, sc){
     // each easel dwarf IS a running workflow subagent -> its own hover region showing what
     // it's doing (not the whole-workflow tooltip). Small radius so the board still hovers
     // as the workflow; the easel hit below is shrunk to the board so these win at the base.
-    helperHits.push({ x: x+(hx-x)*sc, y: y+((hy-4)-y)*sc, r: 10*sc, sub: acts[i]||null });
+    helperHits.push({ ...S(hx, hy-4), r: 10*sc*es, sub: acts[i]||null });
     const sbw = acts[i] && acts[i].id ? subBubbles[acts[i].id] : null;
     if(sbw){ const lo=(i&1)===1;   // stagger easel dwarves: even -> above the hat, odd -> below the face
-      bubbleAnchors.push({ x: x+(hx-x)*sc, y: y+((hy+(lo?1:-12))-y)*sc, text:sbw.text, start:sbw.start, until:sbw.until, below:lo, tool:sbw.tool }); }
+      bubbleAnchors.push({ ...S(hx, hy+(lo?1:-12)), text:sbw.text, start:sbw.start, until:sbw.until, below:lo, tool:sbw.tool }); }
   }
-  return { x: cxT, y: y-26, r: 26 };   // hit only the board face, not the dwarves at its base
+  if(running>n){
+    // "+N" just under the board's outer corner (inside the easel footprint, so always on-canvas)
+    const bx=cxT+(side==='L' ? -1 : 1)*(bw/2-7), by=byT+bh+4;
+    const hw=drawPlusBadge(bx, by, running-n);
+    helperHits.push({ ...S(bx, by), r: Math.max(hw, 5)*sc*es, badge:true,
+                      extra: acts.slice(n), more: running-n });
+  }
+  ctx.restore();
+  // hit only the board face, not the dwarves at its base (pod-local, the caller applies sc)
+  return { x: ax+(cxT-ax)*es, y: ay+((y-26)-ay)*es, r: 26*es };
 }
 
 // wrap `text` to <= maxLines lines that each fit `maxW` px at the CURRENT ctx.font,
@@ -4238,6 +5916,21 @@ function wrapWords(text, maxW, maxLines){
 
 // first ~90 chars, whitespace-collapsed (drawBubble wraps + ellipsizes the rest)
 function firstWords(s){ s=String(s||'').replace(/\s+/g,' ').trim(); return s.length>90?s.slice(0,90):s; }
+// word-boundary truncation with an ellipsis
+function shortText(s, n){ s=String(s||'').replace(/\s+/g,' ').trim(); if(s.length<=n) return s;
+  const cut=s.slice(0,n+1).replace(/\s+\S*$/,''); return (cut.length>=n*0.6?cut:s.slice(0,n)).replace(/[\s,.;:\-]+$/,'')+'\u2026'; }
+// the backend sends a cleaned `title`; detail is the raw fallback (demo / older payloads)
+function helperTitle(s){ return shortText(s.title || String(s.detail||'').replace(/<[^>]+>/g,' ') || 'a background task', 40); }
+// first sentence of a message, markdown stripped
+function firstSentence(s, n){
+  s=String(s||'').replace(/```[\s\S]*?(```|$)/g,' ').replace(/\[([^\]]+)\]\([^)]*\)/g,'$1')
+    .replace(/\*\*|__|`|~~|^#+\s*/gm,'').replace(/\s+/g,' ').replace(/\s*\.\.\.$/,'').trim();
+  const m=s.match(/^(.+?[.!?])(\s|$)/); return shortText(m ? m[1] : s, n); }
+// "Name: detail" -> a plain line, used when the payload has no `doing`
+function toolPlainFallback(t){ if(!t) return ''; const i=t.indexOf(':'); const nm=(i>0?t.slice(0,i):t).trim();
+  return '\u{1F6E0}\uFE0F using '+nm.replace(/([a-z])([A-Z])/g,'$1 $2').replace(/[_-]+/g,' ').toLowerCase(); }
+function fmtRunning(d){ d=Math.max(0,d);
+  return 'running '+(d<60 ? Math.round(d)+'s' : d<3600 ? Math.round(d/60)+'m' : Math.floor(d/3600)+'h '+Math.round((d%3600)/60)+'m'); }
 // small white speech bubble centred on (x,y) in SCREEN coords. Tail points DOWN to the
 // anchor (bubble sits above) unless `below` is set, in which case it sits below with an
 // up-pointing tail -- used to stagger neighbouring dwarf bubbles so they don't overlap.
@@ -4355,6 +6048,12 @@ function drawStanding(p, t){
     dy0 = -Math.abs(Math.sin(tt*0.004))*1.6;    // soft contented float
   }
   if(performance.now()<angryUntil){ dx0 += Math.sin(performance.now()*0.05 + p.x)*1.6; }  // ANGRY MODE jitter
+  // waiting on you: knock on the glass / raise a hand; a snoozed asker relaxes with a coffee
+  const askA = (p.kind==='wait' || p.kind==='knock') && isAsking(p.agent) ? p.agent : null;
+  const pose = !askA ? '' : (isSnoozed(askA) ? 'relax' : (p.kind==='knock' ? 'knock' : 'raise'));
+  const tier = askA ? askTier(askA) : 0;
+  if(pose==='knock' && p.knockHit) dx0 += ((p.seed&1)?1:-1)*(1+tier*0.5);    // tap-tap shake
+  if((pose==='knock' || pose==='raise') && tier===2) dx0 += Math.sin(performance.now()*0.045 + p.seed)*0.8;
   const x=Math.round(p.x+dx0), y=Math.round(p.y+dy0);
   const f=p.feat||featuresFor(p.id||'x');
   const sk=f.skin, sh=f.shirt, pants=f.pants, shoe='#4a3526';
@@ -4363,14 +6062,16 @@ function drawStanding(p, t){
   // deterministic kitchen "persona": a held item, stable per agent id (salted so it
   // doesn't merely echo the appearance bits featuresFor() already used).
   const kh = hash((p.id||'x')+'|kit');
-  const item = (f.messenger || p.kind==='work') ? -1 : (kh % 6);
-  //  -1 courier/worker(none)  0 mug  1 pastry  2 phone  3 plate  4 bottle  5 hands-free
+  const item = (pose==='knock' || pose==='raise') ? -2 : pose==='relax' ? 0
+             : (f.messenger || p.kind==='work') ? -1 : (kh % 6);
+  //  -2 asking (free left hand, right hand up)  -1 courier/worker(none)  0 mug  1 pastry  2 phone  3 plate  4 bottle  5 hands-free
   const settled = p.kind!=='work' && !walking && p.mode==='idle';
   const now = performance.now();
   const canSip = settled && item===0;                       // only the mug persona sips
-  const sip = canSip && ((now + ((x*197)&2047)*3) % 5200) < 700;
+  const sip = canSip && (pose==='relax' ? ((now + ((x*197)&2047)*3) % 3400) < 1100
+                                        : ((now + ((x*197)&2047)*3) % 5200) < 700);
   // occasional small-talk: face the paired neighbour on a staggered ~4.2s-in-12s window
-  const talking = settled && p.talkX!=null && ((now + (kh%24000)) % 26000) < 2600;  // chat rarely: ~2.6s in every 26s
+  const talking = settled && !pose && p.talkX!=null && ((now + (kh%24000)) % 26000) < 2600;  // chat rarely: ~2.6s in every 26s
   const faceDir = talking ? (Math.sign(p.talkX - x)||0) : 0; // -1 look left, +1 look right
   const ht = sip ? -1 : (item===2 ? 1 : 0);                  // sip: tip back; phone: glance down
   const hx = faceDir*2;                                      // subtle head turn toward neighbour
@@ -4393,7 +6094,19 @@ function drawStanding(p, t){
   // ---- arms + the held item (deterministic persona) --------------------------
   const gL = talking && (item===2||item===3 ? false : (faceDir<=0));  // lift left free hand
   const gR = talking && (item===5||item===-1) && faceDir>0;           // hands-free can lift right
-  if(item===0){                                            // coffee mug (+ steam / sip)
+  if(item===-2){                                           // asking: left arm down, right hand up
+    ro(x-14, y-7, 5, 8, sh); px(x-14, y+1, 4,4, sk);
+    if(pose==='knock'){                                    // forearm up, fist toward the glass
+      const hit=!!p.knockHit, fs=hit?8:6;
+      ro(x+9, y-17, 5, 12, sh);
+      px(x+11-fs/2+(hit?1:0), y-24-(hit?1:0), fs, fs, hit ? shade(sk,.12) : sk);
+      px(x+11-fs/2+(hit?1:0), y-24-(hit?1:0)+Math.round(fs*0.45), fs, 1, shade(sk,-.25));   // knuckle crease
+    } else {                                               // raised hand, a little wave
+      const wv = Math.sin(now*[0.004,0.008,0.014][tier] + p.seed) > 0 ? 1 : -1;
+      ro(x+9, y-27, 5, 18, sh);
+      px(x+9+wv, y-33, 5, 6, sk); px(x+9+wv, y-35, 1, 2, sk); px(x+11+wv, y-36, 1, 3, sk); px(x+13+wv, y-35, 1, 2, sk);
+    }
+  } else if(item===0){                                     // coffee mug (+ steam / sip)
     ro(x-14, y-7-(gL?4:0), 5, 7, sh); px(x-14, y-1-(gL?4:0), 5,4, sk);
     const ay = sip?-4:0, my = sip?-6:0;
     ro(x+9, y-9+ay, 5, 7, sh); px(x+9, y-3+ay, 5,3, sk);
@@ -4429,7 +6142,7 @@ function drawStanding(p, t){
   drawHairAcc(x+hx, y-25+ht, f); drawFace(x+hx, y-25+ht, f);
   if(performance.now()<angryUntil) drawAngryFace(x+hx, y-25+ht, f);
   // small-talk bubble while chatting, else the cozy heart when settled
-  if(settled){
+  if(settled && !pose){
     if(talking){ const nd=1+((((now/700)|0)+(kh%3))%3); talkBubble(x + (faceDir<0?-15:15), y-34, nd); }
     else heartBubble(x+15, y-34);
   }
@@ -4515,6 +6228,10 @@ function tick(now){
     for(let i=poopSplats.length-1;i>=0;i--){ const s=poopSplats[i]; s.age+=ds;
       if(s.age>=s.life) poopSplats.splice(i,1); }
   }
+  if(glassTaps.length){
+    const ds=dt/1000;
+    for(let i=glassTaps.length-1;i>=0;i--){ glassTaps[i].age+=ds; if(glassTaps[i].age>=glassTaps[i].life) glassTaps.splice(i,1); }
+  }
   // restock vending slots whose can has finished dropping + resting
   for(const k in vendDrops){ if(now-vendDrops[k].start>3200) delete vendDrops[k]; }
   for(const p of people){
@@ -4560,7 +6277,21 @@ function tick(now){
       // clamp once settled (lets cross-room walks pass through first). Beach agents
       // stay on the sand (right of BEACH_X, clear of the water); kitchen agents stay
       // to the left of the divider.
-      if(p.mode==='idle'){
+      if(p.kind==='knock'){
+        // tap-tap ... pause, faster per escalation tier; each tap onset leaves a glass ripple
+        p.knockHit=false;
+        if(p.mode==='idle' && !isSnoozed(p.agent)){
+          const tier=askTier(p.agent), per=[1500,950,560][tier];
+          const ph=(now + (p.seed%997)) % per, u=ph/per;
+          p.knockHit = u<0.09 || (u>=0.2 && u<0.29);
+          const key=Math.floor((now + (p.seed%997))/per)*2 + (u>=0.2?1:0);
+          if(p.knockHit && key!==p.lastTapKey){
+            p.lastTapKey=key;
+            const s=pscale(p);
+            spawnGlassTap(p.x + 12*s, p.y - 21*s, tier, u>=0.2);
+          }
+        }
+      } else if(p.mode==='idle'){
         if(p.kind==='beach'){
           p.x=Math.max(BEACH_X+16, Math.min(SHORE_X-16, p.x));   // stay on the sand, clear of the ocean
         } else {
@@ -5097,6 +6828,7 @@ function render(t){
   helperHits = [];                   // rebuilt each frame as dwarves are drawn
   workflowHits = [];                 // rebuilt each frame as workflow tents are drawn
   shellHits = [];                    // rebuilt each frame as open-shell terminals are drawn
+  listenHits = [];                   // rebuilt each frame as listening glyphs are drawn
   bubbleAnchors = [];                // rebuilt each frame; drawn as an overlay below
   vendSlots = [];                    // rebuilt each frame as the vending slots are drawn
   ctx.setTransform(SS,0,0,SS,0,0);   // map logical 640x576 onto the super-sampled backing
@@ -5108,13 +6840,14 @@ function render(t){
   // the desk is shown empty and the worker is drawn separately as a walker.
   const bt = performance.now();
   const slots=[...deskSlots].sort((a,b)=>a.y-b.y);
+  helperLayout(slots);
   for(const s of slots){ const w=s.worker; const ds=s.scale||SC;
-    ctx.save(); scaleAbout(s.x, s.y, ds); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t, ds); ctx.restore();
+    ctx.save(); scaleAbout(s.x, s.y, ds); drawDeskPod(s.x, s.y, (w&&w.seated)?w:null, t, ds, s); ctx.restore();
     if(w && w.seated && w.bubbleUntil>bt && !bossActive(w.id)) bubbleAnchors.push({x:s.x, y:s.y-30*ds, text:w.bubbleText, start:w.bubbleStart, until:w.bubbleUntil, tool:w.bubbleTool}); }
   // everyone currently standing/walking (kitchen agents + workers still walking in),
   // interleaved with the ambient dog/cat so overlaps sort correctly by y (painter's).
   const drawList=[];
-  people.filter(p=> p.kind!=='work' || !p.seated).forEach(p=> drawList.push({y:p.y, p}));
+  people.filter(p=> p.kind!=='work' || !p.seated).forEach(p=> drawList.push({y:p.y+(p.kind==='knock'?1000:0), p}));
   if(amb.dog) drawList.push({y:amb.dog.y, dog:amb.dog});
   if(amb.cat) drawList.push({y:amb.cat.y, cat:amb.cat});
   if(amb.turkeys) for(const tk of amb.turkeys) drawList.push({y:tk.y, turkey:tk});
@@ -5137,11 +6870,12 @@ function render(t){
           shellHits.push({ x: e.p.x+((sx+8)-e.p.x)*SC, y: e.p.y+((sy+6)-e.p.y)*SC, r: 11*SC, shell: sh[i] }); }
         ctx.restore();
       }
-      if(e.p.bubbleUntil>bt && !bossActive(e.p.id)) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
+      if(e.p.bubbleUntil>bt && !bossActive(e.p.id) && !askActive(e.p)) bubbleAnchors.push({x:e.p.x, y:e.p.y-34*SC, text:e.p.bubbleText, start:e.p.bubbleStart, until:e.p.bubbleUntil, tool:e.p.bubbleTool}); }
     else if(e.dog) drawDog(e.dog, t);
     else if(e.cat) drawCat(e.cat, t);
-    else if(e.turkey) drawTurkeyRunner(e.turkey, t);
+    else if(e.turkey) drawTurkeyAny(e.turkey, t);
   }
+  if(tkArrows.length || tkFeathers.length || tkPops.length) drawTurkeyFx(bt);
   // supervisor "boss" visits: a stern suited figure delivering a fresh user instruction.
   // The boss ESCORTS the agent -- it appears the moment the instruction lands and walks
   // ALONGSIDE the agent from the kitchen to the desk (trailing the direction of travel),
@@ -5169,6 +6903,17 @@ function render(t){
     const fin=Math.min(1,(bt-b.start)/160), fout=Math.min(1, rem/BUBBLE_FADE);
     if(b.tool) drawToolChip(b.x, b.y, b.text, Math.min(fin,fout), b.below);
     else drawBubble(b.x, b.y, b.text, Math.min(fin,fout), b.below);
+  }
+  for(const p of people){
+    if(p.x==null || !p.agent || !(p.agent.listening||[]).length || p.mode==='drown') continue;
+    if(!(p.kind==='work' || p.kind==='wait' || p.kind==='knock')) continue;
+    drawListenGlyphs(p, bt);
+  }
+  // "waiting on you" markers (above every sprite + bubble so the chip is always clickable)
+  snoozeHits = [];
+  for(const p of people){
+    if(p.x==null || !(p.kind==='wait' || p.kind==='knock') || p.mode==='drown' || !isAsking(p.agent)) continue;
+    drawAskOverlay(p, bt);
   }
   // hover ring (around the drawn sprite, scaled to match the sprite's draw scale)
   if(hover){
@@ -5279,7 +7024,215 @@ function render(t){
     drawPoop(x, y, sz, q.rot, 1);
   }
   ctx.globalAlpha=1;
+  drawGlassTaps();
   drawHolidayWeather(t);              // seasonal snow / bats / leaves overlay (pure scenery)
+}
+
+// a polite knuckle tap on the "glass": an expanding ring, three knuckle smudges and a tiny
+// "tap" -- the courteous cousin of the WHIP revolt's poop splats.
+function spawnGlassTap(x, y, tier, second){
+  glassTaps.push({ x, y, tier, second, age:0, life:0.9 + tier*0.15 });
+  if(glassTaps.length>40) glassTaps.splice(0, glassTaps.length-40);
+}
+function drawGlassTaps(){
+  if(!glassTaps.length) return;
+  ctx.save();
+  for(const g of glassTaps){
+    const u=g.age/g.life, a=Math.max(0, 1-u);
+    ctx.globalAlpha=a*0.75; ctx.strokeStyle='#ffffff'; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.ellipse(g.x, g.y, 3+u*(12+g.tier*4), 2+u*(8+g.tier*3), 0, 0, Math.PI*2); ctx.stroke();
+    ctx.globalAlpha=a*0.45; ctx.fillStyle='#eaf4ff';
+    for(let k=-1;k<=1;k++) px(g.x+k*3-1, g.y-1+Math.abs(k), 2, 2, '#eaf4ff');
+    ctx.globalAlpha=Math.min(1, a*1.4); ctx.font='6px "Press Start 2P", monospace'; ctx.textAlign='center';
+    ctx.fillStyle='rgba(36,28,43,.6)'; ctx.fillText('tap', g.x+(g.second?17:-15)+1, g.y-9-u*6+1);
+    ctx.fillStyle='#ffffff';           ctx.fillText('tap', g.x+(g.second?17:-15),   g.y-9-u*6);
+  }
+  ctx.textAlign='left'; ctx.restore();
+}
+
+const EMOJI_FONT = '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
+// a speech bubble holding emoji (💬❓ for forms), scaled by sz; returns its rect
+function drawEmojiBubble(cx, by, text, sz){
+  ctx.save(); ctx.font=Math.round(9*sz)+'px '+EMOJI_FONT;
+  const tw=ctx.measureText(text).width, bw=Math.ceil(tw+8*sz), bh=Math.round(13*sz);
+  const bx=Math.round(cx-bw/2), y0=Math.round(by-bh);
+  ro(bx, y0, bw, bh, PAL.paper); px(bx+1, y0+1, bw-2, 1, '#ececf2');
+  px(cx-2, y0+bh, 4,1, PAL.paper); px(cx-1, y0+bh+1, 2,2, PAL.paper);
+  px(cx-3, y0+bh, 1,1, PAL.outline); px(cx+2, y0+bh, 1,1, PAL.outline);
+  px(cx-2, y0+bh+1, 1,2, PAL.outline); px(cx+1, y0+bh+1, 1,2, PAL.outline); px(cx-1, y0+bh+3, 2,1, PAL.outline);
+  ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillStyle=PAL.ink;
+  ctx.fillText(text, cx, y0+bh/2+1);
+  ctx.restore();
+  return { x0:bx, y0, x1:bx+bw, y1:y0+bh };
+}
+// the small clickable "😌 not now" chip; registers its exact drawn rect in snoozeHits
+function drawSnoozeChip(x, y, id){
+  ctx.save(); ctx.font='4px "Press Start 2P", monospace';
+  const label='not now', tw=ctx.measureText(label).width, h=9, w=Math.ceil(tw)+15;
+  const bx=Math.round(x), byy=Math.round(y-h/2);
+  ro(bx, byy, w, h, '#2f5d3a'); px(bx+1, byy+1, w-2, 1, '#3f7a4d');
+  ctx.font='6px '+EMOJI_FONT; ctx.textBaseline='middle'; ctx.fillText('\u{1F60C}', bx+2, byy+h/2+0.5);
+  ctx.font='4px "Press Start 2P", monospace'; ctx.fillStyle='#e8f5e9'; ctx.textBaseline='alphabetic';
+  ctx.fillText(label, bx+11, byy+h-3);
+  ctx.restore();
+  snoozeHits.push({ x0:bx-1, y0:byy-1, x1:bx+w+1, y1:byy+h+1, id });
+}
+function pickSnooze(mx,my){
+  for(let i=snoozeHits.length-1;i>=0;i--){ const s=snoozeHits[i];
+    if(mx>=s.x0 && mx<=s.x1 && my>=s.y0 && my<=s.y1) return s; }
+  return null;
+}
+// per-asker overlay: knock bubble + title, or the bouncing "?", the chip, and sweat at tier 2;
+// a snoozed asker just shows a small contented 😌
+function drawAskOverlay(p, now){
+  const a=p.agent, s=pscale(p), headY=p.y-30*s;
+  if(isSnoozed(a)){
+    if(p.bubbleUntil>now) return;                     // the "ok 😌" bubble is still showing
+    ctx.save(); ctx.globalAlpha=0.8; ctx.font='8px '+EMOJI_FONT; ctx.textAlign='center';
+    ctx.fillText('\u{1F60C}', p.x+11*s, headY+2); ctx.restore();
+    return;
+  }
+  const tier=askTier(a);
+  const freq=[0.003,0.006,0.011][tier], amp=[2,3,4.5][tier];
+  const bob=Math.abs(Math.sin(now*freq + p.seed))*amp;
+  let r;
+  if(p.kind==='knock'){
+    r = drawEmojiBubble(Math.round(p.x), headY-4-bob, '\u{1F4AC}\u2753', [1,1.2,1.4][tier]);
+    const ttl=String(a.title||'').replace(/\s+/g,' ').trim();
+    if(ttl){
+      ctx.save(); ctx.font='4px "Press Start 2P", monospace'; ctx.textAlign='center';
+      const txt=ttl.length>34 ? ttl.slice(0,33)+'\u2026' : ttl, w=Math.ceil(ctx.measureText(txt).width)+6;
+      ctx.fillStyle='rgba(28,30,36,.78)'; ctx.fillRect(Math.round(p.x-w/2), r.y0-10, w, 8);
+      ctx.fillStyle='#f4f5f7'; ctx.fillText(txt, p.x, r.y0-4); ctx.restore();
+    }
+  } else {
+    const fs=[12,15,18][tier], qx=Math.round(p.x+11*s), qy=Math.round(p.y-38*s-bob);
+    ctx.save(); ctx.font=fs+'px "Press Start 2P", monospace'; ctx.textAlign='center';
+    ctx.lineWidth=3; ctx.strokeStyle=PAL.outline; ctx.strokeText('?', qx, qy);
+    ctx.fillStyle='#ffd84d'; ctx.fillText('?', qx, qy); ctx.restore();
+    r = { x0:qx-fs/2, y0:qy-fs, x1:qx+fs/2, y1:qy };
+  }
+  drawSnoozeChip(r.x1+3, (r.y0+r.y1)/2, a.id);
+  if(tier===2){                                       // sweat drops (top tier only)
+    for(let k=0;k<2;k++){
+      const ph=((now*0.0011 + k*0.5 + (p.seed%13)*0.07)%1+1)%1;
+      const sx=p.x + (k? 9:-9)*s, sy=headY + 8*s + ph*6*s, dw=Math.max(2, Math.round(1.3*s)), dh=Math.round(dw*1.6);
+      ctx.save(); ctx.globalAlpha=0.35+Math.sin(ph*Math.PI)*0.6;
+      ro(sx-dw/2, sy, dw, dh, '#7fd3ef'); px(sx-1, sy-dw/2, 2, Math.ceil(dw/2), '#7fd3ef'); px(sx-dw/2, sy+1, 1, 1, '#ffffff');
+      ctx.restore();
+    }
+  }
+}
+
+// ---- "listening": tiny Slack / GitHub / Linear / Origin glyphs left of the head ----
+// One 9x9 tile per kind the agent is subscribed to; a ring pulses for LISTEN_PULSE_S after
+// the latest delivered event. Hover shows who (Slack senders) / what (PR, CI branch).
+const LISTEN_KINDS=['github','slack','linear','origin'];
+const LISTEN_NAME={github:'GitHub', slack:'Slack', linear:'Linear', origin:'Origin'};
+const LISTEN_SUB={pr:'Pull request', ci:'CI run', repo:'Repository PRs', author:'Author PRs',
+  thread:'Thread', channel:'Channel', new_channels:'New channels', issue:'Issue', team:'Team', project:'Project'};
+const LISTEN_RING={github:'#f0f3f6', slack:'#e01e5a', linear:'#8f99ff', origin:'#4fd0a8'};
+const LISTEN_PULSE_S=45;
+const LISTEN_GLYPH={
+  slack:{bg:'#ffffff', pal:{b:'#36c5f0',g:'#2eb67d',y:'#ecb22e',r:'#e01e5a'}, rows:[
+    '.........','...b.g...','...b.g...','.bbb.ggg.','.........','.rrr.yyy.','...r.y...','...r.y...','.........']},
+  github:{bg:'#24292f', pal:{w:'#f0f3f6'}, rows:[
+    '.........','..w...w..','..wwwww..','.wwwwwww.','.w.www.w.','.wwwwwww.','..wwwww..','.w..w....','..ww.....']},
+  linear:{bg:'#5e6ad2', pal:{w:'#ffffff'}, rows:[
+    '.........','....wwww.','.w....ww.','.ww....w.','.www....w','..www....','...www...','....www..','.........']},
+  origin:{bg:'#1f6f5c', pal:{t:'#e9fff7',l:'#9fdcc8',d:'#4fa98e'}, rows:[
+    '.........','....t....','..ttttt..','.lltttdd.','.llllddd.','.llllddd.','..llldd..','....ld...','.........']},
+};
+function drawListenGlyph(kind, cx, cy){
+  const g=LISTEN_GLYPH[kind]||LISTEN_GLYPH.github, x0=Math.round(cx)-4, y0=Math.round(cy)-4;
+  ro(x0, y0, 9, 9, g.bg);
+  for(let r=0;r<9;r++){ const row=g.rows[r];
+    for(let c=0;c<9;c++){ const col=g.pal[row[c]]; if(col) px(x0+c, y0+r, 1, 1, col); } }
+}
+// Glyph row geometry (sprite-local px, times pscale): first tile LISTEN_OFF from the head
+// centre, LISTEN_PITCH apart, LISTEN_HALF = half a tile incl. its outline.
+const LISTEN_OFF=15, LISTEN_PITCH=11, LISTEN_HALF=5.5, LISTEN_EDGE=2;
+// screen x-range the row may use: the canvas, minus this desk's own easel and a facing
+// neighbour's easel (both reach up to head height; gnomes and name-plates sit lower)
+function listenBounds(p){
+  let lo=LISTEN_EDGE, hi=W-LISTEN_EDGE;
+  const slot = (p.kind==='work' && p.seated) ? deskSlots.find(s=>s.worker===p) : null;
+  if(!slot) return {lo, hi};
+  const inner=s=>(30+4*(s.easelScale||1))*(s.scale||SC), outer=s=>(30+48*(s.easelScale||1))*(s.scale||SC);
+  if(slot.easel==='L') lo=Math.max(lo, slot.x-inner(slot));
+  if(slot.easel==='R') hi=Math.min(hi, slot.x+inner(slot));
+  for(const s of deskSlots){
+    if(s===slot || Math.round(s.y)!==Math.round(slot.y) || !s.easel) continue;
+    if(s.x<slot.x && s.easel==='R') lo=Math.max(lo, s.x+outer(s));
+    if(s.x>slot.x && s.easel==='L') hi=Math.min(hi, s.x-outer(s));
+  }
+  return {lo, hi};
+}
+// left of the head by default; flip right when the left has no room; if neither side
+// fits, wrap into tiers on the roomier side, then slide inside the bounds (canvas edge wins)
+function listenLayout(p, n){
+  const s=pscale(p), seated=p.kind==='work' && p.seated;
+  const hx=seated ? p.deskX : p.x, y=(seated ? p.deskY : p.y)-23*s, b=listenBounds(p);
+  const span=(LISTEN_OFF+(n-1)*LISTEN_PITCH+LISTEN_HALF)*s;
+  const roomL=hx-b.lo, roomR=b.hi-hx;
+  const dir = span<=roomL ? -1 : span<=roomR ? 1 : (roomR>roomL ? 1 : -1);
+  // too wide for either side: stack into tiers (upward) of as many tiles as the room allows
+  const room=(dir<0 ? roomL : roomR)/s;
+  const per = span/s<=room ? n : Math.max(1, Math.floor((room-LISTEN_OFF-LISTEN_HALF)/LISTEN_PITCH)+1);
+  let xs=[], ys=[];
+  for(let i=0;i<n;i++){ xs.push(hx+dir*(LISTEN_OFF+(i%per)*LISTEN_PITCH)*s); ys.push(y-Math.floor(i/per)*LISTEN_PITCH*s); }
+  const fit=(lo,hi)=>{ const mn=Math.min(...xs)-LISTEN_HALF*s, mx=Math.max(...xs)+LISTEN_HALF*s;
+    const d = mn<lo ? lo-mn : mx>hi ? hi-mx : 0; if(d) xs=xs.map(x=>x+d); };
+  fit(b.lo, b.hi); fit(LISTEN_EDGE, W-LISTEN_EDGE);
+  return {xs, ys, s, dir};
+}
+function drawListenGlyphs(p, now){
+  const L=p.agent.listening, nowS=Date.now()/1000;
+  const kinds=LISTEN_KINDS.filter(k=>L.some(e=>e.kind===k)), lay=listenLayout(p, kinds.length), s=lay.s;
+  kinds.forEach((k,i)=>{
+    const cx=lay.xs[i], cy=lay.ys[i];
+    const last=L.reduce((m,e)=>e.kind===k ? Math.max(m, e.last_event_at||0) : m, 0);
+    const age=nowS-last, hot=last>0 && age>=0 && age<LISTEN_PULSE_S;
+    const bob=hot ? -Math.abs(Math.sin(now*0.006+i))*1.5 : 0;
+    ctx.save(); scaleAbout(cx, cy, s);
+    if(hot){
+      const fr=(now/900+i*0.3)%1, fade=1-age/LISTEN_PULSE_S;
+      ctx.globalAlpha=(1-fr)*0.9*fade; ctx.strokeStyle=LISTEN_RING[k]; ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.arc(cx, cy+bob, 5.5+fr*5, 0, Math.PI*2); ctx.stroke(); ctx.globalAlpha=1;
+    }
+    drawListenGlyph(k, cx, cy+bob);
+    ctx.restore();
+    listenHits.push({ x:cx, y:cy, r:6.5*s, p, kind:k });
+  });
+}
+function pickListen(mx,my){ let best=null,bd=1e9;
+  for(const h of listenHits){ const d=(mx-h.x)*(mx-h.x)+(my-h.y)*(my-h.y); if(d<h.r*h.r && d<bd){bd=d;best=h;} }
+  return best; }
+function fmtUntil(ts){
+  if(!ts) return '';
+  const d=ts-Date.now()/1000; if(d<=0) return 'expiring';
+  const h=d/3600;
+  return 'expires in '+(h>=48 ? Math.round(h/24)+'d' : h>=1 ? Math.round(h)+'h' : Math.max(1,Math.round(d/60))+'m');
+}
+function fmtEventAgo(ts){
+  if(!ts) return '';
+  const d=Math.max(0, Date.now()/1000-ts);
+  return 'last event '+(d<60 ? 'just now' : d<3600 ? Math.round(d/60)+'m ago' : d<172800 ? Math.round(d/3600)+'h ago' : Math.round(d/86400)+'d ago');
+}
+function listenLineMeta(e){
+  const who = e.detail ? ((e.kind==='slack' ? 'from ' : '')+e.detail) : (e.kind==='slack' ? 'no messages yet' : '');
+  return [who, fmtEventAgo(e.last_event_at), fmtUntil(e.expires_at)].filter(Boolean).join('  \u00b7  ');
+}
+function listenCardHTML(hit){
+  const a=hit.p.agent, L=(a.listening||[]).filter(e=>e.kind===hit.kind);
+  let html='<div class="nt-name">Listening on '+esc(LISTEN_NAME[hit.kind]||hit.kind)+
+    '<span class="nt-badge listen-'+hit.kind+'">'+L.length+'</span></div>'+
+    '<div class="nt-meta">'+esc(a.title||nameFor(a.id))+'</div>';
+  for(const e of L){
+    html+='<div class="nt-label">'+esc(LISTEN_SUB[e.sub]||e.sub||'')+'</div><div class="nt-text">'+esc(e.label)+'</div>';
+    const meta=listenLineMeta(e); if(meta) html+='<div class="nt-sub">'+esc(meta)+'</div>';
+  }
+  return html+'<div class="nt-hint">waiting for events \u00b7 click to open the session</div>';
 }
 
 // burst ~110 confetti pieces: half from the agent's head, half across the whole screen
@@ -5568,16 +7521,30 @@ function updateAmbient(now, dt){
   // Thanksgiving: a small flock of turkeys scurries across the floor the whole time the
   // theme is active (holiday-gated -- they never appear in a plain office or other theme).
   // Each runs edge-to-edge, then re-enters from the far side on a fresh lane/speed so the
-  // flock keeps "running around". Pure scenery: never hit-tested, like the dog/cat.
+  // flock keeps "running around". Easter egg: hover one for a bow cursor, click to shoot it;
+  // it cooks into a mini roast, fades, and a replacement wanders in later (see shootTurkey).
   if(activeHolidays.includes('thanksgiving')){
-    if(!amb.turkeys) amb.turkeys=[];
-    while(amb.turkeys.length<3) amb.turkeys.push(spawnTurkey());
-    for(const tk of amb.turkeys){
+    if(!amb.turkeys){ amb.turkeys=[]; amb.tkRespawn=[]; }
+    for(let i=amb.tkRespawn.length-1;i>=0;i--)
+      if(now>=amb.tkRespawn[i]){ amb.tkRespawn.splice(i,1); amb.turkeys.push(spawnTurkey()); }
+    while(amb.turkeys.length+amb.tkRespawn.length<3) amb.turkeys.push(spawnTurkey());
+    for(let i=amb.turkeys.length-1;i>=0;i--){ const tk=amb.turkeys[i];
+      if(tk.hitAt){
+        const m=tk.tm;
+        if(now-tk.hitAt >= m.stun+m.cook+m.hold+m.fade){
+          amb.turkeys.splice(i,1);
+          amb.tkRespawn.push(now + m.respawn[0] + Math.random()*(m.respawn[1]-m.respawn[0]));
+        }
+        continue;
+      }
       tk.x += tk.dir*tk.spd*sec;
+      if(tk.shot) continue;              // arrow in flight: don't wrap it off-screen mid-shot
       if(tk.dir>0 && tk.x>W+30) respawnTurkey(tk,-1);
       else if(tk.dir<0 && tk.x<-30) respawnTurkey(tk,1);
     }
-  } else if(amb.turkeys){ amb.turkeys=null; }   // clear the flock when Thanksgiving ends
+    updateTurkeyFx(now, sec);
+  } else if(amb.turkeys){ amb.turkeys=null; amb.tkRespawn=[]; tkArrows.length=0; tkFeathers.length=0; tkPops.length=0; }
+  refreshTurkeyCursor();
 }
 
 // ---- Thanksgiving turkey flock (holiday-gated scenery) ----
@@ -5594,6 +7561,152 @@ function spawnTurkey(){
 function respawnTurkey(tk, dir){
   tk.dir=dir; tk.x = dir>0 ? -30 : W+30; tk.y=turkeyLaneY();
   tk.spd = 92 + Math.random()*54;
+}
+
+// ---- Thanksgiving easter egg: shoot a running turkey, it cooks, fades, and respawns ----
+// 32x32 bow-and-arrow cursor (keyed-out PNG); hotspot (29,4) is the arrow tip.
+const BOW_CURSOR="url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAJcUlEQVR42rVXa1RU5Rp+vm/vGWAYQAHFUMBApRCVxFt6ipksyWUqp+NMec1MMDorL0czXSvds6mjmVopKqHgBTVwj7fyHtRAWimRViqoIBZyG0EEuc/svb/zA+iiWNo55/mx16y1Z8/3vM/77ud5h6Adh9esiXTXqRPO1DYYy4lulGdlxY3Hb5Z/TTlHrYu3f1mz3uObQp+/n50//3F7xzM2IYo3WLIVQgjDXwTp+CDFTpYNKOd2aoDq8QPgvfMbxNY6oA1wQnXRoN7FDXYXT3uTLuhYjWuvYwdYdFbqwpE1ACCZTJzZalX+KwJp8+LmutZdj/m4xmlsHRZ5aWBhvs8zNdXd+nnK6KKtgVuPVvC9APAeqGvyQVF9z4qfXAbs/s57xJqVsU/bGUDBGOtMDUEQqMEACmTDgLar0SjKvyMAANC4YP7S5cddidfhJy3/3HJ21arHHr5WMUjbUmr2UiqiHvGo4/z9b4HrITtUxV3boobgh4agiitK0OKZS4VdAOtEDUaAe7eI/NpPgc8WRdV3f2bXmpLSL/276CfHzjT9CADgNdj84cb+9EKuuVdz0exwrxp/X586Rr2Zk9i7akvoI8hDwMHvg4bFrXzFXCUIAhVFUW3/fbZra+IAXlf/RI9epWF+HoSV/NQjL3rish13KSAwRkVC1N3S/scdTiVhpoaNW3+ygtQkznOKgAoAS36s7RqUPH9B31tFSyM11byGwtlcptJWfSB3POSxa9cDgl8U58XnCssFrSiKzoSVadPrKdsWGWWngd0K0FtzE4VXPJWop3fxd7cAQFxysmbznDnO9zMkoc7h0Igzpr0lCAIPQEV2NhVzcmQASNySaPDLzkwZXFIa4lPvVM7fbsKlIRznHjBCrnIONM5fv+iUIAi0S+9Rc7+60LQ2tI/dofO5TAb1O8/xpd4pzz63J75TAmCMSFYr/dTLy7Vnafk5Pe8+a9lL5lMmSeKsZrPCGCMWg4ETc3LkNey2b4/4eR/T06ef4YdTuVeoHl0qKvnrD08ozvJfH7E6htQn7tr2atGxz5OullE2aFpv2c+nRiOXhg791+uv5wEAvXsq2gZmV3R0o6erdjElDZsBwNRxlxAm5uTIgiDwi4hn9SNJW8dd+VvkaS+Nlg9wlJNHp1NlzJjLwYOL5qS8KSxLcRKW5NNbnxM0cFjTjZ/DNbeLg9Z1HP6HMEkSBwDvS1sPrM7Y9CEACDaBv/P1YgA5epp57phu2qKk92HydaNSfmiIcnjKYLZ0+kS2IvWjlwnlsXXv99GLVqavYIwRxjpR/u5OMCIIAj1x4nv3Hfs2lKYf2DAaAKR2YneQoABwXPzHkRubg+Wzb/R15if4y/m7p9yWpK97dqp0O+55gxDC+vfvT6KjIxo9NSTelbRmlOXl6QArGGOkjYyJs1hERgD13IENET0D2aNVN3Sc70CZhM7xxaMRFR4elYc+AqFqcnKypn2YyQNZZftDOHYkSTp2Yut6ALDZbLxNiGpvhyuKD772RuWhSSwvbdIXqYvmL65OHczYpWHqzR3d5RMLxrD1byyf3Jl6AMDfBwdVkAStV1efl8qrK/I/+eTDk0aj0QoAR1LeGRLukZeoqj+PuFgTkDB6VqoAOBGw8PkRwVfyYhofDpMb0cg5msujAaRf3LiR3NMJ71E9TUgQVdZupNYDy57g3Lx2VLFJo4bXr4gL0Nkt5VVy8Wn7oMmxS1bk5sVBE/kQFEvJ3JHB+PakrlmV+xWBtxtGXN+yemGolQQ2d7jjn5YtsV/lyszYOPSrnOSRYReYVspYmXhh34Tagp1jHJmbZ67qs465dEQzAyMMIDbGXP9tGp9/eeAA1jQs3FHw2kz2QfKmsZ21gXZWNWMCNROzsjM1KcyW+V6W+4DW3Nw6/qtZe2JLIhqPmjUu8LriMmLtM3Hb3yysIU4mCNQo5sgEhFmiojgjIS2+fcLSZF93qJ5OpSuxw6+25ikA6HbxIrnnDLSlKVFFkcC6b82iwKASsZyjus+yGtTI27ksxL3Bb2+B37kBwbEvcJrKbVlZ2zdYTl6r+F0FBoOKnBzcDO6/t7zgbEIArdVytA5Erg0DgKr8fNapAu2Hs3XJ74Uc/nT58cDwltWnbhBdTsZVZWzVUao229UvNCNl7+Ezro43js+WndjWojTvFUVRbcv6tnlqT0Gcmz39WpOb/hp1A3Vzl9GVUi8QClOYtXMChBAkphz079NLU+DRTxf98Rc35ZbMQjZOe4n78lZ3Vth7LDNNGc4H+roUMybQieNmv01BvY9/tmW50SjKNpvwS28lEzgroUorp81tdaVw82yBnmv1AeFARai/Hf7fKoAAoL6Z83j3zP6KxtDzlzlvvULS2SAl5MUY8vLYUO1P31an/3imdoXVmk8IIYzwHs83OriF+z9PDzEaRVlgAgWAbjeiCMAAzrMQ7q6g+jrILbUe04453Fn7WXcRsFgMXMzsmPqyrKLWwUx1v9XD33mtX1956qynuMdciP1ctj52woTFU5YsmVNnNltVSZK4saOnXGxUtPPq6pV9jDEe2aBgIDAYAACyi764UaZQW1XoofMI0cLtD6zYoAIgnL+u8Gr3kNcCh4RXPRcRxDdcufXZqU+8h06dPiuFMYG22zAzm81KcnKyZsbEadtlRi9sOpC2VjSKspAtcB2D1uKhK3dwWqgOBoVz1PY2oKGj3X+K3buT5u1OS3vxl5XtjiTsGFxJkjhJktxWW7dfTjqRMQoAJEHQAsDWVxc+VTR3JGPvhrNMy8wCUM1dBsh35gMA6NSp8eva2AKqygghRO4ssEySBKvZ3PyB1TqnqrI15dO8vMiK7zY7AYBQVUuaCBrKGJpJ6w1AhQDQjvXuj52wrTLuvgLLZuMBICF172rLpow9HYUcWrAotvKlJ1nZjGEsLT72AwCwRUXx+D+ACIKNZ4zRVVusOZt2SFMAYE/8K2+XjxvKcs2j2aa3VkzoiPD72gceEAzIVgkhqo8Xi2McEgrPNwV87uUZeXSQP7K7eN/uOe6FMwBgMknqfafhg0KSJM5sNit7Dx435l8qW5XvWhccOlTv03y++Yc18QsiVFUhuOOfE/1fEjCbzYogCPykmGdtt8p+qB5TfNrH71wpuvHd16pMhWS10r+ykDwQLPn5DIJAn2661DiqG48jnG7f+NmTd0qSiTObzcp974R/GWFhTBQT1FLdQ/U2TR+7I7ivRRAECmvn3/8PvhVg8t+TcsgAAAAASUVORK5CYII=) 29 4, crosshair";
+// lifecycle timings (ms). Override for testing with e.g.
+//   window.__turkeyTimes={hold:800, respawn:[1500,2500]}   (restore: delete window.__turkeyTimes)
+function turkeyTimes(){
+  return Object.assign({ stun:450, cook:2600, hold:5000, fade:700, respawn:[20000,40000] },
+                       window.__turkeyTimes||{});
+}
+const TK_DITHER_COLS=20, TK_DITHER_ROWS=16;    // cook dissolve grid: 2x2 sprite-px blocks over 40x32
+const TK_MAX_FEATHERS=48, TK_MAX_POPS=6, TK_MAX_ARROWS=6;
+const tkArrows=[], tkFeathers=[], tkPops=[];
+let turkeyMouse=null, turkeyCursorOn=false;    // last canvas-space pointer + whether the bow is shown
+
+// a RUNNING (not yet shot) turkey under the pointer; hitbox follows the drawn sprite at SC
+function pickTurkey(mx,my){
+  if(!amb.turkeys || !activeHolidays.includes('thanksgiving')) return null;
+  let best=null, bd=1e9;
+  for(const tk of amb.turkeys){
+    if(tk.hitAt || tk.shot) continue;
+    const dx=mx-tk.x;
+    if(Math.abs(dx)<17*SC && my>tk.y-23*SC && my<tk.y+6*SC){
+      const d=dx*dx+(my-(tk.y-10*SC))**2; if(d<bd){ bd=d; best=tk; } }
+  }
+  return best;
+}
+// a turkey can run under a still pointer (or away from it), so re-check every frame
+// and hand the cursor back to the normal hover logic once it leaves.
+function refreshTurkeyCursor(){
+  if(!turkeyMouse) return;
+  const over=!!pickTurkey(turkeyMouse.x, turkeyMouse.y);
+  if(over===turkeyCursorOn) return;
+  if(over){ applyTurkeyHover(); return; }
+  turkeyCursorOn=false; onCanvasHover(turkeyMouse);
+}
+function applyTurkeyHover(){
+  turkeyCursorOn=true; hover=null; cv.style.cursor=BOW_CURSOR; nametag.style.display='none';
+}
+function shootTurkey(tk, x0, y0){
+  if(tkArrows.length>=TK_MAX_ARROWS) return;
+  tk.shot=true; initAudio(); playBowTwang();
+  tkArrows.push({ tk, x0, y0, start:performance.now(), dur:150+Math.random()*100 });
+  turkeyCursorOn=false; if(turkeyMouse) onCanvasHover(turkeyMouse);
+}
+function turkeyAim(tk){ return { x:tk.x, y:tk.y-10*SC }; }   // body centre (logical px)
+function impactTurkey(a, now){
+  const tk=a.tk, aim=turkeyAim(tk);
+  tk.hitAt=now; tk.tm=turkeyTimes(); tk.frozenT=tCount;
+  tk.stuckAng=a.ang; tk.dith=new Float32Array(TK_DITHER_COLS*TK_DITHER_ROWS).map(()=>Math.random());
+  playThunk();
+  if(tkPops.length<TK_MAX_POPS) tkPops.push({ x:aim.x, y:aim.y-16*SC, start:now, text:Math.random()<0.5?'THUNK!':'*bonk*' });
+  const fc=['#7a4a28','#9a6238','#c0392b','#e07a2f','#e3b021','#f1efe8'];
+  for(let i=0;i<8 && tkFeathers.length<TK_MAX_FEATHERS;i++){
+    const ang=-Math.PI/2 + (Math.random()-0.5)*2.6, sp=40+Math.random()*70;
+    tkFeathers.push({ x:aim.x, y:aim.y, vx:Math.cos(ang)*sp, vy:Math.sin(ang)*sp, rot:Math.random()*6.28,
+                      vr:(Math.random()-0.5)*8, age:0, life:1.1+Math.random()*0.6, col:fc[i%fc.length], ph:Math.random()*6.28 });
+  }
+}
+function updateTurkeyFx(now, sec){
+  for(let i=tkArrows.length-1;i>=0;i--){ const a=tkArrows[i];
+    if(!amb.turkeys || !amb.turkeys.includes(a.tk)){ tkArrows.splice(i,1); continue; }
+    if(now-a.start>=a.dur){ tkArrows.splice(i,1); impactTurkey(a, now); }
+  }
+  for(let i=tkFeathers.length-1;i>=0;i--){ const f=tkFeathers[i]; f.age+=sec;
+    if(f.age>=f.life){ tkFeathers.splice(i,1); continue; }
+    f.vy+=60*sec; f.vx*=0.96; f.vy*=0.96; f.x+=f.vx*sec + Math.sin(f.age*7+f.ph)*0.3; f.y+=f.vy*sec; f.rot+=f.vr*sec;
+  }
+  for(let i=tkPops.length-1;i>=0;i--) if(now-tkPops[i].start>800) tkPops.splice(i,1);
+}
+// a small pixel arrow (shaft + grey head + green fletching), pointing along +x before rotation
+function drawPixelArrow(x, y, ang){
+  ctx.save(); ctx.translate(x, y); ctx.rotate(ang); ctx.scale(SC, SC);
+  px(-11, -1, 3, 1, '#7fbf5a'); px(-11, 1, 3, 1, '#7fbf5a'); px(-12, 0, 2, 1, '#5a9a4a');   // fletching
+  px(-10, 0, 9, 1, '#c08a3e');                                                             // shaft
+  px(-1, -1, 2, 3, '#8a929c'); px(1, 0, 1, 1, '#c9d0d8');                                  // head
+  ctx.restore();
+}
+// flying arrows, feathers and THUNK pops -- drawn above the floor sprites
+function drawTurkeyFx(now){
+  for(const a of tkArrows){
+    const aim=turkeyAim(a.tk), p=Math.min(1,(now-a.start)/a.dur);
+    const x=a.x0+(aim.x-a.x0)*p, y=a.y0+(aim.y-a.y0)*p - Math.sin(p*Math.PI)*8*SC;   // slight lob
+    const dx=aim.x-a.x0, dy=aim.y-a.y0;
+    a.ang = (dx*dx+dy*dy>9) ? Math.atan2(dy,dx) : (a.tk.dir>0 ? 0 : Math.PI);
+    ctx.save(); ctx.globalAlpha=0.35; drawPixelArrow(x-Math.cos(a.ang)*6, y-Math.sin(a.ang)*6, a.ang); ctx.restore();
+    drawPixelArrow(x, y, a.ang);
+  }
+  for(const f of tkFeathers){
+    ctx.save(); ctx.globalAlpha=Math.max(0, 1-f.age/f.life); ctx.translate(f.x, f.y); ctx.rotate(f.rot); ctx.scale(SC,SC);
+    px(-2,-1,4,2,f.col); px(-3,0,1,1,shade(f.col,.3)); px(2,0,1,1,'#f1efe8');
+    ctx.restore();
+  }
+  for(const pp of tkPops){
+    const e=(now-pp.start)/800, s=(e<0.15) ? 0.55+e/0.15*0.5 : 1.05;   // quick pop-in, then hold
+    ctx.save(); ctx.globalAlpha=Math.max(0, Math.min(1, (1-e)*2));
+    ctx.translate(pp.x, pp.y - e*10*SC); ctx.scale(s, s);
+    ctx.font='8px "Press Start 2P", monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle='#241c2b'; for(const [ox,oy] of [[-1,0],[1,0],[0,-1],[0,1],[1,1]]) ctx.fillText(pp.text, ox, oy);
+    ctx.fillStyle = pp.text==='THUNK!' ? '#f0c33b' : '#ffffff'; ctx.fillText(pp.text, 0, 0);
+    ctx.restore();
+  }
+}
+function drawMiniRoast(tk, t){
+  ctx.save(); scaleAbout(tk.x, tk.y, SC*0.46); drawRoastTurkey(tk.x, tk.y-2, t); ctx.restore();
+}
+function drawStuckArrow(tk){
+  const aim=turkeyAim(tk), a=tk.stuckAng||0;
+  drawPixelArrow(aim.x - Math.cos(a)*4*SC, aim.y - Math.sin(a)*4*SC, a);
+}
+// turkey in any lifecycle phase: running -> stunned (arrow stuck) -> pixel-dissolve into a
+// mini roast on a platter (with steam) -> cooked, held -> fade out
+function drawTurkeyAny(tk, t){
+  if(!tk.hitAt){ drawTurkeyRunner(tk, t); return; }
+  const m=tk.tm, e=performance.now()-tk.hitAt;
+  if(e<m.stun){
+    const shake=(e<220) ? ((Math.floor(e/40)&1) ? 1 : -1) : 0;
+    ctx.save(); ctx.translate(shake, 0); drawTurkeyRunner(tk, tk.frozenT); ctx.restore();
+    drawStuckArrow(tk); return;
+  }
+  if(e<m.stun+m.cook){
+    const p=(e-m.stun)/m.cook, cs=2*SC, bx=tk.x-20*SC, by=tk.y-26*SC, d=tk.dith;
+    ctx.save(); ctx.beginPath();
+    for(let i=0;i<d.length;i++) if(d[i]>=p) ctx.rect(bx+(i%TK_DITHER_COLS)*cs, by+((i/TK_DITHER_COLS)|0)*cs, cs, cs);
+    ctx.clip(); drawTurkeyRunner(tk, tk.frozenT); drawStuckArrow(tk); ctx.restore();
+    ctx.save(); ctx.beginPath();
+    for(let i=0;i<d.length;i++) if(d[i]<p) ctx.rect(bx+(i%TK_DITHER_COLS)*cs, by+((i/TK_DITHER_COLS)|0)*cs, cs, cs);
+    ctx.clip(); drawMiniRoast(tk, t); ctx.restore();
+    // blocks about to flip glow hot, so the dissolve front reads as "cooking" (only over the
+    // body ellipse, so empty corners of the grid don't sparkle in mid-air)
+    ctx.save(); ctx.globalAlpha=0.55;
+    for(let i=0;i<d.length;i++){ const k=d[i]-p; if(k<0 || k>=0.035) continue;
+      const c=i%TK_DITHER_COLS, r=(i/TK_DITHER_COLS)|0, ex=(c-9.5)/8, ey=(r-8)/6.5;
+      if(ex*ex+ey*ey<=1) px(bx+c*cs, by+r*cs, cs, cs, k<0.015?'#fff6c0':'#ff9a3c'); }
+    ctx.restore();
+    ctx.save();
+    for(let s=0;s<3;s++) for(let k=0;k<3;k++){
+      const yy=tk.y-24*SC-k*5*SC-((t*0.7+s*9)%(5*SC)), xx=tk.x+(s-1)*7*SC+Math.sin(t*0.03+k+s*2)*2*SC;
+      ctx.globalAlpha=(0.18+0.10*k)*Math.min(1,p*3); px(xx|0, yy|0, 2*SC, 2*SC, '#ffffff'); }
+    ctx.restore();
+    return;
+  }
+  const fadeAt=m.stun+m.cook+m.hold;
+  ctx.save(); ctx.globalAlpha = e<fadeAt ? 1 : Math.max(0, 1-(e-fadeAt)/m.fade);
+  drawMiniRoast(tk, t); ctx.restore();
 }
 
 // ---------- pixel-art critters (drawn scaled by SC about their anchor) ----------
@@ -5771,7 +7884,8 @@ function drawCat(c, t){
 }
 
 // TURKEY: a plump side-on turkey mid-run -- fan tail (back), round brown body, shuffling
-// legs + head bob so it reads as scurrying. Faces its travel direction. Pure scenery.
+// legs + head bob so it reads as scurrying. Faces its travel direction. Pass a frozen `t`
+// to hold a single pose (the shot/cooking phases do).
 function drawTurkeyRunner(tk, t){
   ctx.save();
   scaleAbout(tk.x, tk.y, SC);
@@ -5867,9 +7981,20 @@ function placeNametag(m){
   if(top+bh+pad>sh) top=Math.max(pad, sh-bh-pad);
   nametag.style.left=Math.round(left)+'px'; nametag.style.top=Math.round(top)+'px';
 }
-function pickHelper(mx,my){ let best=null,bd=1e9;
-  for(const h of helperHits){ const d=(mx-h.x)*(mx-h.x)+(my-h.y)*(my-h.y); if(d<h.r*h.r && d<bd){bd=d;best=h;} }
+function pickHelper(mx,my,badgesOnly){ let best=null,bd=1e9;
+  for(const h of helperHits){ if(badgesOnly && !h.badge) continue;
+    const d=(mx-h.x)*(mx-h.x)+(my-h.y)*(my-h.y);
+    if(d>=h.r*h.r) continue;
+    const k=h.badge ? d-1e6 : d;   // a "+N" badge sits on top of a dwarf: it wins inside its radius
+    if(k<bd){bd=k;best=h;} }
   return best; }
+function helperBadgeHTML(b){
+  const L=(b.extra||[]).slice(0,8), rest=b.more-L.length;
+  return '<div class="nt-name">+'+b.more+' more helper'+(b.more>1?'s':'')+'<span class="nt-badge scheduled">helpers</span></div>'+
+    (b.parent ? '<div class="nt-sub">helping: '+esc(shortText(b.parent, 48))+'</div>' : '')+
+    (L.length ? '<div class="nt-text">'+L.map(s=>esc(helperTitle(s||{}))).join('<br>')+'</div>' : '')+
+    '<div class="nt-hint">'+(rest>0 ? ('…and '+rest+' more running') : 'running, not drawn (no room by the desk)')+'</div>';
+}
 function pickWorkflow(mx,my){ let best=null,bd=1e9;
   for(const w of workflowHits){ const d=(mx-w.x)*(mx-w.x)+(my-w.y)*(my-w.y); if(d<w.r*w.r && d<bd){bd=d;best=w;} }
   return best; }
@@ -5884,6 +8009,13 @@ function dispenseDrink(s){
   vendDrops[s.idx]={start:performance.now(), col:s.col, fromX:s.bxv, fromY:s.ry}; }
 cv.addEventListener('mousemove', e=>{
   const m=toCanvas(e);
+  turkeyMouse=m;
+  // Thanksgiving: a running turkey under the pointer gets the bow cursor (wins only on a hit)
+  if(pickTurkey(m.x,m.y)){ applyTurkeyHover(); return; }
+  turkeyCursorOn=false;
+  onCanvasHover(m);
+});
+function onCanvasHover(m){
   // a pettable pet under the cursor?
   const pet=pickPet(m.x,m.y);
   if(pet){ hover=null; cv.style.cursor='pointer';
@@ -5894,6 +8026,17 @@ cv.addEventListener('mousemove', e=>{
   if(vs){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
   // clickable props -- pointer cursor only, no tooltip (discover them by clicking)
   if(inHit(coolerHit,m.x,m.y) || inHit(clockHit,m.x,m.y)){ hover=null; cv.style.cursor='pointer'; nametag.style.display='none'; return; }
+  if(pickSnooze(m.x,m.y)){ hover=null; cv.style.cursor='pointer';
+    nametag.innerHTML='<div class="nt-hint">not now \u2014 let them relax until the next question</div>';
+    nametag.style.display='block'; placeNametag(m); return; }
+  // a "listening" glyph beside a head (takes precedence over the agent under it)
+  const lh=pickListen(m.x,m.y);
+  if(lh){ hover=null; cv.style.cursor='help';
+    nametag.innerHTML=listenCardHTML(lh); nametag.style.display='block'; placeNametag(m); return; }
+  // a "+N more helpers" badge (sits over a dwarf / under an easel board)
+  const hb=pickHelper(m.x,m.y,true);
+  if(hb){ hover=null; cv.style.cursor='help';
+    nametag.innerHTML=helperBadgeHTML(hb); nametag.style.display='block'; placeNametag(m); return; }
   // a workflow tent? (takes precedence over helpers)
   const wf=pickWorkflow(m.x,m.y);
   if(wf){
@@ -5915,7 +8058,7 @@ cv.addEventListener('mousemove', e=>{
             (p.count!=null?(' '+p.done+'/'+p.count):'')+'</span>').join('<span class="wf-sep">›</span>')+
           '</div>';
       if(w.active && w.active.length)
-        html += '<div class="nt-label">Running now</div><div class="nt-text">'+w.active.map(a=>esc((a.detail||'a subagent').slice(0,64))).join('<br>')+'</div>';
+        html += '<div class="nt-label">Running now</div><div class="nt-text">'+w.active.map(a=>esc(helperTitle(a))).join('<br>')+'</div>';
     } else {
       html += '<div class="nt-label">Runs</div><div class="nt-text">'+
         runs.map(w=>esc(w.name||'workflow')+' — '+(w.done||0)+'/'+(w.total||0)+(w.running?(' ('+w.running+' live)'):'')).join('<br>')+'</div>';
@@ -5945,20 +8088,18 @@ cv.addEventListener('mousemove', e=>{
     hover=null; cv.style.cursor='help';
     // subagent dwarf
     const s=dw.sub||{};
-    // workflow subagents reuse the regular subagent tooltip (same structure + badge style).
-    // "general-purpose"/"workflow-subagent" (uninformative default types) tell you nothing --
-    // for those (or a missing type) show the task detail as the title, dropping the detail line.
+    // concise card: name / who it helps / what it's doing / its latest line / how long
     const isWf = s.type==='workflow-subagent';
-    const generic = !s.type || !s.type.length || s.type==='general-purpose' || isWf;
-    const ttl = generic ? (s.detail || 'a background task') : s.type;
+    const generic = !s.type || s.type==='general-purpose' || isWf;
+    const doing = s.doing || toolPlainFallback(s.last_tool);
+    const latest = firstSentence(s.last_message, 90);
+    const age = s.started ? fmtRunning(Date.now()/1000 - s.started) : '';
     nametag.innerHTML =
-      '<div class="nt-name">'+esc(ttl)+'<span class="nt-badge scheduled">'+(isWf?'workflow subagent':'helper')+'</span></div>'+
-      (generic ? '' :
-        '<div class="nt-label">This subagent is</div>'+
-        '<div class="nt-text">'+esc(s.detail||'working on a background task')+'</div>')+
-      (s.last_tool ? ('<div class="nt-label">Last tool used</div><div class="nt-text">'+esc(s.last_tool)+'</div>') : '')+
-      (s.last_message ? ('<div class="nt-label">Last message</div><div class="nt-text">'+esc(s.last_message)+'</div>') : '')+
-      '<div class="nt-hint">a running '+(isWf?'workflow ':'')+'subagent</div>';
+      '<div class="nt-name">'+esc(helperTitle(s))+'<span class="nt-badge scheduled">'+(isWf?'workflow helper':'helper')+'</span></div>'+
+      (dw.parent ? '<div class="nt-sub">helping: '+esc(shortText(dw.parent, 48))+'</div>' : '')+
+      (doing ? '<div class="nt-text">'+esc(doing)+'</div>' : '')+
+      (latest ? '<div class="nt-text">\u{1F4AC} '+esc(latest)+'</div>' : '')+
+      '<div class="nt-hint">'+esc([age, generic ? '' : s.type].filter(Boolean).join('  \u00B7  ') || 'a running subagent')+'</div>';
     nametag.style.display='block'; placeNametag(m);
     return;
   }
@@ -5982,7 +8123,10 @@ cv.addEventListener('mousemove', e=>{
         '<span class="nt-badge '+a.status+'">'+esc(a.status)+'</span>'+
         srcBadgeHTML(a.source)+
         (a.scheduled?'<span class="nt-badge scheduled">scheduled</span>':'')+'</div>'+
-      '<div class="nt-meta">'+esc(meta)+'  ·  '+where+'</div>'+
+      '<div class="nt-meta">'+esc(meta)+'  ·  '+(hover.kind==='knock' ? 'knocking on your screen' : where)+'</div>'+
+      (isAsking(a) ? ('<div class="nt-label">&#10067; Waiting on you'+(isSnoozed(a)?' (snoozed)':'')+'</div><div class="nt-text">'+esc(a.question_preview||'a question')+'</div>') : '')+
+      ((a.listening||[]).length ? ('<div class="nt-label">Listening</div><div class="nt-text">'+
+        a.listening.map(e=>esc((LISTEN_NAME[e.kind]||e.kind)+': '+e.label+(e.detail?' ('+e.detail+')':''))).join('<br>')+'</div>') : '')+
       '<div class="nt-label">Task</div>'+
       '<div class="nt-text">'+esc(a.title||'(untitled session)')+'</div>'+
       (a.last_instruction ? ('<div class="nt-label">Last instruction</div><div class="nt-text">'+esc(a.last_instruction)+'</div>') : '')+
@@ -5996,17 +8140,24 @@ cv.addEventListener('mousemove', e=>{
     nametag.innerHTML='<div class="nt-hint">click to see who\u2019s in the kitchen</div>';
     nametag.style.display='block'; placeNametag(m);
   } else { nametag.style.display='none'; cv.style.cursor='default'; }
-});
-cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';});
+}
+cv.addEventListener('mouseleave',()=>{hover=null;nametag.style.display='none';
+  turkeyMouse=null; if(turkeyCursorOn){ turkeyCursorOn=false; cv.style.cursor='default'; } });
 function inHit(h,mx,my){ return h && mx>=h.x0 && mx<=h.x1 && my>=h.y0 && my<=h.y1; }
 cv.addEventListener('click', e=>{
   const m=toCanvas(e);
+  const tk=pickTurkey(m.x,m.y);               // Thanksgiving: shoot a running turkey (only on a hit)
+  if(tk){ shootTurkey(tk, m.x, m.y); return; }
   if(inHit(clockHit,m.x,m.y)){ triggerGodzilla(); toast('🦖'); return; }   // clock -> summon Godzilla (test hook)
   if(inHit(coolerHit,m.x,m.y)){ squirtCooler(); return; }                  // cooler -> squirt water
   const pet=pickPet(m.x,m.y);                 // pet the dog/cat before opening any worker
   if(pet){ if(pet==='dog') petDog(); else petCat(); return; }
   const slot=pickVend(m.x,m.y);               // click a drink -> it drops into the tray
   if(slot){ dispenseDrink(slot); return; }
+  const chip=pickSnooze(m.x,m.y);             // "😌 not now" chip on an asking agent's bubble
+  if(chip){ const a=agents.find(x=>x.id===chip.id); if(a) setSnooze(a, true); return; }
+  const lc=pickListen(m.x,m.y);               // a listening glyph -> its agent's detail
+  if(lc){ openDetail(lc.p.agent.id); return; }
   const p=pick(m.x,m.y);
   if(p){ openDetail(p.agent.id); return; }    // an individual sprite -> its detail overlay
   // the kitchen BACKGROUND (not a sprite/prop/drink/button) -> list who's waiting there
@@ -6052,8 +8203,14 @@ async function openDetail(id){
     catch(err){ toast('failed to load'); return; }
   }
   if(!d||d.error){ toast('not found'); return; }
+  // detailCache is long-lived: take the asking state (and status) from the latest poll
+  const liveA=agents.find(x=>x.id===id);
+  if(liveA) d=Object.assign({}, d, { status:liveA.status, asking:liveA.asking, asked_at:liveA.asked_at,
+    question_id:liveA.question_id, question_preview:liveA.question_preview, question_count:liveA.question_count,
+    listening:liveA.listening||d.listening||[] });
   currentDetail=d;
   updateFinishBtn(d.id);
+  updateSnoozeBtn(d);
   // the header is the REAL Cursor session title (falls back to the whimsical name only
   // when a session has no resolvable name yet); the whimsical character name still shows
   // as a muted tag in the sub-line and is what the NAMES toggle cycles.
@@ -6066,7 +8223,28 @@ async function openDetail(id){
     ' &nbsp;·&nbsp; <span id="d-char">'+esc(nameFor(d.id))+'</span>';
   const body=document.getElementById('dbody');
   let html='';
+  if(isAsking(d)){
+    const mins=Math.max(0, Math.floor((Date.now()/1000-(d.asked_at||Date.now()/1000))/60));
+    const isForm=d.asking==='form', n=d.question_count||1;
+    const kind=isForm ? ('a question form'+(n>1?' ('+n+' questions)':'')) : 'a question in its last message';
+    const where=d.source==='claude'
+      ? (isForm ? 'Answer it in Claude Code \u2014 the terminal running this session.' : 'Reply in Claude Code \u2014 the terminal running this session.')
+      : (isForm ? 'Answer it in Cursor \u2014 open this chat and pick your answers in the question form.' : 'Reply in Cursor \u2014 open this chat and answer there.');
+    html+='<section class="ask'+(isSnoozed(d)?' snoozed':'')+'"><h4>&#10067; Waiting on you'+(isSnoozed(d)?' \u00b7 snoozed &#128524;':'')+'</h4>'+
+      '<div class="box">'+esc(d.question_preview||'(question)')+'</div>'+
+      '<div class="asknote">It asked '+kind+' '+(mins<1?'just now':(mins+' min ago'))+'. <b>'+where+'</b></div></section>';
+  }
   html+='<section><h4>Task</h4><div class="box role-user">'+esc(d.task_full||d.title||'(none)')+'</div></section>';
+  if(d.listening && d.listening.length){
+    html+='<section><h4>Listening for events</h4>';
+    for(const e of d.listening){
+      const ttl=esc(e.label), meta=listenLineMeta(e);
+      html+='<div style="margin-bottom:6px"><span class="badge listen-'+esc(e.kind)+'">'+esc((LISTEN_NAME[e.kind]||e.kind).toUpperCase())+'</span> '+
+        (/^https:\/\//.test(e.url||'') ? '<a href="'+esc(e.url)+'" target="_blank" rel="noopener">'+ttl+'</a>' : ttl)+
+        (meta ? '<div style="font-size:10px;color:var(--card-ink-lo);margin-top:2px">'+esc(meta)+'</div>' : '')+'</div>';
+    }
+    html+='</section>';
+  }
   if(d.latest_tool){
     html+='<section><h4>Last action</h4><span class="tool">'+esc(d.latest_tool.name)+'</span> '+esc(d.latest_tool.detail||'')+'</section>';
   }
@@ -6120,7 +8298,9 @@ const koverlay=document.getElementById('koverlay');
 // graceful one-line truncation for the last-message preview
 function ktrunc(s,n){ s=(s||'').replace(/\s+/g,' ').trim(); return s.length>n ? s.slice(0,n-1).trimEnd()+'\u2026' : s; }
 function openKitchen(){
-  const waiters=people.filter(p=>p.kind==='wait');
+  // knockers left the kitchen for the glass but are still waiting on you -> listed first
+  const waiters=people.filter(p=>p.kind==='wait' || p.kind==='knock')
+    .sort((p,q)=>(isAsking(q.agent)&&!isSnoozed(q.agent)?2:isAsking(q.agent)?1:0)-(isAsking(p.agent)&&!isSnoozed(p.agent)?2:isAsking(p.agent)?1:0));
   document.getElementById('k-title').textContent='In the kitchen ('+waiters.length+')';
   const kb=document.getElementById('kbody');
   if(!waiters.length){
@@ -6129,10 +8309,11 @@ function openKitchen(){
     kb.innerHTML=waiters.map(p=>{
       const a=p.agent;
       const title=a.title||nameFor(a.id)||'(untitled session)';
-      const msg=a.last_message||a.latest||a.preview||'';   // same field the hover card / detail use
+      const msg=(isAsking(a) && a.question_preview) || a.last_message||a.latest||a.preview||'';   // same field the hover card / detail use
       const msgHtml=msg ? '<div class="k-msg">'+esc(ktrunc(msg,160))+'</div>'
                         : '<div class="k-msg" style="opacity:.6">(no message yet)</div>';
-      return '<div class="krow" data-id="'+esc(a.id)+'"><div class="k-ttl">'+esc(title)+'</div>'+msgHtml+'</div>';
+      const mark=isAsking(a) ? '<span class="k-ask'+(isSnoozed(a)?' snz':'')+'" title="'+(isSnoozed(a)?'asking (snoozed)':'waiting on you')+'">&#10067;</span>' : '';
+      return '<div class="krow" data-id="'+esc(a.id)+'"><div class="k-ttl">'+mark+esc(title)+'</div>'+msgHtml+'</div>';
     }).join('');
     kb.querySelectorAll('.krow').forEach(el=>{
       el.addEventListener('click',()=>{ const id=el.getAttribute('data-id'); closeKitchen(); openDetail(id); });
@@ -6152,6 +8333,18 @@ function updateFinishBtn(id){
   b.innerHTML = on ? '&#8617;&#65039; BRING BACK TO WORK' : '&#127958; SEND TO BEACH';
   b.classList.toggle('ghost', on);
 }
+function updateSnoozeBtn(d){
+  const b=document.getElementById('d-snooze');
+  b.style.display = isAsking(d) ? '' : 'none';
+  b.innerHTML = isSnoozed(d) ? '&#9200; REMIND ME AGAIN' : '&#128524; NOT NOW';
+}
+document.getElementById('d-snooze').addEventListener('click',()=>{
+  if(!currentDetail || !isAsking(currentDetail)) return;
+  const on=!isSnoozed(currentDetail);
+  setSnooze(currentDetail, on);
+  updateSnoozeBtn(currentDetail);
+  const sec=document.querySelector('#dbody section.ask'); if(sec) sec.classList.toggle('snoozed', on);
+});
 document.getElementById('d-finish').addEventListener('click',()=>{
   if(!currentDetail) return;
   const id=currentDetail.id;
@@ -6302,11 +8495,25 @@ async function refresh(){
       return false;                                         // still under
     });
     if(_undrowned) saveDrowned();
+    pruneSnoozed(agents);
+    seedDemoSnoozes(agents);
     rebuild();
     detectMessages(agents);
     detectInstructions(agents);
     detectFinishes(agents);
+    detectAsks(agents);
   }catch(e){/* keep last */}
+}
+// a toast the first time each (un-snoozed) question shows up -- including a NEW question from
+// an agent that was snoozed on an older one
+function detectAsks(list){
+  const cur={}; list.forEach(a=>{ if(isAsking(a)) cur[a.id]=a.question_id; });
+  if(askSeen!==null){
+    const fresh=list.filter(a=>isAsking(a) && !isSnoozed(a) && !finishedIds.has(a.id) && askSeen[a.id]!==a.question_id);
+    if(fresh.length===1) toast('\u2753 '+nameFor(fresh[0].id)+' has a question for you');
+    else if(fresh.length>1) toast('\u2753 '+fresh.length+' agents have questions for you');
+  }
+  askSeen=cur;
 }
 // ---- gentle "an agent finished" chime (Web Audio, no files) ----
 let audioCtx = null;
@@ -6356,6 +8563,23 @@ function playScratch(){
   const bp=audioCtx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=2800; bp.Q.value=1.1;
   const g=audioCtx.createGain(); g.gain.value=0.09;
   src.connect(bp).connect(g).connect(audioCtx.destination); src.start(t0);
+}
+// Thanksgiving easter egg: a soft bow "thwip" on release and a muffled thunk on impact
+function playBowTwang(){
+  if(!soundOn || !audioCtx) return;
+  const t0=audioCtx.currentTime, o=audioCtx.createOscillator(), g=audioCtx.createGain();
+  o.type='triangle'; o.frequency.setValueAtTime(420, t0); o.frequency.exponentialRampToValueAtTime(180, t0+0.12);
+  g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.05, t0+0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0+0.14);
+  o.connect(g).connect(audioCtx.destination); o.start(t0); o.stop(t0+0.15);
+}
+function playThunk(){
+  if(!soundOn || !audioCtx) return;
+  const t0=audioCtx.currentTime, o=audioCtx.createOscillator(), g=audioCtx.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(150, t0); o.frequency.exponentialRampToValueAtTime(70, t0+0.09);
+  g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.08, t0+0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0+0.12);
+  o.connect(g).connect(audioCtx.destination); o.start(t0); o.stop(t0+0.13);
 }
 const soundBtn=document.getElementById('sound');
 function updateSoundBtn(){ soundBtn.innerHTML=(soundOn?'&#9834; ON':'&#9834; OFF'); soundBtn.classList.toggle('off', !soundOn); }
